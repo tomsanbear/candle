@@ -4,6 +4,21 @@ using namespace metal;
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
+METAL_FUNC uint get_strided_index(
+    uint idx,
+    constant size_t &num_dims,
+    constant size_t *dims,
+    constant size_t *strides
+) {
+    uint strided_i = 0;
+    for (uint d = 0; d < num_dims; d++) {
+        uint dim_idx = num_dims - 1 - d;
+        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
+        idx /= dims[dim_idx];
+    }
+    return strided_i;
+}
+
 template <typename T>
 METAL_FUNC void im2col(
     constant size_t &dst_numel,
@@ -233,19 +248,25 @@ METAL_FUNC void avg_pool2d(
   const size_t dst_w = (tid / h_out) % w_out;
   const size_t dst_h = tid % h_out;
 
-  const size_t src_idx0 = b_idx * src_strides[0];
+  const size_t src_w_offset = w_stride * dst_w;
+  const size_t src_h_offset = h_stride * dst_h;
+  const size_t src_idx_0 = (b_idx * src_strides[0]) + (c_idx * src_strides[1]);
+
   A d = 0;
-  for (size_t w_offset = 0; w_offset < w_k; ++w_offset) {
-    size_t src_w = w_stride * dst_w + w_offset;
-    if (src_w >= w_in){
-      continue;
+
+  for (size_t w_offset = 0; w_offset < w_k; ++w_offset){
+    const size_t src_w = src_w_offset + w_offset;
+    if(src_w >= w_in){
+      break;
     }
-    for (size_t h_offset = 0; h_offset < h_k; ++h_offset) {
-      size_t src_h = h_stride * dst_h + h_offset;
-      if (src_h >= h_in) {
+
+    // NOTE: we start at 1 in case it's the first iteration since we have already initialized
+    for (size_t h_offset = 0; h_offset < h_k; ++h_offset){
+      const size_t src_h = src_h_offset + h_offset;
+      if (src_h >= h_in){
         continue;
       }
-      const size_t src_idx = src_idx0 + c_idx * src_strides[1] + src_w * src_strides[2] + src_h * src_strides[3];
+      const size_t src_idx = src_idx_0 + (src_w * src_strides[2]) + (src_h * src_strides[3]);
       d += static_cast<A>(src[src_idx]);
     }
   }
@@ -294,27 +315,26 @@ METAL_FUNC void max_pool2d(
   const size_t dst_w = (tid / h_out) % w_out;
   const size_t dst_h = tid % h_out;
 
-  const size_t src_idx0 = b_idx * src_strides[0];
-  T d = 0;
-  bool set = false;
-  for (size_t w_offset = 0; w_offset < w_k; ++w_offset) {
-    size_t src_w = w_stride * dst_w + w_offset;
-    if (src_w >= w_in){
-      continue;
+  const size_t src_w_offset = w_stride * dst_w;
+  const size_t src_h_offset = h_stride * dst_h;
+  const size_t src_idx_0 = (b_idx * src_strides[0]) + (c_idx * src_strides[1]);
+
+  T d = src[src_idx_0];
+  
+  for (size_t w_offset = 0; w_offset < w_k; ++w_offset){
+    const size_t src_w = src_w_offset + w_offset;
+    if(src_w >= w_in){
+      break;
     }
-    for (size_t h_offset = 0; h_offset < h_k; ++h_offset) {
-      size_t src_h = h_stride * dst_h + h_offset;
-      if (src_h >= h_in) {
+
+    // NOTE: we start at 1 in case it's the first iteration since we have already initialized
+    for (size_t h_offset = w_offset == 0 ? 1 : 0; h_offset < h_k; ++h_offset){
+      const size_t src_h = src_h_offset + h_offset;
+      if (src_h >= h_in){
         continue;
       }
-      const size_t src_idx = src_idx0 + c_idx * src_strides[1] + src_w * src_strides[2] + src_h * src_strides[3];
-      if (set) {
-        d = MAX(d, src[src_idx]);
-      }
-      else {
-        d = src[src_idx];
-        set = true;
-      }
+      const size_t src_idx = src_idx_0 + (src_w * src_strides[2]) + (src_h * src_strides[3]);
+      d = MAX(d, src[src_idx]);
     }
   }
   dst[tid] = d;

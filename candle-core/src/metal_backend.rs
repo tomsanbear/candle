@@ -1293,11 +1293,9 @@ impl BackendStorage for MetalStorage {
             (DType::I64, DType::F32) => "sa_i64_f32",
             (DType::I64, DType::F16) => "sa_i64_f16",
             (DType::I64, DType::BF16) => "sa_i64_bf16",
-            _ => Err(MetalError::UnexpectedDType {
-                msg: "scatter-add ids should be u8/u32/i64",
-                expected: DType::U32,
-                got: ids.dtype(),
-            })?,
+            (i_dtype, dtype) => {
+                crate::bail!("Metal scatter_add {i_dtype:?} {dtype:?} not implemented")
+            }
         };
         let command_buffer = self.device.command_buffer()?;
         candle_metal_kernels::call_scatter_add(
@@ -1402,11 +1400,9 @@ impl BackendStorage for MetalStorage {
             (DType::U8, DType::U32) => "ia_u8_u32",
             (DType::U8, DType::U8) => "ia_u8_u8",
 
-            _ => Err(MetalError::UnexpectedDType {
-                msg: "index-add ids should be u8/u32/i64",
-                expected: DType::U32,
-                got: ids.dtype(),
-            })?,
+            (i_dtype, dtype) => {
+                crate::bail!("Metal index_add {i_dtype:?} {dtype:?} not implemented")
+            }
         };
         let command_buffer = self.device.command_buffer()?;
         candle_metal_kernels::call_index_add(

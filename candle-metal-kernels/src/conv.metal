@@ -259,14 +259,14 @@ METAL_FUNC void avg_pool2d(
     if(src_w >= w_in){
       break;
     }
-
+    const size_t src_idx_offset = src_idx_0 + (src_w * src_strides[2]);
     // NOTE: we start at 1 in case it's the first iteration since we have already initialized
     for (size_t h_offset = 0; h_offset < h_k; ++h_offset){
       const size_t src_h = src_h_offset + h_offset;
       if (src_h >= h_in){
         continue;
       }
-      const size_t src_idx = src_idx_0 + (src_w * src_strides[2]) + (src_h * src_strides[3]);
+      const size_t src_idx = src_idx_offset + (src_h * src_strides[3]);
       d += static_cast<A>(src[src_idx]);
     }
   }

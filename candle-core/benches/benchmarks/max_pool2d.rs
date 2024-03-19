@@ -4,7 +4,7 @@ use criterion::{black_box, criterion_group, Criterion, Throughput};
 use std::time::Instant;
 
 fn run(x: &Tensor) {
-    x.max_pool2d(2).unwrap();
+    x.max_pool2d(4).unwrap();
 }
 
 fn run_bench(c: &mut Criterion, device: &Device) {

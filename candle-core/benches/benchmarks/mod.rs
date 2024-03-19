@@ -2,6 +2,7 @@ pub(crate) mod affine;
 pub(crate) mod avg_pool2d;
 pub(crate) mod matmul;
 pub(crate) mod max_pool2d;
+pub(crate) mod ones;
 pub(crate) mod random;
 pub(crate) mod where_cond;
 

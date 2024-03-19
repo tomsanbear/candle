@@ -245,6 +245,27 @@ impl MetalDevice {
         Ok(buffer)
     }
 
+    pub fn allocate_ones(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
+        let buffer = self.allocate_buffer(
+            size_in_bytes as NSUInteger,
+            MTLResourceOptions::StorageModePrivate,
+            "allocate_ones",
+        )?;
+        let command_buffer = self.command_buffer()?;
+        command_buffer.set_label("ones");
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.fill_buffer(
+            &buffer,
+            metal::NSRange {
+                location: 0,
+                length: buffer.length(),
+            },
+            1,
+        );
+        blit.end_encoding();
+        Ok(buffer)
+    }
+
     fn find_available_buffer(
         &self,
         size: NSUInteger,
@@ -1848,9 +1869,14 @@ impl BackendDevice for MetalDevice {
     }
 
     fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        // TODO Is there a faster way ?
-        let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
-        self.storage_from_cpu_storage(&cpu_storage)
+        let size = shape.elem_count() * dtype.size_in_bytes();
+        let buffer = self.allocate_ones(size)?;
+        Ok(MetalStorage::new(
+            buffer,
+            self.clone(),
+            shape.elem_count(),
+            dtype,
+        ))
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {

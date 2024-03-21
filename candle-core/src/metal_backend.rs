@@ -724,6 +724,7 @@ impl BackendStorage for MetalStorage {
                 ("urecip", DType::F32) => contiguous::recip::FLOAT,
                 ("utanh", DType::F32) => contiguous::tanh::FLOAT,
                 ("urelu", DType::F32) => contiguous::relu::FLOAT,
+                ("sign", DType::F32) => contiguous::sign::FLOAT,
                 ("ucos", DType::F16) => contiguous::cos::HALF,
                 ("usin", DType::F16) => contiguous::sin::HALF,
                 ("usqr", DType::F16) => contiguous::sqr::HALF,
@@ -742,6 +743,7 @@ impl BackendStorage for MetalStorage {
                 ("urecip", DType::F16) => contiguous::recip::HALF,
                 ("utanh", DType::F16) => contiguous::tanh::HALF,
                 ("urelu", DType::F16) => contiguous::relu::HALF,
+                ("sign", DType::F16) => contiguous::sign::HALF,
                 (name, dtype) => {
                     crate::bail!("Metal contiguous unary {name} {dtype:?} not implemented")
                 }

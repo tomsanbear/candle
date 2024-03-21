@@ -254,6 +254,7 @@ pub(crate) struct Tanh;
 pub(crate) struct Floor;
 pub(crate) struct Ceil;
 pub(crate) struct Round;
+pub(crate) struct Sign;
 
 macro_rules! bin_op {
     ($op:ident, $name: literal, $e: expr, $f32_vec: ident, $f64_vec: ident) => {
@@ -686,6 +687,68 @@ impl UnaryOpT for Abs {
     #[inline(always)]
     fn i64(v: i64) -> i64 {
         v.abs()
+    }
+}
+
+impl UnaryOpT for Sign {
+    const NAME: &'static str = "sign";
+    const KERNEL: &'static str = "usign";
+    const V: Self = Sign;
+    #[inline(always)]
+    fn bf16(v: bf16) -> bf16 {
+        if v == bf16::ZERO {
+            bf16::ZERO
+        } else {
+            v.signum()
+        }
+    }
+    #[inline(always)]
+    fn f16(v: f16) -> f16 {
+        if v == f16::ZERO {
+            f16::ZERO
+        } else {
+            v.signum()
+        }
+    }
+    #[inline(always)]
+    fn f32(v: f32) -> f32 {
+        if v == 0.0 {
+            0.0
+        } else {
+            v.signum()
+        }
+    }
+    #[inline(always)]
+    fn f64(v: f64) -> f64 {
+        if v == 0.0 {
+            0.0
+        } else {
+            v.signum()
+        }
+    }
+    #[inline(always)]
+    fn u8(v: u8) -> u8 {
+        if v == 0 {
+            0
+        } else {
+            1
+        }
+    }
+    #[inline(always)]
+    fn u32(v: u32) -> u32 {
+        if v == 0 {
+            0
+        } else {
+            1
+        }
+    }
+    #[inline(always)]
+    fn i64(v: i64) -> i64 {
+        if v == 0 {
+            0
+        } else {
+            v.signum()
+        }
     }
 }
 

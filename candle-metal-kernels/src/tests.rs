@@ -1933,3 +1933,10 @@ fn conv_transpose1d_u32() {
     let expected = vec![1, 4, 10, 20, 25, 24, 16];
     assert_eq!(results, expected);
 }
+
+#[test]
+fn sign_f32() {
+    let v: Vec<f32> = vec![-100.0f32, 0.0, 0.1];
+    let results = run(&v, unary::contiguous::sign::FLOAT);
+    assert_eq!(results, vec![-1.0f32, 0.0, 1.0]);
+}

@@ -15,7 +15,7 @@ fn run_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
         .to_dtype(dtype)
         .unwrap();
 
-    let ids = Tensor::new(&[0u8, 100, 199], device).unwrap();
+    let ids = Tensor::new((0..100).map(|i| i as u8).collect::<Vec<u8>>(), device).unwrap();
 
     let flops = t.dims().iter().product::<usize>() * dtype.size_in_bytes();
 

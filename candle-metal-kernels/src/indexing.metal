@@ -23,7 +23,49 @@ METAL_FUNC void index(
     constant size_t &src_dim_size, 
     constant size_t &right_size, 
     constant size_t &ids_size,
-    constant bool &contiguous,
+    const device TYPENAME *input,
+    const device INDEX_TYPENAME *input_ids, 
+    device TYPENAME *output, 
+    uint tid [[ thread_position_in_grid ]] 
+) { 
+    if (tid >= dst_size) { 
+        return;
+    } 
+    const size_t id_i = (tid / right_size) % ids_size; 
+    const INDEX_TYPENAME input_i = min(input_ids[id_i], (INDEX_TYPENAME)(src_dim_size - 1)); 
+    const size_t right_rank_i = tid % right_size; 
+    const size_t left_rank_i = tid / right_size / ids_size; 
+    /* 
+    // Force prevent out of bounds indexing 
+    // since there doesn't seem to be a good way to force crash 
+    // No need to check for zero we're only allowing unsized. 
+    */ 
+    const size_t src_i = left_rank_i * src_dim_size * right_size + input_i * right_size + right_rank_i; 
+    output[tid] = input[src_i];
+}
+
+# define INDEX_OP(NAME, INDEX_TYPENAME, TYPENAME) \
+kernel void NAME( \
+    constant size_t &dst_size, \
+    constant size_t &left_size, \
+    constant size_t &src_dim_size, \
+    constant size_t &right_size, \
+    constant size_t &ids_size, \
+    const device TYPENAME *input, \
+    const device INDEX_TYPENAME *input_ids, \
+    device TYPENAME *output, \
+    uint tid [[ thread_position_in_grid ]] \
+) { \
+    index<TYPENAME, INDEX_TYPENAME>(dst_size, left_size, src_dim_size, right_size, ids_size, input, input_ids, output, tid); \
+} \
+
+template<typename TYPENAME, typename INDEX_TYPENAME>
+METAL_FUNC void index_strided( 
+    constant size_t &dst_size, 
+    constant size_t &left_size, 
+    constant size_t &src_dim_size, 
+    constant size_t &right_size, 
+    constant size_t &ids_size,
     constant size_t *src_dims,
     constant size_t *src_strides,
     const device TYPENAME *input,
@@ -44,18 +86,17 @@ METAL_FUNC void index(
     // No need to check for zero we're only allowing unsized. 
     */ 
     const size_t src_i = left_rank_i * src_dim_size * right_size + input_i * right_size + right_rank_i; 
-    const size_t strided_src_i = contiguous ? src_i : get_strided_index(src_i, src_dim_size, src_dims, src_strides);
+    const size_t strided_src_i = get_strided_index(src_i, src_dim_size, src_dims, src_strides);
     output[tid] = input[strided_src_i];
 }
 
-# define INDEX_OP(NAME, INDEX_TYPENAME, TYPENAME) \
+# define INDEX_STRIDED_OP(NAME, INDEX_TYPENAME, TYPENAME) \
 kernel void NAME( \
     constant size_t &dst_size, \
     constant size_t &left_size, \
     constant size_t &src_dim_size, \
     constant size_t &right_size, \
     constant size_t &ids_size, \
-    constant bool &contiguous, \
     constant size_t *src_dims, \
     constant size_t *src_strides, \
     const device TYPENAME *input, \
@@ -63,8 +104,8 @@ kernel void NAME( \
     device TYPENAME *output, \
     uint tid [[ thread_position_in_grid ]] \
 ) { \
-    index<TYPENAME, INDEX_TYPENAME>(dst_size, left_size, src_dim_size, right_size, ids_size, contiguous, src_dims, src_strides, input, input_ids, output, tid); \
-}
+    index_strided<TYPENAME, INDEX_TYPENAME>(dst_size, left_size, src_dim_size, right_size, ids_size, src_dims, src_strides, input, input_ids, output, tid); \
+} \
 
 
 template<typename TYPENAME, typename INDEX_TYPENAME>
@@ -197,6 +238,18 @@ INDEX_OP(is_u8_f32, uint8_t, float)
 INDEX_OP(is_u8_f16, uint8_t, half)
 #if defined(__HAVE_BFLOAT__)
 INDEX_OP(is_u8_bf16, uint8_t, bfloat)
+#endif
+
+INDEX_STRIDED_OP(is_strided_u32_f32, uint32_t, float)
+INDEX_STRIDED_OP(is_strided_u32_f16, uint32_t, half)
+#if defined(__HAVE_BFLOAT__)
+INDEX_STRIDED_OP(is_strided_u32_bf16, uint32_t, bfloat)
+#endif
+
+INDEX_STRIDED_OP(is_strided_u8_f32, uint8_t, float)
+INDEX_STRIDED_OP(is_strided_u8_f16, uint8_t, half)
+#if defined(__HAVE_BFLOAT__)
+INDEX_STRIDED_OP(is_strided_u8_bf16, uint8_t, bfloat)
 #endif
 
 GATHER_OP(gather_u32_f32, uint, float)

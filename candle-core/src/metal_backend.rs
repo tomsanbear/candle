@@ -2,6 +2,7 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result, Shape};
+use candle_metal_kernels::binary::contiguous;
 use candle_metal_kernels::CallConvTranspose2dCfg;
 use candle_metal_kernels::Kernels;
 use metal::{Buffer, CommandBuffer, CommandQueue, MTLResourceOptions, NSUInteger};
@@ -1357,38 +1358,64 @@ impl BackendStorage for MetalStorage {
         let dtype = self.dtype;
         let device = self.device();
         let buffer = device.new_buffer(dst_el, dtype, "index_select")?;
-        let name = match (ids.dtype, self.dtype) {
-            (DType::U8, DType::BF16) => "is_u8_bf16",
-            (DType::U8, DType::F32) => "is_u8_f32",
-            (DType::U8, DType::F16) => "is_u8_f16",
+        let src_contiguous = src_l.is_contiguous();
+        let name = match (src_contiguous, ids.dtype, self.dtype) {
+            (true, DType::U8, DType::BF16) => "is_u8_bf16",
+            (true, DType::U8, DType::F32) => "is_u8_f32",
+            (true, DType::U8, DType::F16) => "is_u8_f16",
 
-            (DType::U32, DType::F32) => "is_u32_f32",
-            (DType::U32, DType::F16) => "is_u32_f16",
-            (DType::U32, DType::BF16) => "is_u32_bf16",
+            (true, DType::U32, DType::F32) => "is_u32_f32",
+            (true, DType::U32, DType::F16) => "is_u32_f16",
+            (true, DType::U32, DType::BF16) => "is_u32_bf16",
 
-            (left, right) => {
-                crate::bail!("Metal contiguous index_select {left:?} {right:?} not implemented")
+            (false, DType::U8, DType::BF16) => "is_strided_u8_bf16",
+            (false, DType::U8, DType::F32) => "is_strided_u8_f32",
+            (false, DType::U8, DType::F16) => "is_strided_u8_f16",
+
+            (false, DType::U32, DType::F32) => "is_strided_u32_f32",
+            (false, DType::U32, DType::F16) => "is_strided_u32_f16",
+            (false, DType::U32, DType::BF16) => "is_strided_u32_bf16",
+
+            (contiguous, left, right) => {
+                crate::bail!("Metal index_select {left:?} {right:?} contiguous={contiguous:?} not implemented")
             }
         };
         let command_buffer = self.device.command_buffer()?;
-        candle_metal_kernels::call_index_select(
-            &device.device,
-            &command_buffer,
-            &self.device.kernels,
-            name,
-            src_l.dims(),
-            ids_el,
-            dim,
-            src_l.is_contiguous(),
-            src_l.dims(),
-            src_l.stride(),
-            &self.buffer,
-            src_l.start_offset() * dtype.size_in_bytes(),
-            &ids.buffer,
-            ids_l.start_offset() * ids.dtype.size_in_bytes(),
-            &buffer,
-        )
-        .map_err(MetalError::from)?;
+        if src_contiguous {
+            candle_metal_kernels::call_index_select(
+                &device.device,
+                &command_buffer,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                ids_el,
+                dim,
+                &self.buffer,
+                src_l.start_offset() * dtype.size_in_bytes(),
+                &ids.buffer,
+                ids_l.start_offset() * ids.dtype.size_in_bytes(),
+                &buffer,
+            )
+            .map_err(MetalError::from)?;
+        } else {
+            candle_metal_kernels::call_index_select_strided(
+                &device.device,
+                &command_buffer,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                ids_el,
+                dim,
+                src_l.dims(),
+                src_l.stride(),
+                &self.buffer,
+                src_l.start_offset() * dtype.size_in_bytes(),
+                &ids.buffer,
+                ids_l.start_offset() * ids.dtype.size_in_bytes(),
+                &buffer,
+            )
+            .map_err(MetalError::from)?;
+        }
         Ok(Self::new(buffer, device.clone(), dst_el, dtype))
     }
 

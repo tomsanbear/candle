@@ -625,7 +625,8 @@ fn index_select_strided() {
     let stride = [2, 4];
     let ids = [0u32];
     let dim = 0;
-    let result = run_index_select_strided(&embedding, &shape, &stride, &ids, dim, "is_u32_f32");
+    let result =
+        run_index_select_strided(&embedding, &shape, &stride, &ids, dim, "is_strided_u32_f32");
     assert_eq!(result, vec![0.0, 4.0]);
 }
 
@@ -717,9 +718,6 @@ fn run_index_select<T: Clone, I: Clone + std::fmt::Debug>(
         shape,
         ids.len(),
         dim,
-        true,
-        shape,
-        stride,
         &embeddings_buffer,
         0,
         &ids_buffer,
@@ -755,7 +753,7 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
     let dst_buffer = new_buffer(&device, &vec![0.0f32; dst_el]);
 
     let kernels = Kernels::new();
-    call_index_select(
+    call_index_select_strided(
         &device,
         &command_buffer,
         &kernels,
@@ -763,7 +761,6 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
         shape,
         ids.len(),
         dim,
-        false,
         shape,
         stride,
         &embeddings_buffer,

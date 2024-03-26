@@ -2002,3 +2002,77 @@ fn conv_transpose1d_u32() {
     let expected = vec![1, 4, 10, 20, 25, 24, 16];
     assert_eq!(results, expected);
 }
+
+#[test]
+fn attention() {
+    let device = device();
+    let command_queue = device.new_command_queue();
+    let command_buffer = command_queue.new_command_buffer();
+    let kernels = Kernels::new();
+
+    let (batch_size, seq_len, head, size_per_head) = (1, 1, 8, 8);
+    let dst_el = batch_size * seq_len * head * size_per_head;
+
+    let q_stride = [
+        seq_len * head * size_per_head,
+        head * size_per_head,
+        size_per_head,
+        1,
+    ];
+    let q_offset = 0;
+    let q_buffer = new_buffer(
+        &device,
+        &(0..dst_el).map(|v| v as f32).collect::<Vec<f32>>(),
+    );
+
+    let k_stride = [
+        seq_len * head * size_per_head,
+        head * size_per_head,
+        size_per_head,
+        1,
+    ];
+    let k_offset = 0;
+    let k_buffer = new_buffer(
+        &device,
+        &(0..dst_el).map(|v| v as f32).collect::<Vec<f32>>(),
+    );
+
+    let v_stride = [
+        seq_len * head * size_per_head,
+        head * size_per_head,
+        size_per_head,
+        1,
+    ];
+    let v_offset = 0;
+    let v_buffer = new_buffer(
+        &device,
+        &(0..dst_el).map(|v| v as f32).collect::<Vec<f32>>(),
+    );
+
+    let output = new_buffer(&device, &vec![0.0f32; dst_el]);
+
+    call_attention(
+        &device,
+        &command_buffer,
+        &kernels,
+        "attention",
+        (batch_size, seq_len, head, size_per_head),
+        &q_stride,
+        q_offset,
+        &q_buffer,
+        &k_stride,
+        k_offset,
+        &k_buffer,
+        &v_stride,
+        v_offset,
+        &v_buffer,
+        &output,
+    )
+    .unwrap();
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let output: Vec<f32> = read_to_vec(&output, dst_el);
+    println!("{:?}", output);
+}

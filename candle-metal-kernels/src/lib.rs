@@ -1567,6 +1567,23 @@ pub fn call_attention(
     let batched = r > 1;
     let fused_activation = false;
     let fused_bias = false;
+    let q_data_type = 4 as usize;
+    let masked = false;
+    let block_sparse = false;
+    let triangular = false;
+    let forward = true;
+    let backward = false;
+    let generate_block_mask = false;
+    let grouped_query = false;
+    let float_accumulator = false;
+    // TODO: revisit this and figure out what to do with these
+    let (r_simd, c_simd, r_splits, n_splits) = (8, 32, 4, 1);
+    let fuse_async_loads = false;
+    let d_simd = ((d + 7) / 8 * 8) as u16;
+    let r_group = r_simd * r_splits;
+    let r_bank_offset = r_group;
+    let c_bank_offset = c_simd;
+    let d_bank_offset = d_simd;
     let constants = Some(ConstantValues::new(vec![
         (0, Value::USize(r)),
         (1, Value::USize(c)),
@@ -1577,7 +1594,7 @@ pub fn call_attention(
         (12, Value::Bool(v_trans)),
         (13, Value::Bool(o_trans)),
         (20, Value::F32(alpha)),
-        (30, Value::F32(q_data_type)),
+        (30, Value::USize(q_data_type)),
         (100, Value::Bool(batched)),
         (50000, Value::Bool(masked)), // 101?
         (102, Value::Bool(block_sparse)),
@@ -1597,57 +1614,31 @@ pub fn call_attention(
         (222, Value::U16(d_bank_offset)),
     ]));
     let pipeline = kernels.load_pipeline_with_constants(device, Source::Mfa, name, constants)?;
-    let m_group = m_simd * m_splits;
-    let n_group = n_simd * n_splits;
-
-    let a_block_length = m_group * k_simd;
-    let b_block_length = k_simd * n_group;
-
-    let mut block_elements = a_block_length + b_block_length;
-    if (m % 8 != 0) && (n % 8 != 0) {
-        let c_block_length = m_group * n_group;
-        block_elements = std::cmp::max(c_block_length, block_elements)
-    }
-    if fused_bias {
-        if d_trans {
-            block_elements = std::cmp::max(block_elements, m_group);
-        } else {
-            block_elements = std::cmp::max(block_elements, n_group);
-        }
-    }
-    let bytes = match name {
-        "sgemm" => 4,
-        "hgemm" => 2,
-        other => {
-            return Err(MetalKernelError::LoadLibraryError(format!(
-                "{other} is not a valid kernel for gemm"
-            )));
-        }
-    };
-    let block_bytes: u16 = block_elements * bytes;
-
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_threadgroup_memory_length(0, block_bytes.into());
     encoder.set_buffer(0, Some(q_buffer), q_offset as NSUInteger);
     encoder.set_buffer(1, Some(k_buffer), k_offset as NSUInteger);
     encoder.set_buffer(2, Some(v_buffer), v_offset as NSUInteger);
     encoder.set_buffer(3, Some(output), 0);
-
-    let grid_size = MTLSize {
-        width: divide(n, n_group.into()),
-        height: divide(m, m_group.into()),
-        depth: grid_z as NSUInteger,
-    };
-    let group_size = MTLSize {
-        width: 32 * (m_splits as u64) * (n_splits as u64),
-        height: 1,
-        depth: 1,
-    };
     encoder.use_resource(q_buffer, metal::MTLResourceUsage::Read);
     encoder.use_resource(k_buffer, metal::MTLResourceUsage::Read);
     encoder.use_resource(v_buffer, metal::MTLResourceUsage::Read);
     encoder.use_resource(output, metal::MTLResourceUsage::Write);
+
+    let grid_z = r;
+    let r_group = r_simd * r_splits;
+    let c_group = c_simd * n_splits;
+    let grid_size = MTLSize {
+        width: divide(r, r_group.into()),
+        height: divide(c, c_group.into()),
+        depth: grid_z as NSUInteger,
+    };
+    let group_size = MTLSize {
+        width: 32 * (r_splits as u64),
+        height: 1,
+        depth: 1,
+    };
+
     encoder.dispatch_thread_groups(grid_size, group_size);
     encoder.end_encoding();
 

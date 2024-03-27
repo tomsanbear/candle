@@ -5,7 +5,7 @@ using namespace metal;
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 template <typename T>
-METAL_FUNC void winograd_conv_onebyone(
+METAL_FUNC void winograd_conv2d_onebyone(
     device const T *src,
     device const T *k,
     device T *dest,
@@ -13,21 +13,30 @@ METAL_FUNC void winograd_conv_onebyone(
     dest[tid] = (src[tid] * k[0]);
 }
 
-#define WINOGRAD_CONV_ONEBYONE_OP(T, FN_NAME) \
+#define WINOGRAD_CONV2D_ONEBYONE_OP(T, FN_NAME) \
 kernel void FN_NAME( \
     device const T *src, \
     device const T *k, \
     device T *dest, \
     uint tid [[ thread_position_in_grid ]] \
 ) { \
-    winograd_conv_onebyone<T>(src, k, dest, tid); \
+    winograd_conv2d_onebyone<T>(src, k, dest, tid); \
 } \
 
-WINOGRAD_CONV_ONEBYONE_OP(float, winograd_conv2d_f32_1b1)
-WINOGRAD_CONV_ONEBYONE_OP(half, winograd_conv2d_f16_1b1)
-WINOGRAD_CONV_ONEBYONE_OP(bfloat, winograd_conv2d_bf16_1b1)
-WINOGRAD_CONV_ONEBYONE_OP(uint8_t, winograd_conv2d_u8_1b1)
-WINOGRAD_CONV_ONEBYONE_OP(uint32_t, winograd_conv2d_u32_1b1)
+WINOGRAD_CONV2D_ONEBYONE_OP(float, winograd_conv2d_f32_1b1)
+WINOGRAD_CONV2D_ONEBYONE_OP(half, winograd_conv2d_f16_1b1)
+WINOGRAD_CONV2D_ONEBYONE_OP(bfloat, winograd_conv2d_bf16_1b1)
+WINOGRAD_CONV2D_ONEBYONE_OP(uint8_t, winograd_conv2d_u8_1b1)
+WINOGRAD_CONV2D_ONEBYONE_OP(uint32_t, winograd_conv2d_u32_1b1)
+
+template <typename T>
+METAL_FUNC void winograd_conv2d_twobytwo(
+    device const T *src,
+    device const T *k,
+    device T *dest,
+    uint tid [[ thread_position_in_grid ]]) {
+    
+}
 
 template <typename T>
 METAL_FUNC void im2col(

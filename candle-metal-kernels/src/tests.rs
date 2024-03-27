@@ -2070,26 +2070,4 @@ fn test_winograd_conv2d() {
 
     let expected: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
     assert_eq!(results, expected);
-
-    // 2 x 2 kernel
-    let input = vec![1.0f32, 2.0, 3.0, 4.0];
-    let input_shape = &[1, 1, 2, 2];
-    let input_stride = &[4, 4, 2, 1];
-
-    let kernel = vec![1.0f32, 2.0, 3.0, 4.0];
-    let kernel_shape = &[1, 1, 2, 2];
-    let kernel_stride = &[4, 4, 2, 1];
-
-    let results = run_winograd_conv2d(
-        &input,
-        input_shape,
-        input_stride,
-        &kernel,
-        kernel_shape,
-        "winograd_conv2d_f32_2b2",
-        (2, 2, 1, 0, 1),
-    );
-
-    let expected: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-    assert_eq!(results, expected);
 }

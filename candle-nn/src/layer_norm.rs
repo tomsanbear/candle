@@ -28,7 +28,7 @@
 //! ```
 //!
 //! [`Layer Normalization`]: https://arxiv.org/abs/1607.06450
-use candle::{DType, Result, Tensor, D};
+use candle::{Result, Tensor, D};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNormConfig {
@@ -107,22 +107,15 @@ impl LayerNorm {
 
 impl crate::Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_dtype = x.dtype();
-        let internal_dtype = match x_dtype {
-            DType::F16 | DType::BF16 => DType::F32,
-            d => d,
-        };
-        let hidden_size = x.dim(D::Minus1)?;
-        let x = x.to_dtype(internal_dtype)?;
         let x = if self.remove_mean {
-            let mean_x = (x.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+            let mean_x = x.mean_keepdim(D::Minus1)?.expand(x.shape())?;
             x.broadcast_sub(&mean_x)?
         } else {
-            x
+            x.clone()
         };
-        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let norm_x = x.sqr()?.mean_keepdim(D::Minus1)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        let x = x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)?;
+        let x = x_normed.broadcast_mul(&self.weight)?;
         match &self.bias {
             None => Ok(x),
             Some(bias) => x.broadcast_add(bias),

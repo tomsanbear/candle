@@ -221,8 +221,7 @@ impl crate::Module for Conv2d {
         match &self.bias {
             None => Ok(x),
             Some(bias) => {
-                let b = bias.dims1()?;
-                let bias = bias.reshape((1, b, 1, 1))?;
+                let bias: Tensor = bias.reshape((1, (), 1, 1))?;
                 Ok(x.broadcast_add(&bias)?)
             }
         }

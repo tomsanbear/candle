@@ -688,6 +688,11 @@ impl Tensor {
                         let sum_grad = grads.or_insert(arg)?;
                         *sum_grad = sum_grad.add(&arg_grad)?
                     }
+                    Op::Unary(arg, UnaryOp::Rsqrt) => {
+                        let arg_grad = (1.0f64 / grad.div(node)?.affine(0.5, 0.)?)?;
+                        let sum_grad = grads.or_insert(arg)?;
+                        *sum_grad = sum_grad.add(&arg_grad)?
+                    }
                     Op::ToDevice(arg) => {
                         let sum_grad = grads.or_insert(arg)?;
                         let arg_grad = grad.to_device(sum_grad.device())?;

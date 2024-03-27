@@ -188,3 +188,9 @@ impl Module for RmsNorm {
         self.inner.forward(x)
     }
 }
+
+pub fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
+    let inner = candle_nn::rms_norm(size, eps, vb)?;
+    let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
+    Ok(RmsNorm { inner, span })
+}

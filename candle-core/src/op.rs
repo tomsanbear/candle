@@ -57,6 +57,7 @@ pub enum UnaryOp {
     Recip,
     Sqr,
     Sqrt,
+    Rsqrt,
     Gelu,
     GeluErf,
     Erf,
@@ -245,6 +246,7 @@ pub(crate) struct Neg;
 pub(crate) struct Recip;
 pub(crate) struct Sqr;
 pub(crate) struct Sqrt;
+pub(crate) struct Rsqrt;
 pub(crate) struct Gelu;
 pub(crate) struct GeluErf;
 pub(crate) struct Erf;
@@ -456,6 +458,7 @@ unary_op!(Neg, "neg", v, -v);
 unary_op!(Recip, "recip", v, v.recip());
 unary_op!(Sqr, "sqr", v, v * v, vs_sqr, vd_sqr);
 unary_op!(Sqrt, "sqrt", v, v.sqrt(), vs_sqrt, vd_sqrt);
+unary_op!(Rsqrt, "rsqrt", v, v.sqrt(), vs_sqrt, vd_sqrt);
 
 /// Tanh based approximation of the `gelu` operation
 /// GeluErf is the more precise one.

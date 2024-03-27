@@ -1596,6 +1596,45 @@ pub fn call_gemm(
     Ok(())
 }
 
+pub fn call_winograd_conv2d(
+    device: &Device,
+    command_buffer: &CommandBufferRef,
+    kernels: &Kernels,
+    name: &'static str,
+    (h_k, w_k, stride, padding, dilation): (usize, usize, usize, usize, usize),
+    input: &Buffer,
+    input_offset: usize,
+    input_shape: &[usize],
+    kernel: &Buffer,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let h = input_shape[2];
+    let w = input_shape[3];
+    let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
+    let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
+    let dst_el = input_shape[0] * h_out * w_out * input_shape[1] * h_k * w_k;
+
+    match (h_k, w_k) {
+        (1, 1) => {
+            let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+            let encoder = command_buffer.new_compute_command_encoder();
+            let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+            encoder.set_compute_pipeline_state(&pipeline);
+            set_params!(encoder, ((input, input_offset), kernel, output));
+            encoder.use_resource(input, metal::MTLResourceUsage::Read);
+            encoder.use_resource(kernel, metal::MTLResourceUsage::Read);
+            encoder.use_resource(output, metal::MTLResourceUsage::Write);
+            encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+            encoder.end_encoding();
+            Ok(())
+        }
+        (h_k, w_k) => Err(MetalKernelError::LoadLibraryError(format!(
+            "{:?} is not a valid kernel for winograd_conv2d",
+            (h_k, w_k)
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_im2col1d_strided(
     device: &Device,

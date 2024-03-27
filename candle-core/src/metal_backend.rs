@@ -1040,13 +1040,40 @@ impl BackendStorage for MetalStorage {
             .device
             .new_buffer(dst_el, self.dtype, "conv2d_im2col")?;
         let command_buffer = self.device.command_buffer()?;
-        let name = match self.dtype {
-            DType::F32 => "im2col_f32",
-            DType::F16 => "im2col_f16",
-            DType::BF16 => "im2col_bf16",
-            DType::U8 => "im2col_u8",
-            DType::U32 => "im2col_u32",
-            dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
+
+        // Special case for 1x1 convolutions with stride 1 and padding 0
+        // if h_k == 1 && w_k == 1 {
+        //     let name = match (h_out, w_out, self.dtype) {
+        //         (_, _, DType::F32) => "winograd_conv2d_f32_1b1",
+        //         (_, _, DType::F16) => "winograd_conv2d_f16_1b1",
+        //         (_, _, DType::BF16) => "winograd_conv2d_bf16_1b1",
+        //         (_, _, DType::U8) => "winograd_conv2d_u8_1b1",
+        //         (_, _, DType::U32) => "winograd_conv2d_u32_1b1",
+        //         (_, _, dtype) => crate::bail!("Metal conv2d {dtype:?} not implemented"),
+        //     };
+        //     candle_metal_kernels::call_winograd_conv2d(
+        //         &self.device.device,
+        //         &command_buffer,
+        //         &self.device.kernels,
+        //         name,
+        //         (h_k, w_k, stride, padding, dilation),
+        //         &self.buffer,
+        //         layout.start_offset(),
+        //         layout.shape().dims(),
+        //         &kernel.buffer,
+        //         &dst,
+        //     )
+        //     .map_err(MetalError::from)?;
+        //     return Ok(Self::new(dst, self.device.clone(), dst_el, self.dtype));
+        // };
+
+        let name = match (h_out, w_out, self.dtype) {
+            (_, _, DType::F32) => "im2col_f32",
+            (_, _, DType::F16) => "im2col_f16",
+            (_, _, DType::BF16) => "im2col_bf16",
+            (_, _, DType::U8) => "im2col_u8",
+            (_, _, DType::U32) => "im2col_u32",
+            (_, _, dtype) => crate::bail!("Metal conv2d {dtype:?} not implemented"),
         };
         candle_metal_kernels::call_im2col_strided(
             &self.device.device,

@@ -2002,3 +2002,94 @@ fn conv_transpose1d_u32() {
     let expected = vec![1, 4, 10, 20, 25, 24, 16];
     assert_eq!(results, expected);
 }
+
+fn run_winograd_conv2d(
+    input: &[f32],
+    input_shape: &[usize],
+    input_stride: &[usize],
+    kernel: &[f32],
+    kernel_shape: &[usize],
+    name: &'static str,
+    (h_k, w_k, stride, padding, dilation): (usize, usize, usize, usize, usize),
+) -> Vec<f32> {
+    let device = device();
+    let command_queue = device.new_command_queue();
+    let command_buffer = command_queue.new_command_buffer();
+
+    let h = input_shape[2];
+    let w = input_shape[3];
+    let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
+    let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
+
+    let dst_el = input_shape[0] * h_out * w_out * input_shape[1] * h_k * w_k;
+
+    let input = new_buffer(&device, input);
+    let kernel = new_buffer(&device, kernel);
+    let output = new_buffer(&device, &vec![0.0f32; dst_el]);
+    let kernels = Kernels::new();
+
+    call_winograd_conv2d(
+        &device,
+        command_buffer,
+        &kernels,
+        name,
+        (h_k, w_k, stride, padding, dilation),
+        &input,
+        0,
+        &input_shape,
+        &kernel,
+        &output,
+    )
+    .unwrap();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    read_to_vec(&output, dst_el)
+}
+
+#[test]
+fn test_winograd_conv2d() {
+    // 1 x 1 kernel
+    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_shape = &[1, 1, 2, 2];
+    let input_stride = &[4, 4, 2, 1];
+
+    let kernel = vec![1.0f32];
+    let kernel_shape = &[1, 1, 1, 1];
+    let kernel_stride = &[1, 1, 1, 1];
+
+    let results = run_winograd_conv2d(
+        &input,
+        input_shape,
+        input_stride,
+        &kernel,
+        kernel_shape,
+        "winograd_conv2d_f32_1b1",
+        (1, 1, 1, 0, 1),
+    );
+
+    let expected: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+    assert_eq!(results, expected);
+
+    // 2 x 2 kernel
+    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_shape = &[1, 1, 2, 2];
+    let input_stride = &[4, 4, 2, 1];
+
+    let kernel = vec![1.0f32, 2.0, 3.0, 4.0];
+    let kernel_shape = &[1, 1, 2, 2];
+    let kernel_stride = &[4, 4, 2, 1];
+
+    let results = run_winograd_conv2d(
+        &input,
+        input_shape,
+        input_stride,
+        &kernel,
+        kernel_shape,
+        "winograd_conv2d_f32_2b2",
+        (2, 2, 1, 0, 1),
+    );
+
+    let expected: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+    assert_eq!(results, expected);
+}

@@ -2010,6 +2010,7 @@ fn run_welford_layer_norm<T: Debug>(
     weight: &[T],
     bias: &[T],
     shape: &[u32],
+    strides: &[u32],
     name: &'static str,
 ) -> Vec<f32> {
     let device = device();
@@ -2027,6 +2028,7 @@ fn run_welford_layer_norm<T: Debug>(
         &kernels,
         name,
         shape,
+        strides,
         &input,
         &weight,
         &bias,
@@ -2045,7 +2047,15 @@ fn welford_layer_norm_f32() {
     let weight = vec![1.0f32; 8];
     let bias = vec![0.0f32; 8];
     let shape = vec![1u32, 1, 8];
-    let output = run_welford_layer_norm(&input, &weight, &bias, &shape, "welford_scalar_f32");
+    let strides = vec![8, 8, 1];
+    let output = run_welford_layer_norm(
+        &input,
+        &weight,
+        &bias,
+        &shape,
+        &strides,
+        "welford_scalar_f32",
+    );
     let expected = vec![
         -1.5275, -1.0911, -0.6547, -0.2182, 0.2182, 0.6547, 1.0911, 1.5275,
     ];

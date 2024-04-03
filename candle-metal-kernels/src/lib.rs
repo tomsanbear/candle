@@ -2133,6 +2133,7 @@ fn call_welford_layer_norm(
     kernels: &Kernels,
     name: &'static str,
     shape: &[u32],
+    strides: &[u32],
     input: &Buffer,
     scale: &Buffer,
     bias: &Buffer,
@@ -2145,7 +2146,10 @@ fn call_welford_layer_norm(
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, src_el);
 
-    set_params!(encoder, (input, scale, bias, output, shape));
+    set_params!(
+        encoder,
+        (input, scale, bias, output, shape.len(), shape, strides)
+    );
 
     encoder.use_resource(input, metal::MTLResourceUsage::Read);
     encoder.use_resource(scale, metal::MTLResourceUsage::Read);

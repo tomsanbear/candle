@@ -93,7 +93,9 @@ kernel void welford_scalar_f32(
     device const float *S [[buffer(1)]],
     device const float *B [[buffer(2)]],
     device float *Y [[buffer(3)]],
-    device uint *shape [[buffer(4)]],
+    constant size_t &num_dims [[buffer(4)]],
+    constant const size_t *shape [[buffer(5)]],
+    constant const size_t *strides [[buffer(6)]],
     uint global_id [[thread_position_in_grid]],
     uint local_id [[thread_position_in_threadgroup]],
     uint local_size [[threads_per_threadgroup]],
@@ -101,6 +103,8 @@ kernel void welford_scalar_f32(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
+    uint anchor = get_strided_index(global_id, num_dims, shape, strides);
+
     // Shape: [B, M, N]
     uint M = shape[1];
     uint N = shape[2];
@@ -112,7 +116,7 @@ kernel void welford_scalar_f32(
     thread float thread_mean = 0.0;
     thread float thread_count = 0.0;
 
-    welford_combine<float>(X[global_id], thread_mean, thread_var, thread_count);
+    welford_combine<float>(X[anchor], thread_mean, thread_var, thread_count);
     
     thread float mean = 0.0;
     thread float m2 = 0.0;

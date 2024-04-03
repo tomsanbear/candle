@@ -2046,9 +2046,8 @@ fn welford_layer_norm_f32() {
     let shape = vec![1u32, 1, 8];
     let output = run_welford_layer_norm(&input, &weight, &bias, &shape, "welford_f32");
 
-    // TODO: get the actual expected value
     let expected = vec![
         -1.5275, -1.0911, -0.6547, -0.2182, 0.2182, 0.6547, 1.0911, 1.5275,
     ];
-    assert_eq!(output, expected);
+    assert_eq!(approx(output, 4), expected);
 }

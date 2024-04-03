@@ -97,13 +97,7 @@ kernel void welford_f32(
     thread float thread_mean = 0.0;
     thread float thread_count = 0.0;
 
-    // for (var i = local_id.x; i < metadata.N; i+= {{ workgroup_size_x }}u) {
-    //     welford_combine(X[anchor + i], &threadMean, &threadVar, &threadCount);
-    // }
-    // TODO: probably a bug here
-    for (uint i = local_id; i < N; i += local_size) {
-        welford_combine<float>(X[anchor + i], thread_mean, thread_var, thread_count);
-    }
+    welford_combine<float>(X[anchor], thread_mean, thread_var, thread_count);
 
     thread float mean = 0.0;
     thread float m2 = 0.0;
@@ -117,15 +111,7 @@ kernel void welford_f32(
 
     simdgroup_barrier(mem_flags::mem_none);
 
-    // for (var i = local_id.x; i < metadata.N; i+= {{ workgroup_size_x }}u) {
-    //     let val = X[anchor + i];
-    //     let normalized = (val - mu) * sigma;
-    //     Y[anchor + i] = fma(normalized, S[i], B[i]); 
-    // }
-    // TODO: probably a bug here
-    for (uint i = local_id; i < N; i += local_size) {
-        float val = X[anchor + i];
-        float normalized = (val - mu) * sigma;
-        Y[anchor + i] = fma(normalized, S[i], B[i]);
-    }
+    float val = X[anchor];
+    float normalized = (val - mu) * sigma;
+    Y[anchor] = fma(normalized, S[anchor], B[anchor]);
 }

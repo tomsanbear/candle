@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use super::*;
 use half::{bf16, f16};
 use metal::MTLResourceOptions;
@@ -2001,4 +2003,52 @@ fn conv_transpose1d_u32() {
 
     let expected = vec![1, 4, 10, 20, 25, 24, 16];
     assert_eq!(results, expected);
+}
+
+fn run_welford_layer_norm<T: Debug>(
+    input: &[T],
+    weight: &[T],
+    bias: &[T],
+    shape: &[u32],
+    name: &'static str,
+) -> Vec<f32> {
+    let device = device();
+    let command_queue = device.new_command_queue();
+    let command_buffer = command_queue.new_command_buffer();
+    let input_len = input.len() as usize;
+    let input = new_buffer(&device, input);
+    let weight = new_buffer(&device, weight);
+    let bias = new_buffer(&device, bias);
+    let output = new_buffer(&device, &vec![0.0f32; input_len]);
+    let kernels = Kernels::new();
+    call_welford_layer_norm(
+        &device,
+        command_buffer,
+        &kernels,
+        name,
+        shape,
+        &input,
+        &weight,
+        &bias,
+        &output,
+    )
+    .unwrap();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    read_to_vec(&output, input_len)
+}
+
+#[test]
+fn welford_layer_norm_f32() {
+    let input = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let weight = vec![1.0f32; 8];
+    let bias = vec![0.0f32; 8];
+    let shape = vec![1u32, 1, 8];
+    let output = run_welford_layer_norm(&input, &weight, &bias, &shape, "welford_f32");
+
+    // TODO: get the actual expected value
+    let expected = vec![
+        -1.5275, -1.0911, -0.6547, -0.2182, 0.2182, 0.6547, 1.0911, 1.5275,
+    ];
+    assert_eq!(output, expected);
 }

@@ -17,6 +17,7 @@ const REDUCE: &str = include_str!("reduce.metal");
 const RANDOM: &str = include_str!("random.metal");
 const MFA: &[u8] = include_bytes!("libMetalFlashAttention.metallib");
 const QUANTIZED: &str = include_str!("quantized.metal");
+const LAYER_NORM: &str = include_str!("layer_norm.metal");
 
 /// Most kernels apply similarly across the tensors
 /// This creates a strategy that uses the maximum amount of threads per threadgroup (capped at the
@@ -125,6 +126,7 @@ pub enum Source {
     Conv,
     Random,
     Quantized,
+    LayerNorm,
 }
 
 pub mod copy2d {
@@ -257,6 +259,7 @@ impl Kernels {
             Source::Conv => CONV,
             Source::Random => RANDOM,
             Source::Quantized => QUANTIZED,
+            Source::LayerNorm => LAYER_NORM,
             Source::Mfa => panic!("Invalid lib"),
         }
     }
@@ -2118,6 +2121,34 @@ pub fn call_conv_transpose2d(
     );
     encoder.use_resource(input, metal::MTLResourceUsage::Read);
     encoder.use_resource(kernel, metal::MTLResourceUsage::Read);
+    encoder.use_resource(output, metal::MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    encoder.end_encoding();
+    Ok(())
+}
+
+fn call_welford_layer_norm(
+    device: &Device,
+    command_buffer: &CommandBufferRef,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[u32],
+    input: &Buffer,
+    scale: &Buffer,
+    bias: &Buffer,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::LayerNorm, name)?;
+    let encoder = command_buffer.new_compute_command_encoder();
+    let src_el = shape.iter().product::<u32>() as usize;
+    encoder.set_compute_pipeline_state(&pipeline);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, src_el);
+
+    set_params!(encoder, (input, scale, bias, output, shape));
+
+    encoder.use_resource(input, metal::MTLResourceUsage::Read);
+    encoder.use_resource(scale, metal::MTLResourceUsage::Read);
+    encoder.use_resource(bias, metal::MTLResourceUsage::Read);
     encoder.use_resource(output, metal::MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     encoder.end_encoding();

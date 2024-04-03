@@ -1,6 +1,21 @@
 #include <metal_stdlib>
 using namespace metal;
 
+METAL_FUNC uint get_strided_index(
+    uint idx,
+    constant size_t &num_dims,
+    constant size_t *dims,
+    constant size_t *strides
+) {
+    uint strided_i = 0;
+    for (uint d = 0; d < num_dims; d++) {
+        uint dim_idx = num_dims - 1 - d;
+        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
+        idx /= dims[dim_idx];
+    }
+    return strided_i;
+}
+
 template<typename T>
 METAL_FUNC void welford_combine(
     thread T val,
@@ -8,7 +23,7 @@ METAL_FUNC void welford_combine(
     thread T &m2,
     thread T &count
 ) {
-    count += 1.0;
+    count += 1;
     T delta1 = val - mean;
     mean += delta1 / count;
     T delta2 = val - mean;
@@ -24,7 +39,7 @@ METAL_FUNC void block_welford_combine(
     thread T &m2,
     thread T &count
 ) {
-    if (b_count == 0.0) {
+    if (b_count == 0) {
         return;
     }
     T new_count = count + b_count; 
@@ -73,7 +88,7 @@ METAL_FUNC void welford_warp_all_reduce(
     count = simd_broadcast(count, 0u);
 }
 
-kernel void welford_f32(
+kernel void welford_scalar_f32(
     device const float *X [[buffer(0)]],
     device const float *S [[buffer(1)]],
     device const float *B [[buffer(2)]],
@@ -86,32 +101,32 @@ kernel void welford_f32(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    uint subgrp_size = local_size;
+    // Shape: [B, M, N]
     uint M = shape[1];
     uint N = shape[2];
-    float mu = 0.0;
-    float sigma = 0.0;
 
-    uint anchor = global_id;
+    threadgroup float mu = 0.0;
+    threadgroup float sigma = 0.0;
+
     thread float thread_var = 0.0;
     thread float thread_mean = 0.0;
     thread float thread_count = 0.0;
 
-    welford_combine<float>(X[anchor], thread_mean, thread_var, thread_count);
-
+    welford_combine<float>(X[global_id], thread_mean, thread_var, thread_count);
+    
     thread float mean = 0.0;
     thread float m2 = 0.0;
     thread float count = 0.0;
 
-    welford_warp_all_reduce<float>(subgrp_size, thread_mean, thread_var, thread_count, mean, m2, count);
-    if (simd_group_id == 0u) {
+    welford_warp_all_reduce<float>(local_size, thread_mean, thread_var, thread_count, mean, m2, count);
+    if (simd_lane_id == 0u) {
         mu = mean;
         sigma = rsqrt(m2 / count + 1e-5);
     }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    simdgroup_barrier(mem_flags::mem_none);
-
-    float val = X[anchor];
+    uint dst_idx = global_id;
+    float val = X[dst_idx];
     float normalized = (val - mu) * sigma;
-    Y[anchor] = fma(normalized, S[anchor], B[anchor]);
+    Y[dst_idx] = fma(normalized, S[dst_idx], B[dst_idx]);
 }

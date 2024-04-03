@@ -2040,14 +2040,14 @@ fn run_welford_layer_norm<T: Debug>(
 
 #[test]
 fn welford_layer_norm_f32() {
+    // (1, 1, 8)
     let input = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
     let weight = vec![1.0f32; 8];
     let bias = vec![0.0f32; 8];
     let shape = vec![1u32, 1, 8];
-    let output = run_welford_layer_norm(&input, &weight, &bias, &shape, "welford_f32");
-
+    let output = run_welford_layer_norm(&input, &weight, &bias, &shape, "welford_scalar_f32");
     let expected = vec![
         -1.5275, -1.0911, -0.6547, -0.2182, 0.2182, 0.6547, 1.0911, 1.5275,
     ];
-    assert_eq!(approx(output, 4), expected);
+    assert_eq!(approx(output, 4), expected, "(1, 1, 8)");
 }

@@ -2142,6 +2142,7 @@ fn call_welford_layer_norm(
     let encoder = command_buffer.new_compute_command_encoder();
     let src_el = shape.iter().product::<u32>() as usize;
     encoder.set_compute_pipeline_state(&pipeline);
+
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, src_el);
 
     set_params!(encoder, (input, scale, bias, output, shape));

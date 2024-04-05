@@ -67,6 +67,8 @@ enum Which {
     Mixtral,
     #[value(name = "mixtral-instruct")]
     MixtralInstruct,
+    #[value(name = "tinyllama-chat-v1.0")]
+    TinyLlamaChatV10,
 }
 
 impl Which {
@@ -93,7 +95,8 @@ impl Which {
             | Self::MixtralInstruct
             | Self::Mistral7b
             | Self::Mistral7bInstruct
-            | Self::Mistral7bInstructV02 => true,
+            | Self::TinyLlamaChatV10 => true,
+            Self::Mistral7bInstructV02 => true,
         }
     }
 
@@ -117,7 +120,7 @@ impl Which {
             | Self::Mistral7bInstructV02
             | Self::OpenChat35
             | Self::Starling7bAlpha => false,
-            Self::Zephyr7bAlpha | Self::Zephyr7bBeta => true,
+            Self::Zephyr7bAlpha | Self::Zephyr7bBeta | Self::TinyLlamaChatV10 => true,
         }
     }
 
@@ -140,7 +143,8 @@ impl Which {
             | Self::Mistral7bInstruct
             | Self::Mistral7bInstructV02
             | Self::Zephyr7bAlpha
-            | Self::Zephyr7bBeta => false,
+            | Self::Zephyr7bBeta
+            | Self::TinyLlamaChatV10 => false,
             Self::OpenChat35 | Self::Starling7bAlpha => true,
         }
     }
@@ -155,7 +159,8 @@ impl Which {
             | Which::L70bChat
             | Which::L7bCode
             | Which::L13bCode
-            | Which::L34bCode => "hf-internal-testing/llama-tokenizer",
+            | Which::L34bCode
+            | Which::TinyLlamaChatV10 => "hf-internal-testing/llama-tokenizer",
             Which::Leo7b => "LeoLM/leo-hessianai-7b",
             Which::Leo13b => "LeoLM/leo-hessianai-13b",
             Which::Mixtral => "mistralai/Mixtral-8x7B-v0.1",
@@ -211,6 +216,11 @@ struct Args {
     /// Enable tracing (generates a trace-timestamp.json file).
     #[arg(long)]
     tracing: bool,
+
+    /// Enable Metal tracing (generates a timestamp.gputrace directory).
+    /// This is only available on OSX and requires the metal feature to be enabled.
+    #[arg(long)]
+    metal_tracing: bool,
 
     /// Display the token for the specified prompt.
     #[arg(long)]
@@ -322,6 +332,10 @@ impl Args {
                         "TheBloke/Starling-LM-7B-alpha-GGUF",
                         "starling-lm-7b-alpha.Q4_K_M.gguf",
                     ),
+                    Which::TinyLlamaChatV10 => (
+                        "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+                        "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+                    ),
                 };
                 let api = hf_hub::api::sync::Api::new()?;
                 let api = api.model(repo.to_string());
@@ -431,7 +445,8 @@ fn main() -> anyhow::Result<()> {
                 | Which::L70b
                 | Which::L70bChat
                 | Which::OpenChat35
-                | Which::Starling7bAlpha => 8,
+                | Which::Starling7bAlpha
+                | Which::TinyLlamaChatV10 => 8,
             };
             ModelWeights::from_ggml(model, args.gqa.unwrap_or(default_gqa))?
         }
@@ -545,6 +560,29 @@ fn main() -> anyhow::Result<()> {
         let eos_token = *tos.tokenizer().get_vocab(true).get(eos_token).unwrap();
         let start_post_prompt = std::time::Instant::now();
         let mut sampled = 0;
+
+        // If Metal tracing is enabled and the device is of type Metal, enable tracing.
+        // We start capturing after the model has been loaded to focus on only capturing
+        // the inference phase, further if we capture everything, my laptop crashes
+        // when loading the trace!
+        #[cfg(feature = "metal")]
+        {
+            if args.metal_tracing {
+                // It's required to also pass an environment variable to enable Metal tracing, this is super undocumented so let's tell the user here!
+                if std::env::var("METAL_CAPTURE_ENABLED").is_err() {
+                    println!("To enable Metal tracing, you need to set the METAL_CAPTURE_ENABLED environment variable to '1'.");
+                    std::process::exit(1);
+                }
+                if let candle::Device::Metal(metal_device) = &device {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    metal_device.capture(format!("/tmp/{}.gputrace", timestamp))?;
+                }
+            }
+        }
+
         for index in 0..to_sample {
             let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, prompt_tokens.len() + index)?;

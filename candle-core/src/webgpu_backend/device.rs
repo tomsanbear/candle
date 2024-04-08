@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::{
     backend::{BackendDevice, BackendStorage},
@@ -16,6 +16,11 @@ pub struct WebGPUDevice {
 }
 
 impl WebGPUDevice {
+    pub fn wait_until_completed(&self) -> Result<()> {
+        self.queue.submit(std::iter::empty());
+        Ok(())
+    }
+
     pub fn webgpu_device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -26,20 +31,20 @@ impl WebGPUDevice {
 
     pub fn allocate_buffer(
         &self,
-        size: usize,
+        size: u64,
         usage: wgpu::BufferUsages,
         label: &str,
-    ) -> Result<Arc<wgpu::Buffer>> {
+    ) -> Result<wgpu::Buffer> {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: size as u64,
+            size,
             usage,
             mapped_at_creation: false,
         });
-        Ok(Arc::new(buffer))
+        Ok(buffer)
     }
 
-    pub fn allocate_output_buffer(&self, size: usize, label: &str) -> Result<Arc<wgpu::Buffer>> {
+    pub fn allocate_output_buffer(&self, size: u64, label: &str) -> Result<wgpu::Buffer> {
         self.allocate_buffer(
             size,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
@@ -163,6 +168,7 @@ impl BackendDevice for WebGPUDevice {
             storage.dtype(),
             self.clone(),
             None,
+            Arc::new(RwLock::new(None)),
         ))
     }
 

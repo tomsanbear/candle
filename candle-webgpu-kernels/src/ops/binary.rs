@@ -1,10 +1,15 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::Result;
 use tera::Tera;
+use wgpu::CommandEncoder;
 
 use crate::WebGPUKernelError;
 
+#[derive(Debug, Clone)]
 pub struct BinaryOp {
     pub op: String,
     pub lhs_shape: Vec<usize>,
@@ -22,7 +27,7 @@ impl BinaryOp {
         rhs: &wgpu::Buffer,
         output: &wgpu::Buffer,
         staging: Option<&wgpu::Buffer>,
-    ) -> Result<Arc<wgpu::CommandEncoder>, WebGPUKernelError> {
+    ) -> Result<Arc<RwLock<Option<CommandEncoder>>>, WebGPUKernelError> {
         // Configuration variables
         let workgroup_size_x = self.lhs_shape.iter().product::<usize>() as u32;
         let workgroup_size_y = 1;
@@ -89,7 +94,7 @@ impl BinaryOp {
             cpass.dispatch_workgroups(workgroup_size_x, workgroup_size_y, workgroup_size_z);
         }
 
-        Ok(Arc::new(cpass))
+        Ok(Arc::new(RwLock::new(Some(cpass))))
     }
 }
 

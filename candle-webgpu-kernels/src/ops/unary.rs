@@ -1,7 +1,11 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::Result;
 use tera::Tera;
+use wgpu::CommandEncoder;
 
 use crate::WebGPUKernelError;
 
@@ -20,7 +24,7 @@ impl UnaryOp {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
         staging: Option<&wgpu::Buffer>,
-    ) -> Result<(), WebGPUKernelError> {
+    ) -> Result<Arc<RwLock<Option<CommandEncoder>>>, WebGPUKernelError> {
         // Configuration variables
         let workgroup_size_x = self.input_shape.iter().product::<usize>() as u32;
         let workgroup_size_y = 1;
@@ -81,16 +85,9 @@ impl UnaryOp {
             cpass.set_bind_group(0, &bind_group, &[]);
             cpass.insert_debug_marker("abs");
             cpass.dispatch_workgroups(workgroup_size_x, workgroup_size_y, workgroup_size_z);
-        }
+        };
 
-        if let Some(staging) = staging {
-            cpass.copy_buffer_to_buffer(output, 0, staging, 0, input.size());
-        }
-
-        // Submit the command encoder
-        queue.submit(Some(cpass.finish()));
-
-        Ok(())
+        Ok(Arc::new(RwLock::new(Some(cpass))))
     }
 }
 

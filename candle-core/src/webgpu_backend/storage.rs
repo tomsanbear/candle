@@ -1,20 +1,24 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use wgpu::{Buffer, BufferUsages, CommandEncoder};
 
-use crate::{backend::BackendStorage, DType, WebGPUDevice, WebGPUError};
+use crate::{backend::BackendStorage, CpuStorage, DType, Result, WebGPUDevice, WebGPUError};
+
+use super::Block;
 
 #[derive(Debug, Clone)]
 pub struct WebGPUStorage {
     /// The buffer that holds the output data
     buffer: Arc<Buffer>,
 
+    staging_buffer: Arc<RwLock<Option<Buffer>>>,
+
     /// The encoder that is used for processing the op
-    encoder: Arc<Option<CommandEncoder>>,
+    encoder: Arc<RwLock<Option<CommandEncoder>>>,
 
     /// The parent storage that this storage is derived from
     /// This is used for computing the operation graph
-    parent: Arc<Option<WebGPUStorage>>,
+    parent: Option<Arc<WebGPUStorage>>,
 
     /// The data type of the storage
     dtype: DType,
@@ -28,20 +32,39 @@ impl WebGPUStorage {
         buffer: Arc<Buffer>,
         dtype: DType,
         device: WebGPUDevice,
-        parent: Option<Self>,
+        parent: Option<Arc<Self>>,
+        encoder: Arc<RwLock<Option<CommandEncoder>>>,
     ) -> Self {
         Self {
             buffer,
-            parent: Arc::new(parent),
-            encoder: Arc::new(None),
+            parent,
+            encoder,
             dtype,
             device,
+            staging_buffer: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Waits for the gpu to finish processing and unlock reading from the staging buffer
+    /// Forces the storage enqueue all pending operations
     pub fn synchronize(&self) -> crate::Result<()> {
-        todo!()
+        if let Some(parent) = self.parent.as_ref() {
+            parent.synchronize()?;
+        } else if self.encoder.try_read().unwrap().is_some() {
+            let mut encoder = self.encoder.try_write().unwrap().take().unwrap();
+            if let Some(staging_buffer) = self.staging_buffer.try_read().unwrap().as_ref() {
+                encoder.copy_buffer_to_buffer(
+                    &self.buffer,
+                    0,
+                    staging_buffer,
+                    0,
+                    self.buffer.size(),
+                );
+            }
+            encoder.finish();
+        } else {
+            return Ok(());
+        }
+        Ok(())
     }
 
     /// Returns the buffer
@@ -50,8 +73,47 @@ impl WebGPUStorage {
     }
 
     /// Returns the parent storage
-    pub fn parent(&self) -> Arc<Option<WebGPUStorage>> {
+    pub fn parent(&self) -> Option<Arc<WebGPUStorage>> {
         self.parent.clone()
+    }
+
+    pub(crate) fn to_cpu<T: std::fmt::Debug + Clone + bytemuck::Pod>(&self) -> Result<Vec<T>> {
+        // setup the staging buffer
+        {
+            let mut staging_buffer = self.staging_buffer.write().unwrap();
+            if staging_buffer.is_none() {
+                *staging_buffer = Some(self.device.allocate_buffer(
+                    self.buffer.size(),
+                    BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    "staging",
+                )?);
+            }
+        }
+
+        // evaluate the graph and queue the encoders
+        self.synchronize()?;
+
+        // Note that we're not calling `.await` here.
+        let staging_buffer = self.staging_buffer.try_write().unwrap();
+        let staging_buffer = staging_buffer.as_ref().unwrap();
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = flume::bounded(4);
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+        self.device
+            .device
+            .poll(wgpu::Maintain::wait())
+            .panic_on_timeout();
+
+        // Awaits until `buffer_future` can be read from
+        receiver.recv().unwrap();
+        let result = {
+            let data = buffer_slice.get_mapped_range();
+            let result = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buffer.unmap();
+            result
+        };
+        Ok(result)
     }
 }
 
@@ -71,32 +133,19 @@ impl BackendStorage for WebGPUStorage {
     }
 
     fn to_cpu_storage(&self) -> crate::Result<crate::CpuStorage> {
-        todo!()
+        match self.dtype {
+            DType::U8 => Ok(CpuStorage::U8(self.to_cpu()?)),
+            DType::U32 => Ok(CpuStorage::U32(self.to_cpu()?)),
+            DType::I64 => Ok(CpuStorage::I64(self.to_cpu()?)),
+            DType::F16 => Ok(CpuStorage::F16(self.to_cpu()?)),
+            DType::BF16 => Ok(CpuStorage::BF16(self.to_cpu()?)),
+            DType::F32 => Ok(CpuStorage::F32(self.to_cpu()?)),
+            DType::F64 => Ok(CpuStorage::F64(self.to_cpu()?)),
+        }
     }
 
     fn affine(&self, layout: &crate::Layout, mul: f64, add: f64) -> crate::Result<Self> {
-        if mul == 1.0 && add == 0.0 {
-            return Ok(self.clone());
-        }
-
-        let device = self.device.clone();
-        let dtype = self.dtype;
-
-        let shape = layout.shape();
-        let el = shape.elem_count();
-
-        let output_buffer = device.allocate_buffer(
-            el,
-            BufferUsages::STORAGE | BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            "affine",
-        )?;
-
-        Ok(Self::new(
-            output_buffer.clone(),
-            dtype,
-            device,
-            Some(self.clone()),
-        ))
+        todo!()
     }
 
     fn powf(&self, _: &crate::Layout, _: f64) -> crate::Result<Self> {
@@ -139,7 +188,7 @@ impl BackendStorage for WebGPUStorage {
 
         let name = B::KERNEL.to_string();
 
-        let output_buffer = device.allocate_output_buffer(el, &name)?;
+        let output_buffer = Arc::new(device.allocate_output_buffer(el as u64, &name)?);
 
         let op = candle_webgpu_kernels::ops::unary::UnaryOp {
             dtype: "f32".to_string(),
@@ -147,20 +196,22 @@ impl BackendStorage for WebGPUStorage {
             op: name,
         };
 
-        op.run(
-            &device.device,
-            &device.queue,
-            &self.buffer,
-            &output_buffer,
-            None,
-        )
-        .map_err(WebGPUError::from)?;
+        let command_encoder = op
+            .run(
+                &device.device,
+                &device.queue,
+                &self.buffer,
+                &output_buffer,
+                None,
+            )
+            .map_err(WebGPUError::from)?;
 
         Ok(Self::new(
             output_buffer.clone(),
             dtype,
             device,
-            Some(self.clone()),
+            Some(Arc::new(self.clone())),
+            command_encoder,
         ))
     }
 
@@ -173,11 +224,9 @@ impl BackendStorage for WebGPUStorage {
         let device = self.device.clone();
         let dtype = self.dtype;
 
-        let shape = lhs_layout.shape();
-        let el = shape.elem_count();
         let name = B::KERNEL.to_string();
 
-        let output_buffer = device.allocate_output_buffer(el, &name)?;
+        let output_buffer = Arc::new(device.allocate_output_buffer(self.buffer.size(), &name)?);
 
         let op = candle_webgpu_kernels::ops::binary::BinaryOp {
             dtype: "f32".to_string(),
@@ -201,7 +250,8 @@ impl BackendStorage for WebGPUStorage {
             output_buffer.clone(),
             dtype,
             device,
-            Some(self.clone()),
+            Some(Arc::new(self.clone())),
+            encoder,
         ))
     }
 
@@ -362,10 +412,11 @@ mod tests {
     fn test_add() {
         let device = Device::new_webgpu(0).unwrap();
 
-        let a = Tensor::new(&[1u32, 2, 3, 4], &device).unwrap();
-        let b = Tensor::new(&[1u32, 2, 3, 4], &device).unwrap();
+        let a = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], &device).unwrap();
+        let b = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], &device).unwrap();
 
         let c = a.add(&b).unwrap();
-        println!("{:?}", c);
+
+        assert_eq!(c.to_vec1::<f32>().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
     }
 }

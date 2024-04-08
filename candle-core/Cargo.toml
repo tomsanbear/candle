@@ -31,6 +31,7 @@ thiserror = { workspace = true }
 yoke = { workspace = true }
 zip = { workspace = true }
 wgpu = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -45,7 +46,7 @@ cudnn = ["cuda", "cudarc/cudnn"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels"]
-webgpu = ["dep:wgpu"]
+webgpu = ["dep:wgpu", "dep:futures"]
 
 [[bench]]
 name = "bench_main"

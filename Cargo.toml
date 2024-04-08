@@ -16,6 +16,7 @@ exclude = [
     "candle-kernels",
     "candle-metal-kernels",
     "candle-onnx",
+    "candle-webgpu-kernels",
 ]
 resolver = "2"
 
@@ -41,6 +42,7 @@ candle-metal-kernels = { path = "./candle-metal-kernels", version = "0.5.0" }
 candle-nn = { path = "./candle-nn", version = "0.5.0" }
 candle-onnx = { path = "./candle-onnx", version = "0.5.0" }
 candle-transformers = { path = "./candle-transformers", version = "0.5.0" }
+candle-webgpu-kernels = { path = "./candle-webgpu-kernels", version = "0.5.0" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.5.1", default-features = false }
 cudarc = { version = "0.10.0", features = ["f16"] }
@@ -81,6 +83,7 @@ yoke = { version = "0.7.2", features = ["derive"] }
 zip = { version = "0.6.6", default-features = false }
 metal = { version = "0.27.0", features = ["mps"] }
 wgpu = { version = "0.19.3" }
+futures = "0.3.30"
 
 [profile.release-with-debug]
 inherits = "release"

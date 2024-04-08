@@ -49,6 +49,7 @@ pub mod display;
 mod dtype;
 mod dummy_cuda_backend;
 mod dummy_metal_backend;
+mod dummy_webgpu_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
@@ -70,8 +71,8 @@ mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
 mod variable;
-// TODO: setup the feature
-//#[cfg(feature = "webgpu")]
+
+#[cfg(feature = "webgpu")]
 pub mod webgpu_backend;
 
 #[cfg(feature = "cudnn")]
@@ -108,8 +109,11 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-pub use webgpu_backend::device::WebGPUDevice;
-pub use webgpu_backend::storage::WebGPUStorage;
+#[cfg(not(feature = "webgpu"))]
+pub use dummy_webgpu_backend::{WebGPUDevice, WebGPUError, WebGPUStorage};
+
+#[cfg(feature = "webgpu")]
+pub use webgpu_backend::{device::WebGPUDevice, storage::WebGPUStorage, WebGPUError};
 
 pub trait ToUsize2 {
     fn to_usize2(self) -> (usize, usize);

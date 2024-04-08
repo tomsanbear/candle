@@ -9,7 +9,7 @@ pub enum DeviceLocation {
     Cpu,
     Cuda { gpu_id: usize },
     Metal { gpu_id: usize },
-    WebGPU { gpu_id: usize },
+    WebGPU { gpu_id: u64 },
 }
 
 #[derive(Debug, Clone)]

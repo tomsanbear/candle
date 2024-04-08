@@ -1,29 +1,61 @@
-use crate::{backend::BackendStorage, WebGPUDevice};
+use std::sync::Arc;
+
+use wgpu::{Buffer, BufferUsages};
+
+use crate::{backend::BackendStorage, DType, WebGPUDevice};
 
 #[derive(Debug, Clone)]
-pub struct WebGPUStorage {}
+pub struct WebGPUStorage {
+    buffer: Arc<Buffer>,
+    dtype: DType,
+    device: WebGPUDevice,
+}
+
+impl WebGPUStorage {
+    pub fn new(buffer: Arc<Buffer>, dtype: DType, device: WebGPUDevice) -> Self {
+        Self {
+            buffer,
+            dtype,
+            device,
+        }
+    }
+}
 
 impl BackendStorage for WebGPUStorage {
     type Device = WebGPUDevice;
 
     fn try_clone(&self, _: &crate::Layout) -> crate::Result<Self> {
-        todo!()
+        Ok(self.clone())
     }
 
     fn dtype(&self) -> crate::DType {
-        todo!()
+        self.dtype
     }
 
     fn device(&self) -> &Self::Device {
-        todo!()
+        &self.device
     }
 
     fn to_cpu_storage(&self) -> crate::Result<crate::CpuStorage> {
         todo!()
     }
 
-    fn affine(&self, _: &crate::Layout, _: f64, _: f64) -> crate::Result<Self> {
-        todo!()
+    fn affine(&self, layout: &crate::Layout, mul: f64, add: f64) -> crate::Result<Self> {
+        let device = self.device.clone();
+        let dtype = self.dtype;
+
+        let shape = layout.shape();
+        let el = shape.elem_count();
+
+        let output_buffer = device.allocate_buffer(
+            el,
+            BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            "affine",
+        )?;
+
+        // TODO: call the kernel
+
+        Ok(Self::new(output_buffer.clone(), dtype, device))
     }
 
     fn powf(&self, _: &crate::Layout, _: f64) -> crate::Result<Self> {

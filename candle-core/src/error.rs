@@ -1,4 +1,4 @@
-use crate::{webgpu_backend::WebGPUError, DType, DeviceLocation, Layout, MetalError, Shape};
+use crate::{DType, DeviceLocation, Layout, MetalError, Shape, WebGPUError};
 
 #[derive(Debug, Clone)]
 pub struct MatMulUnexpectedStriding {
@@ -154,6 +154,9 @@ pub enum Error {
 
     #[error("the candle crate has not been built with metal support")]
     NotCompiledWithMetalSupport,
+
+    #[error("the candle crate has not been built with webgpu support")]
+    NotCompiledWithWebGPUSupport,
 
     #[error("cannot find tensor {path}")]
     CannotFindTensor { path: String },

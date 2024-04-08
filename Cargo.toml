@@ -12,10 +12,10 @@ members = [
     "tensor-tools",
 ]
 exclude = [
-   "candle-flash-attn",
-   "candle-kernels",
-   "candle-metal-kernels",
-   "candle-onnx",
+    "candle-flash-attn",
+    "candle-kernels",
+    "candle-metal-kernels",
+    "candle-onnx",
 ]
 resolver = "2"
 
@@ -42,13 +42,20 @@ candle-nn = { path = "./candle-nn", version = "0.5.0" }
 candle-onnx = { path = "./candle-onnx", version = "0.5.0" }
 candle-transformers = { path = "./candle-transformers", version = "0.5.0" }
 clap = { version = "4.2.4", features = ["derive"] }
-criterion = { version = "0.5.1", default-features=false }
+criterion = { version = "0.5.1", default-features = false }
 cudarc = { version = "0.10.0", features = ["f16"] }
 fancy-regex = "0.13.0"
 gemm = { version = "0.17.0", features = ["wasm-simd128-enable"] }
 hf-hub = "0.3.0"
-half = { version = "2.3.1", features = ["num-traits", "use-intrinsics", "rand_distr"] }
-image = { version = "0.25.0", default-features = false, features = ["jpeg", "png"] }
+half = { version = "2.3.1", features = [
+    "num-traits",
+    "use-intrinsics",
+    "rand_distr",
+] }
+image = { version = "0.25.0", default-features = false, features = [
+    "jpeg",
+    "png",
+] }
 imageproc = { version = "0.24.0", default-features = false }
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
 libc = { version = "0.2.147" }
@@ -72,7 +79,8 @@ tracing-subscriber = "0.3.7"
 wav = "1.0.0"
 yoke = { version = "0.7.2", features = ["derive"] }
 zip = { version = "0.6.6", default-features = false }
-metal = { version = "0.27.0", features = ["mps"]}
+metal = { version = "0.27.0", features = ["mps"] }
+wgpu = { version = "0.19.3" }
 
 [profile.release-with-debug]
 inherits = "release"

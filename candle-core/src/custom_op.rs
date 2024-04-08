@@ -32,6 +32,18 @@ pub trait CustomOp1 {
         ))
     }
 
+    /// The forward pass, as run on a WebGPU device. Note that the storage can use arbitrary strides,
+    /// offsets etc so the associated layout should be used to access it.
+    fn webgpu_fwd(
+        &self,
+        _storage: &crate::WebGPUStorage,
+        _layout: &Layout,
+    ) -> Result<(crate::WebGPUStorage, Shape)> {
+        Err(crate::Error::WebGPU(
+            format!("no webgpu implementation for {}", self.name()).into(),
+        ))
+    }
+
     /// This function takes as argument the argument `arg` used in the forward pass, the result
     /// produced by the forward operation `res` and the gradient of the result `grad_res`.
     /// The function should return the gradient of the argument.
@@ -78,6 +90,18 @@ pub trait CustomOp2 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn webgpu_fwd(
+        &self,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+    ) -> Result<(crate::WebGPUStorage, Shape)> {
+        Err(crate::Error::WebGPU(
+            format!("no webgpu implementation for {}", self.name()).into(),
         ))
     }
 
@@ -136,6 +160,20 @@ pub trait CustomOp3 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn webgpu_fwd(
+        &self,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+    ) -> Result<(crate::WebGPUStorage, Shape)> {
+        Err(crate::Error::WebGPU(
+            format!("no webgpu implementation for {}", self.name()).into(),
         ))
     }
 
@@ -270,6 +308,12 @@ pub trait InplaceOp1 {
             format!("no metal implementation for {}", self.name()).into(),
         ))
     }
+
+    fn webgpu_fwd(&self, _storage: &mut crate::WebGPUStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::WebGPU(
+            format!("no webgpu implementation for {}", self.name()).into(),
+        ))
+    }
 }
 
 pub trait InplaceOp2 {
@@ -299,6 +343,18 @@ pub trait InplaceOp2 {
     ) -> Result<()> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn webgpu_fwd(
+        &self,
+        _: &mut crate::WebGPUStorage,
+        _: &Layout,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::WebGPU(
+            format!("no webgpu implementation for {}", self.name()).into(),
         ))
     }
 }
@@ -347,6 +403,20 @@ pub trait InplaceOp3 {
     ) -> Result<()> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn webgpu_fwd(
+        &self,
+        _: &mut crate::WebGPUStorage,
+        _: &Layout,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+        _: &crate::WebGPUStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::WebGPU(
+            format!("no webgpu implementation for {}", self.name()).into(),
         ))
     }
 }

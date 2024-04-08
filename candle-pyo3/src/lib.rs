@@ -3,7 +3,6 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{IntoPyDict, PyDict, PyTuple};
-use pyo3::ToPyObject;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::os::raw::c_long;
@@ -78,6 +77,7 @@ enum PyDevice {
     Cpu,
     Cuda,
     Metal,
+    WebGPU,
 }
 
 impl PyDevice {
@@ -86,6 +86,7 @@ impl PyDevice {
             Device::Cpu => Self::Cpu,
             Device::Cuda(_) => Self::Cuda,
             Device::Metal(_) => Self::Metal,
+            Device::WebGPU(_) => Self::WebGPU,
         }
     }
 
@@ -110,6 +111,7 @@ impl PyDevice {
                 *device = Some(d.clone());
                 Ok(d)
             }
+            Self::WebGPU => Err(PyTypeError::new_err("WebGPU not supported yet")),
         }
     }
 }
@@ -132,6 +134,7 @@ impl ToPyObject for PyDevice {
             PyDevice::Cpu => "cpu",
             PyDevice::Cuda => "cuda",
             PyDevice::Metal => "metal",
+            PyDevice::WebGPU => "webgpu",
         };
         str.to_object(py)
     }

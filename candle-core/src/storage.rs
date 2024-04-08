@@ -1,6 +1,9 @@
 use crate::backend::BackendStorage;
 use crate::op::{self, CmpOp, ReduceOp};
-use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
+use crate::{
+    CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape,
+    WebGPUStorage,
+};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -10,6 +13,7 @@ pub enum Storage {
     Cpu(CpuStorage),
     Cuda(CudaStorage),
     Metal(MetalStorage),
+    WebGPU(WebGPUStorage),
 }
 
 impl Storage {
@@ -24,6 +28,10 @@ impl Storage {
                 let storage = storage.try_clone(layout)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.try_clone(layout)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -32,6 +40,7 @@ impl Storage {
             Self::Cpu(_) => Device::Cpu,
             Self::Cuda(storage) => Device::Cuda(storage.device().clone()),
             Self::Metal(storage) => Device::Metal(storage.device().clone()),
+            Self::WebGPU(storage) => Device::WebGPU(storage.device().clone()),
         }
     }
 
@@ -40,6 +49,7 @@ impl Storage {
             Self::Cpu(storage) => storage.dtype(),
             Self::Cuda(storage) => storage.dtype(),
             Self::Metal(storage) => storage.dtype(),
+            Self::WebGPU(storage) => storage.dtype(),
         }
     }
 
@@ -87,6 +97,10 @@ impl Storage {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -104,6 +118,10 @@ impl Storage {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -120,6 +138,10 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Metal(storage))
+            }
+            Self::WebGPU(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::WebGPU(storage))
             }
         }
     }
@@ -173,6 +195,10 @@ impl Storage {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -190,6 +216,10 @@ impl Storage {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -206,6 +236,10 @@ impl Storage {
             Self::Metal(storage) => {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
+            }
+            Self::WebGPU(storage) => {
+                let (storage, shape) = c.webgpu_fwd(storage, l)?;
+                Ok((Self::WebGPU(storage), shape))
             }
         }
     }
@@ -230,6 +264,10 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2)) => {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
+            }
+            (Self::WebGPU(s1), Self::WebGPU(s2)) => {
+                let (s, shape) = c.webgpu_fwd(s1, l1, s2, l2)?;
+                Ok((Self::WebGPU(s), shape))
             }
             _ => unreachable!(),
         }
@@ -259,6 +297,10 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
             }
+            (Self::WebGPU(s1), Self::WebGPU(s2), Self::WebGPU(s3)) => {
+                let (s, shape) = c.webgpu_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::WebGPU(s), shape))
+            }
             _ => unreachable!(),
         }
     }
@@ -268,6 +310,7 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
+            Self::WebGPU(storage) => c.webgpu_fwd(storage, l),
         }
     }
 
@@ -283,6 +326,7 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
+            (Self::WebGPU(s1), Self::WebGPU(s2)) => c.webgpu_fwd(s1, l1, s2, l2),
             _ => unreachable!(),
         }
     }
@@ -304,6 +348,9 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
+            (Self::WebGPU(s1), Self::WebGPU(s2), Self::WebGPU(s3)) => {
+                c.webgpu_fwd(s1, l1, s2, l2, s3, l3)
+            }
             _ => unreachable!(),
         }
     }
@@ -321,6 +368,10 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.unary_impl::<B>(layout)?;
                 Ok(Self::Metal(storage))
+            }
+            Self::WebGPU(storage) => {
+                let storage = storage.unary_impl::<B>(layout)?;
+                Ok(Self::WebGPU(storage))
             }
         }
     }
@@ -502,6 +553,10 @@ impl Storage {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -524,6 +579,10 @@ impl Storage {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -541,6 +600,10 @@ impl Storage {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Metal(storage))
             }
+            Self::WebGPU(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::WebGPU(storage))
+            }
         }
     }
 
@@ -557,6 +620,10 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Metal(storage))
+            }
+            Self::WebGPU(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::WebGPU(storage))
             }
         }
     }

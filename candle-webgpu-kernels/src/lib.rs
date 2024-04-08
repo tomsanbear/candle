@@ -10,7 +10,7 @@ trait UnaryOp {
     );
 }
 
-struct AddOp;
+pub struct AddOp;
 
 impl UnaryOp for AddOp {
     fn run(&self, device: &Device, queue: &Queue, input: &Buffer, output: &Buffer) {

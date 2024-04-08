@@ -1,23 +1,57 @@
 use std::sync::Arc;
 
-use wgpu::{Buffer, BufferUsages};
+use wgpu::{Buffer, BufferUsages, CommandEncoder};
 
-use crate::{backend::BackendStorage, DType, WebGPUDevice};
+use crate::{backend::BackendStorage, DType, WebGPUDevice, WebGPUError};
 
 #[derive(Debug, Clone)]
 pub struct WebGPUStorage {
+    /// The buffer that holds the output data
     buffer: Arc<Buffer>,
+
+    /// The encoder that is used for processing the op
+    encoder: Arc<Option<CommandEncoder>>,
+
+    /// The parent storage that this storage is derived from
+    /// This is used for computing the operation graph
+    parent: Arc<Option<WebGPUStorage>>,
+
+    /// The data type of the storage
     dtype: DType,
+
+    /// The device that the storage is associated with
     device: WebGPUDevice,
 }
 
 impl WebGPUStorage {
-    pub fn new(buffer: Arc<Buffer>, dtype: DType, device: WebGPUDevice) -> Self {
+    pub fn new(
+        buffer: Arc<Buffer>,
+        dtype: DType,
+        device: WebGPUDevice,
+        parent: Option<Self>,
+    ) -> Self {
         Self {
             buffer,
+            parent: Arc::new(parent),
+            encoder: Arc::new(None),
             dtype,
             device,
         }
+    }
+
+    /// Waits for the gpu to finish processing and unlock reading from the staging buffer
+    pub fn synchronize(&self) -> crate::Result<()> {
+        todo!()
+    }
+
+    /// Returns the buffer
+    pub fn buffer(&self) -> Arc<Buffer> {
+        self.buffer.clone()
+    }
+
+    /// Returns the parent storage
+    pub fn parent(&self) -> Arc<Option<WebGPUStorage>> {
+        self.parent.clone()
     }
 }
 
@@ -41,6 +75,10 @@ impl BackendStorage for WebGPUStorage {
     }
 
     fn affine(&self, layout: &crate::Layout, mul: f64, add: f64) -> crate::Result<Self> {
+        if mul == 1.0 && add == 0.0 {
+            return Ok(self.clone());
+        }
+
         let device = self.device.clone();
         let dtype = self.dtype;
 
@@ -49,13 +87,16 @@ impl BackendStorage for WebGPUStorage {
 
         let output_buffer = device.allocate_buffer(
             el,
-            BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            BufferUsages::STORAGE | BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             "affine",
         )?;
 
-        // TODO: call the kernel
-
-        Ok(Self::new(output_buffer.clone(), dtype, device))
+        Ok(Self::new(
+            output_buffer.clone(),
+            dtype,
+            device,
+            Some(self.clone()),
+        ))
     }
 
     fn powf(&self, _: &crate::Layout, _: f64) -> crate::Result<Self> {
@@ -89,17 +130,79 @@ impl BackendStorage for WebGPUStorage {
         todo!()
     }
 
-    fn unary_impl<B: crate::op::UnaryOpT>(&self, _: &crate::Layout) -> crate::Result<Self> {
-        todo!()
+    fn unary_impl<B: crate::op::UnaryOpT>(&self, layout: &crate::Layout) -> crate::Result<Self> {
+        let device = self.device.clone();
+        let dtype = self.dtype;
+
+        let shape = layout.shape();
+        let el = shape.elem_count();
+
+        let name = B::KERNEL.to_string();
+
+        let output_buffer = device.allocate_output_buffer(el, &name)?;
+
+        let op = candle_webgpu_kernels::ops::unary::UnaryOp {
+            dtype: "f32".to_string(),
+            input_shape: layout.shape().dims().to_vec(),
+            op: name,
+        };
+
+        op.run(
+            &device.device,
+            &device.queue,
+            &self.buffer,
+            &output_buffer,
+            None,
+        )
+        .map_err(WebGPUError::from)?;
+
+        Ok(Self::new(
+            output_buffer.clone(),
+            dtype,
+            device,
+            Some(self.clone()),
+        ))
     }
 
     fn binary_impl<B: crate::op::BinaryOpT>(
         &self,
-        _: &Self,
-        _: &crate::Layout,
-        _: &crate::Layout,
+        rhs: &Self,
+        lhs_layout: &crate::Layout,
+        rhs_layout: &crate::Layout,
     ) -> crate::Result<Self> {
-        todo!()
+        let device = self.device.clone();
+        let dtype = self.dtype;
+
+        let shape = lhs_layout.shape();
+        let el = shape.elem_count();
+        let name = B::KERNEL.to_string();
+
+        let output_buffer = device.allocate_output_buffer(el, &name)?;
+
+        let op = candle_webgpu_kernels::ops::binary::BinaryOp {
+            dtype: "f32".to_string(),
+            lhs_shape: lhs_layout.shape().dims().to_vec(),
+            rhs_shape: rhs_layout.shape().dims().to_vec(),
+            op: name,
+        };
+
+        let encoder = op
+            .run(
+                &device.device,
+                &device.queue,
+                &self.buffer,
+                &rhs.buffer,
+                &output_buffer,
+                None,
+            )
+            .map_err(WebGPUError::from)?;
+
+        Ok(Self::new(
+            output_buffer.clone(),
+            dtype,
+            device,
+            Some(self.clone()),
+        ))
     }
 
     fn where_cond(
@@ -248,5 +351,21 @@ impl BackendStorage for WebGPUStorage {
         _dst_offset: usize,
     ) -> crate::Result<()> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Device, Tensor};
+
+    #[test]
+    fn test_add() {
+        let device = Device::new_webgpu(0).unwrap();
+
+        let a = Tensor::new(&[1u32, 2, 3, 4], &device).unwrap();
+        let b = Tensor::new(&[1u32, 2, 3, 4], &device).unwrap();
+
+        let c = a.add(&b).unwrap();
+        println!("{:?}", c);
     }
 }

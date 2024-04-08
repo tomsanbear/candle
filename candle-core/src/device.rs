@@ -154,6 +154,7 @@ impl Device {
             (Self::Cpu, Self::Cpu) => true,
             (Self::Cuda(lhs), Self::Cuda(rhs)) => lhs.same_device(rhs),
             (Self::Metal(lhs), Self::Metal(rhs)) => lhs.same_device(rhs),
+            (Self::WebGPU(lhs), Self::WebGPU(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -177,6 +178,10 @@ impl Device {
 
     pub fn is_metal(&self) -> bool {
         matches!(self, Self::Metal(_))
+    }
+
+    pub fn is_webgpu(&self) -> bool {
+        matches!(self, Self::WebGPU(_))
     }
 
     pub fn cuda_if_available(ordinal: usize) -> Result<Self> {

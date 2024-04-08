@@ -397,6 +397,10 @@ impl Storage {
                 let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Metal(storage))
             }
+            (Self::WebGPU(lhs), Self::WebGPU(rhs)) => {
+                let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::WebGPU(storage))
+            }
             (lhs, rhs) => {
                 // Should not happen because of the same device check above but we're defensive
                 // anyway.

@@ -446,7 +446,7 @@ impl BackendStorage for MetalStorage {
         let src = buffer_o(&self.buffer, layout, self.dtype);
         if layout.is_contiguous() {
             use candle_metal_kernels::unary::contiguous;
-
+ 
             let kernel_name = match (B::KERNEL, dtype) {
                 ("uabs", DType::F16) => contiguous::abs::HALF,
                 ("uabs", DType::F32) => contiguous::abs::FLOAT,
@@ -1687,7 +1687,7 @@ impl BackendDevice for MetalDevice {
     }
 
     fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        // TODO Is there a faster way ?
+        // TODO Is there a faster way?
         let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
         self.storage_from_cpu_storage(&cpu_storage)
     }

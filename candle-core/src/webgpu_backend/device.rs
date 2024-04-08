@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
-use crate::{backend::BackendDevice, Result, WebGPUStorage};
+use crate::{
+    backend::{BackendDevice, BackendStorage},
+    CpuStorage, Result, WebGPUStorage,
+};
 
 use super::Block;
+use wgpu::util::DeviceExt;
 
 #[derive(Debug, Clone)]
 pub struct WebGPUDevice {
@@ -12,10 +16,6 @@ pub struct WebGPUDevice {
 }
 
 impl WebGPUDevice {
-    pub fn wait_until_completed(&self) -> Result<()> {
-        todo!()
-    }
-
     pub fn webgpu_device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -35,6 +35,27 @@ impl WebGPUDevice {
             size: size as u64,
             usage,
             mapped_at_creation: false,
+        });
+        Ok(Arc::new(buffer))
+    }
+
+    pub fn allocate_output_buffer(&self, size: usize, label: &str) -> Result<Arc<wgpu::Buffer>> {
+        self.allocate_buffer(
+            size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            label,
+        )
+    }
+
+    pub fn allocate_buffer_with_data<T>(&self, data: &[T], label: &str) -> Result<Arc<wgpu::Buffer>>
+    where
+        T: bytemuck::Pod,
+    {
+        let device = self.device.clone();
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         Ok(Arc::new(buffer))
     }
@@ -103,12 +124,50 @@ impl BackendDevice for WebGPUDevice {
         todo!()
     }
 
-    fn storage_from_cpu_storage(&self, _: &crate::CpuStorage) -> crate::Result<Self::Storage> {
-        todo!()
+    fn storage_from_cpu_storage(
+        &self,
+        storage: &crate::CpuStorage,
+    ) -> crate::Result<Self::Storage> {
+        let (_, buffer) = match storage {
+            CpuStorage::U8(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+            CpuStorage::U32(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+            CpuStorage::I64(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+            CpuStorage::BF16(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+            CpuStorage::F16(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+            CpuStorage::F32(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+            CpuStorage::F64(storage) => (
+                storage.len(),
+                self.allocate_buffer_with_data(&storage, "todo"),
+            ),
+        };
+        Ok(Self::Storage::new(
+            buffer?,
+            storage.dtype(),
+            self.clone(),
+            None,
+        ))
     }
 
-    fn storage_from_cpu_storage_owned(&self, _: crate::CpuStorage) -> crate::Result<Self::Storage> {
-        todo!()
+    fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> crate::Result<Self::Storage> {
+        self.storage_from_cpu_storage(&storage)
     }
 
     fn rand_uniform(

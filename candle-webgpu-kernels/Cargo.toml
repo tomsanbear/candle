@@ -12,10 +12,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 wgpu = { version = "0.19.3" }
-futures = "0.3.30"
+futures = "0.3"
 once_cell = "1.18.0"
 thiserror = "1"
 tracing = "0.1.37"
+tera = "1.19.1"
+anyhow = "1.0.81"
+flume = "0.11.0"
+bytemuck = "1.15.0"
 
 [dev-dependencies]
 half = { version = "2.3.1", features = [
@@ -23,4 +27,5 @@ half = { version = "2.3.1", features = [
     "use-intrinsics",
     "rand_distr",
 ] }
+futures-test = "0.3"
 rand = "0.8.5"

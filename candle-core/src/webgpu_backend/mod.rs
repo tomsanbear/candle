@@ -1,3 +1,5 @@
+use candle_webgpu_kernels::WebGPUKernelError;
+
 pub mod device;
 pub mod storage;
 
@@ -5,11 +7,19 @@ pub mod storage;
 pub enum WebGPUError {
     #[error("WebGPU error: {0}")]
     Message(String),
+    #[error("WebGPUKernel error: {0}")]
+    Kernel(WebGPUKernelError),
 }
 
 impl From<String> for WebGPUError {
     fn from(e: String) -> Self {
         WebGPUError::Message(e)
+    }
+}
+
+impl From<WebGPUKernelError> for WebGPUError {
+    fn from(e: WebGPUKernelError) -> Self {
+        WebGPUError::Kernel(e)
     }
 }
 

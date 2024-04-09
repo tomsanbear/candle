@@ -1,10 +1,9 @@
+use core::panic;
 use std::sync::{Arc, RwLock};
 
 use wgpu::{Buffer, BufferUsages, CommandEncoder};
 
 use crate::{backend::BackendStorage, CpuStorage, DType, Result, WebGPUDevice, WebGPUError};
-
-use super::Block;
 
 #[derive(Debug, Clone)]
 pub struct WebGPUStorage {
@@ -45,11 +44,12 @@ impl WebGPUStorage {
         }
     }
 
-    /// Forces the storage enqueue all pending operations
-    pub fn synchronize(&self) -> crate::Result<()> {
+    /// Submits the storage to the underlying device queue
+    pub fn submit(&self) -> crate::Result<()> {
         if let Some(parent) = self.parent.as_ref() {
-            parent.synchronize()?;
-        } else if self.encoder.try_read().unwrap().is_some() {
+            parent.submit()?;
+        }
+        if self.encoder.try_read().unwrap().is_some() {
             let mut encoder = self.encoder.try_write().unwrap().take().unwrap();
             if let Some(staging_buffer) = self.staging_buffer.try_read().unwrap().as_ref() {
                 encoder.copy_buffer_to_buffer(
@@ -60,9 +60,7 @@ impl WebGPUStorage {
                     self.buffer.size(),
                 );
             }
-            encoder.finish();
-        } else {
-            return Ok(());
+            self.device.queue.submit(std::iter::once(encoder.finish()));
         }
         Ok(())
     }
@@ -91,29 +89,32 @@ impl WebGPUStorage {
         }
 
         // evaluate the graph and queue the encoders
-        self.synchronize()?;
+        self.submit()?;
 
         // Note that we're not calling `.await` here.
         let staging_buffer = self.staging_buffer.try_write().unwrap();
         let staging_buffer = staging_buffer.as_ref().unwrap();
         let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = flume::bounded(4);
+        let (sender, receiver) = flume::unbounded();
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
         self.device
             .device
             .poll(wgpu::Maintain::wait())
             .panic_on_timeout();
 
-        // Awaits until `buffer_future` can be read from
-        receiver.recv().unwrap();
-        let result = {
-            let data = buffer_slice.get_mapped_range();
-            let result = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buffer.unmap();
-            result
-        };
-        Ok(result)
+        // receive the data from the buffer until the buffer is empty
+        if let Ok(Ok(())) = receiver.recv() {
+            let result = {
+                let data = buffer_slice.get_mapped_range();
+                let result = bytemuck::cast_slice(&data).to_vec();
+                drop(data);
+                staging_buffer.unmap();
+                result
+            };
+            Ok(result)
+        } else {
+            panic!("Failed to receive data from the buffer");
+        }
     }
 }
 
@@ -144,7 +145,7 @@ impl BackendStorage for WebGPUStorage {
         }
     }
 
-    fn affine(&self, layout: &crate::Layout, mul: f64, add: f64) -> crate::Result<Self> {
+    fn affine(&self, _layout: &crate::Layout, _mul: f64, _add: f64) -> crate::Result<Self> {
         todo!()
     }
 
@@ -197,13 +198,7 @@ impl BackendStorage for WebGPUStorage {
         };
 
         let command_encoder = op
-            .run(
-                &device.device,
-                &device.queue,
-                &self.buffer,
-                &output_buffer,
-                None,
-            )
+            .run(&device.device, &self.buffer, &output_buffer)
             .map_err(WebGPUError::from)?;
 
         Ok(Self::new(
@@ -236,14 +231,7 @@ impl BackendStorage for WebGPUStorage {
         };
 
         let encoder = op
-            .run(
-                &device.device,
-                &device.queue,
-                &self.buffer,
-                &rhs.buffer,
-                &output_buffer,
-                None,
-            )
+            .run(&device.device, &self.buffer, &rhs.buffer, &output_buffer)
             .map_err(WebGPUError::from)?;
 
         Ok(Self::new(

@@ -7,8 +7,12 @@ var<storage, read> rhs: array<{{ dtype }}>;
 @group(0) @binding(2)
 var<storage, read_write> output: array<{{ dtype }}>;
 
-fn add (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+fn badd (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
     return a + b;
+}
+
+fn bsub (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return a - b;
 }
 
 @compute @workgroup_size({{ workgroup_size_x }}, {{ workgroup_size_y }}, {{ workgroup_size_z }})

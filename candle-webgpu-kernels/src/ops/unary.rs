@@ -20,10 +20,8 @@ impl UnaryOp {
     pub fn run(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
-        staging: Option<&wgpu::Buffer>,
     ) -> Result<Arc<RwLock<Option<CommandEncoder>>>, WebGPUKernelError> {
         // Configuration variables
         let workgroup_size_x = self.input_shape.iter().product::<usize>() as u32;
@@ -145,8 +143,7 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        op.run(&device, &queue, &input, &output, Some(&staging_buffer))
-            .unwrap();
+        op.run(&device, &input, &output).unwrap();
 
         // Note that we're not calling `.await` here.
         let buffer_slice = staging_buffer.slice(..);

@@ -22,11 +22,9 @@ impl BinaryOp {
     pub fn run(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         lhs: &wgpu::Buffer,
         rhs: &wgpu::Buffer,
         output: &wgpu::Buffer,
-        staging: Option<&wgpu::Buffer>,
     ) -> Result<Arc<RwLock<Option<CommandEncoder>>>, WebGPUKernelError> {
         // Configuration variables
         let workgroup_size_x = self.lhs_shape.iter().product::<usize>() as u32;
@@ -42,7 +40,7 @@ impl BinaryOp {
         context.insert("workgroup_size_y", &workgroup_size_y);
         context.insert("workgroup_size_z", &workgroup_size_z);
         context.insert("dtype", &self.dtype);
-        context.insert("op", "add");
+        context.insert("op", &self.op);
         let source = tera.render("binary", &context).unwrap();
 
         // Construct the shader module
@@ -53,7 +51,7 @@ impl BinaryOp {
 
         // Construct the pipeline
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
+            label: Some("binary"),
             layout: None,
             module: &shader_module,
             entry_point: "main",
@@ -62,7 +60,7 @@ impl BinaryOp {
         // Setup bind group
         let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
+            label: Some("binary"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -90,7 +88,7 @@ impl BinaryOp {
             });
             cpass.set_pipeline(&compute_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.insert_debug_marker("add");
+            cpass.insert_debug_marker("binary");
             cpass.dispatch_workgroups(workgroup_size_x, workgroup_size_y, workgroup_size_z);
         }
 
@@ -161,8 +159,7 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        op.run(&device, &queue, &lhs, &rhs, &output, Some(&staging_buffer))
-            .unwrap();
+        op.run(&device, &lhs, &rhs, &output).unwrap();
 
         // Note that we're not calling `.await` here.
         let buffer_slice = staging_buffer.slice(..);

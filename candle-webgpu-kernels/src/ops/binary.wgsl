@@ -1,3 +1,27 @@
+fn badd (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return a + b;
+}
+
+fn bsub (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return a - b;
+}
+
+fn bmul (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return a * b;
+}
+
+fn bdiv (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return a / b;
+}
+
+fn bmax (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return max(a, b);
+}
+
+fn bmin (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
+    return min(a, b);
+}
+
 @group(0) @binding(0)
 var<storage, read> lhs: array<{{ dtype }}>;
 
@@ -6,14 +30,6 @@ var<storage, read> rhs: array<{{ dtype }}>;
 
 @group(0) @binding(2)
 var<storage, read_write> output: array<{{ dtype }}>;
-
-fn badd (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
-    return a + b;
-}
-
-fn bsub (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
-    return a - b;
-}
 
 @compute @workgroup_size({{ workgroup_size_x }}, {{ workgroup_size_y }}, {{ workgroup_size_z }})
 fn main( 

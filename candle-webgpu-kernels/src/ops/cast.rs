@@ -9,14 +9,15 @@ use wgpu::CommandEncoder;
 
 use crate::WebGPUKernelError;
 
-pub struct UnaryOp {
+pub struct CastOp {
     pub op: String,
     pub input_shape: Vec<usize>,
-    pub dtype: String,
+    pub input_dtype: String,
+    pub output_dtype: String,
 }
 
 /// Operates on a single buffer.
-impl UnaryOp {
+impl CastOp {
     pub fn run(
         &self,
         device: &wgpu::Device,
@@ -30,14 +31,14 @@ impl UnaryOp {
 
         // Render the shader
         let mut tera = Tera::default();
-        tera.add_raw_template("unary", include_str!("unary.wgsl"))
+        tera.add_raw_template("unary", include_str!("cast.wgsl"))
             .unwrap();
         let mut context = tera::Context::new();
         context.insert("workgroup_size_x", &workgroup_size_x);
         context.insert("workgroup_size_y", &workgroup_size_y);
         context.insert("workgroup_size_z", &workgroup_size_z);
-        context.insert("dtype", &self.dtype);
-        context.insert("op", "abs");
+        context.insert("input_dtype", &self.input_dtype);
+        context.insert("output_dtype", &self.output_dtype);
         let source = tera.render("unary", &context).unwrap();
 
         // Construct the shader module
@@ -81,7 +82,7 @@ impl UnaryOp {
             });
             cpass.set_pipeline(&compute_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.insert_debug_marker(&self.op);
+            cpass.insert_debug_marker("abs");
             cpass.dispatch_workgroups(workgroup_size_x, workgroup_size_y, workgroup_size_z);
         };
 

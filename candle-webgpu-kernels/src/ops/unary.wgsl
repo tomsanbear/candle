@@ -34,20 +34,6 @@ fn usqrt(x: {{ dtype }}) -> {{ dtype }} {
     return sqrt(x);
 }
 
-fn ugelu(x: {{ dtype }}) -> {{ dtype }} {
-    let cdf = 0.5 * (1.0 + erf(x / sqrt(2.0)));
-    return x * cdf;
-}
-
-fn ugeluerf(x: {{ dtype }}) -> {{ dtype }} {
-    let cdf = 0.5 * (1.0 + erf(x / sqrt(2.0)));
-    return x * cdf;
-}
-
-fn uerf(x: {{ dtype }}) -> {{ dtype }} {
-    return erf(x);
-}
-
 fn urelu(x: {{ dtype }}) -> {{ dtype }} {
     return max(0.0, x);
 }

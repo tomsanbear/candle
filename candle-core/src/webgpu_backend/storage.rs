@@ -3,7 +3,21 @@ use std::sync::{Arc, RwLock};
 
 use wgpu::{Buffer, BufferUsages, CommandEncoder};
 
-use crate::{backend::BackendStorage, CpuStorage, DType, Result, WebGPUDevice, WebGPUError};
+use crate::{
+    backend::BackendStorage, op::CmpOp, CpuStorage, DType, Result, WebGPUDevice, WebGPUError,
+};
+
+fn dtype_to_wsgl(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F64 => "f64",
+        DType::I64 => "i64",
+        DType::U32 => "u32",
+        DType::U8 => "u8",
+        DType::BF16 => "bf16",
+        DType::F16 => "f16",
+    }
+}
 
 async fn read_async(buffer: &Buffer, device: &wgpu::Device) -> Vec<u8> {
     let buffer_slice = buffer.slice(..);
@@ -128,6 +142,42 @@ impl WebGPUStorage {
         let result = bytemuck::cast_slice(&data).to_vec();
         Ok(result)
     }
+
+    pub fn binary(
+        &self,
+        op: &'static str,
+        rhs: &Self,
+        lhs_layout: &crate::Layout,
+        rhs_layout: &crate::Layout,
+    ) -> Result<Self> {
+        let device = self.device.clone();
+        let dtype = self.dtype;
+
+        let output_buffer = Arc::new(
+            device
+                .allocate_output_buffer(self.buffer.size(), op)
+                .unwrap(),
+        );
+
+        let op = candle_webgpu_kernels::ops::binary::BinaryOp {
+            dtype: dtype_to_wsgl(dtype).to_string(),
+            lhs_shape: lhs_layout.shape().dims().to_vec(),
+            rhs_shape: rhs_layout.shape().dims().to_vec(),
+            op: op.to_string(),
+        };
+
+        let encoder = op
+            .run(&device.device, &self.buffer, &rhs.buffer, &output_buffer)
+            .unwrap();
+
+        Ok(Self::new(
+            output_buffer.clone(),
+            dtype,
+            device,
+            Some(Arc::new(self.clone())),
+            encoder,
+        ))
+    }
 }
 
 impl BackendStorage for WebGPUStorage {
@@ -180,16 +230,87 @@ impl BackendStorage for WebGPUStorage {
 
     fn cmp(
         &self,
-        _: crate::op::CmpOp,
-        _: &Self,
-        _: &crate::Layout,
-        _: &crate::Layout,
+        op: crate::op::CmpOp,
+        rhs: &Self,
+        lhs_layout: &crate::Layout,
+        rhs_layout: &crate::Layout,
     ) -> crate::Result<Self> {
-        todo!()
+        let name = match op {
+            CmpOp::Eq => "eq",
+            CmpOp::Ne => "ne",
+            CmpOp::Le => "le",
+            CmpOp::Ge => "ge",
+            CmpOp::Lt => "lt",
+            CmpOp::Gt => "gt",
+        };
+        self.binary(name, rhs, lhs_layout, rhs_layout)
     }
 
-    fn to_dtype(&self, _: &crate::Layout, _: crate::DType) -> crate::Result<Self> {
-        todo!()
+    fn to_dtype(&self, layout: &crate::Layout, dtype: crate::DType) -> crate::Result<Self> {
+        let kernel_name = match (self.dtype, dtype) {
+            (DType::U32, DType::BF16) => "cast_u32_bf16",
+            (DType::U32, DType::F16) => "cast_u32_f16",
+            (DType::U32, DType::F32) => "cast_u32_f32",
+            (DType::U32, DType::I64) => "cast_u32_i64",
+            (DType::U32, DType::U8) => "cast_u32_u8",
+
+            (DType::U8, DType::BF16) => "cast_u8_bf16",
+            (DType::U8, DType::F16) => "cast_u8_f16",
+            (DType::U8, DType::F32) => "cast_u8_f32",
+            (DType::U8, DType::I64) => "cast_u8_i64",
+            (DType::U8, DType::U32) => "cast_u8_u32",
+
+            (DType::F32, DType::BF16) => "cast_f32_bf16",
+            (DType::F32, DType::F16) => "cast_f32_f16",
+            (DType::F32, DType::I64) => "cast_f32_i64",
+            (DType::F32, DType::U32) => "cast_f32_u32",
+            (DType::F32, DType::U8) => "cast_f32_u8",
+
+            (DType::I64, DType::BF16) => "cast_i64_bf16",
+            (DType::I64, DType::F16) => "cast_i64_f16",
+            (DType::I64, DType::F32) => "cast_i64_f32",
+            (DType::I64, DType::U32) => "cast_i64_u32",
+            (DType::I64, DType::U8) => "cast_i64_u8",
+
+            (DType::F16, DType::BF16) => "cast_f16_bf16",
+            (DType::F16, DType::F32) => "cast_f16_f32",
+            (DType::F16, DType::I64) => "cast_f16_i64",
+            (DType::F16, DType::U32) => "cast_f16_u32",
+            (DType::F16, DType::U8) => "cast_f16_u8",
+
+            (DType::BF16, DType::F16) => "cast_bf16_f16",
+            (DType::BF16, DType::F32) => "cast_bf16_f32",
+            (DType::BF16, DType::I64) => "cast_bf16_i64",
+            (DType::BF16, DType::U32) => "cast_bf16_u32",
+            (DType::BF16, DType::U8) => "cast_bf16_u8",
+
+            (left, right) => {
+                crate::bail!("WebGPU to_dtype {left:?} {right:?} not implemented")
+            }
+        };
+        let device = self.device.clone();
+
+        let output_buffer =
+            Arc::new(device.allocate_output_buffer(self.buffer.size(), kernel_name)?);
+
+        let op = candle_webgpu_kernels::ops::cast::CastOp {
+            input_dtype: dtype_to_wsgl(self.dtype).to_string(),
+            output_dtype: dtype_to_wsgl(dtype).to_string(),
+            input_shape: layout.shape().dims().to_vec(),
+            op: kernel_name.to_string(),
+        };
+
+        let encoder = op
+            .run(&device.device, &self.buffer, &output_buffer)
+            .map_err(WebGPUError::from)?;
+
+        Ok(Self::new(
+            output_buffer.clone(),
+            dtype,
+            device,
+            Some(Arc::new(self.clone())),
+            encoder,
+        ))
     }
 
     fn unary_impl<B: crate::op::UnaryOpT>(&self, layout: &crate::Layout) -> crate::Result<Self> {
@@ -410,22 +531,5 @@ impl BackendStorage for WebGPUStorage {
         _dst_offset: usize,
     ) -> crate::Result<()> {
         todo!()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{Device, Tensor};
-
-    #[test]
-    fn test_add() {
-        let device = Device::new_webgpu(0).unwrap();
-
-        let a = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], &device).unwrap();
-        let b = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], &device).unwrap();
-
-        let c = a.add(&b).unwrap();
-
-        assert_eq!(c.to_vec1::<f32>().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
     }
 }

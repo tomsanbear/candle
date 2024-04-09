@@ -8,6 +8,10 @@ use crate::{
 use super::Block;
 use wgpu::util::DeviceExt;
 
+fn round_up_to_multiple_of_4(n: u64) -> u64 {
+    (n + 3) & !3
+}
+
 #[derive(Debug, Clone)]
 pub struct WebGPUDevice {
     pub(crate) id: u64,
@@ -35,6 +39,7 @@ impl WebGPUDevice {
         usage: wgpu::BufferUsages,
         label: &str,
     ) -> Result<wgpu::Buffer> {
+        let size = round_up_to_multiple_of_4(size) as u64;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,

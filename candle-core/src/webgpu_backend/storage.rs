@@ -75,18 +75,22 @@ impl WebGPUStorage {
         self.parent.clone()
     }
 
+    /// Allocates a staging buffer
+    pub fn allocate_staging_buffer(&self) -> Result<()> {
+        let mut staging_buffer = self.staging_buffer.write().unwrap();
+        if staging_buffer.is_none() {
+            *staging_buffer = Some(self.device.allocate_buffer(
+                self.buffer.size(),
+                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                "staging",
+            )?);
+        }
+        Ok(())
+    }
+
     pub(crate) fn to_cpu<T: std::fmt::Debug + Clone + bytemuck::Pod>(&self) -> Result<Vec<T>> {
         // setup the staging buffer
-        {
-            let mut staging_buffer = self.staging_buffer.write().unwrap();
-            if staging_buffer.is_none() {
-                *staging_buffer = Some(self.device.allocate_buffer(
-                    self.buffer.size(),
-                    BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-                    "staging",
-                )?);
-            }
-        }
+        self.allocate_staging_buffer()?;
 
         // evaluate the graph and queue the encoders
         self.submit()?;

@@ -32,9 +32,10 @@ yoke = { workspace = true }
 zip = { workspace = true }
 wgpu = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-bytemuck = {workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 flume = { workspace = true, optional = true }
-candle-webgpu-kernels = {workspace = true, optional = true}
+pollster = { workspace = true, optional = true }
+candle-webgpu-kernels = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -49,7 +50,14 @@ cudnn = ["cuda", "cudarc/cudnn"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels"]
-webgpu = ["dep:wgpu", "dep:futures", "dep:candle-webgpu-kernels", "dep:flume", "dep:bytemuck"]
+webgpu = [
+    "dep:wgpu",
+    "dep:futures",
+    "dep:candle-webgpu-kernels",
+    "dep:flume",
+    "dep:bytemuck",
+    "dep:pollster",
+]
 
 [[bench]]
 name = "bench_main"

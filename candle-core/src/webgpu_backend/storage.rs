@@ -5,18 +5,42 @@ use wgpu::{Buffer, BufferUsages, CommandEncoder};
 
 use crate::{backend::BackendStorage, CpuStorage, DType, Result, WebGPUDevice, WebGPUError};
 
+async fn read_async(buffer: &Buffer, device: &wgpu::Device) -> Vec<u8> {
+    let buffer_slice = buffer.slice(..);
+    let (sender, receiver) = flume::bounded(1);
+    buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
+        sender
+            .send(v)
+            .expect("Unable to send buffer slice result to async channel.")
+    });
+
+    device.poll(wgpu::Maintain::Wait);
+
+    let result = receiver.recv_async().await;
+    if let Ok(Ok(())) = result {
+        let data = buffer_slice.get_mapped_range();
+        let result = bytemuck::cast_slice(&data).to_vec();
+
+        drop(data);
+        buffer.unmap();
+        result
+    } else {
+        panic!("Unable to read buffer {:?}", result)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebGPUStorage {
     /// The buffer that holds the output data
     buffer: Arc<Buffer>,
 
+    /// In order to ferry data back to the CPU, we set this in a JIT fashion
     staging_buffer: Arc<RwLock<Option<Buffer>>>,
 
     /// The encoder that is used for processing the op
     encoder: Arc<RwLock<Option<CommandEncoder>>>,
 
     /// The parent storage that this storage is derived from
-    /// This is used for computing the operation graph
     parent: Option<Arc<WebGPUStorage>>,
 
     /// The data type of the storage
@@ -98,27 +122,11 @@ impl WebGPUStorage {
         // Note that we're not calling `.await` here.
         let staging_buffer = self.staging_buffer.try_write().unwrap();
         let staging_buffer = staging_buffer.as_ref().unwrap();
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = flume::unbounded();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-        self.device
-            .device
-            .poll(wgpu::Maintain::wait())
-            .panic_on_timeout();
 
         // receive the data from the buffer until the buffer is empty
-        if let Ok(Ok(())) = receiver.recv() {
-            let result = {
-                let data = buffer_slice.get_mapped_range();
-                let result = bytemuck::cast_slice(&data).to_vec();
-                drop(data);
-                staging_buffer.unmap();
-                result
-            };
-            Ok(result)
-        } else {
-            panic!("Failed to receive data from the buffer");
-        }
+        let data = pollster::block_on(read_async(&staging_buffer, &self.device.device));
+        let result = bytemuck::cast_slice(&data).to_vec();
+        Ok(result)
     }
 }
 
@@ -187,6 +195,15 @@ impl BackendStorage for WebGPUStorage {
     fn unary_impl<B: crate::op::UnaryOpT>(&self, layout: &crate::Layout) -> crate::Result<Self> {
         let device = self.device.clone();
         let dtype = self.dtype;
+        let dtype_wsgl = match dtype {
+            DType::F32 => "f32",
+            DType::F64 => "f64",
+            DType::I64 => "i64",
+            DType::U32 => "u32",
+            DType::U8 => "u8",
+            DType::BF16 => "bf16",
+            DType::F16 => "f16",
+        };
 
         let shape = layout.shape();
         let el = shape.elem_count();
@@ -196,7 +213,7 @@ impl BackendStorage for WebGPUStorage {
         let output_buffer = Arc::new(device.allocate_output_buffer(el as u64, &name)?);
 
         let op = candle_webgpu_kernels::ops::unary::UnaryOp {
-            dtype: "f32".to_string(),
+            dtype: dtype_wsgl.to_string(),
             input_shape: layout.shape().dims().to_vec(),
             op: name,
         };
@@ -207,7 +224,7 @@ impl BackendStorage for WebGPUStorage {
 
         Ok(Self::new(
             output_buffer.clone(),
-            dtype,
+            self.dtype(),
             device,
             Some(Arc::new(self.clone())),
             command_encoder,

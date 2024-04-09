@@ -19,6 +19,6 @@ fn bsub (a: {{ dtype }}, b: {{ dtype }}) -> {{ dtype }} {
 fn main( 
         @builtin(global_invocation_id) global_id: vec3<u32>
 ) {
-    let index = global_id.x * global_id.y * global_id.z;
+    let index = global_id.x;
     output[index] = {{op}}(lhs[index], rhs[index]);
 }

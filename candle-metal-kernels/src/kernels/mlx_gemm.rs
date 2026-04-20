@@ -412,6 +412,9 @@ pub fn call_mlx_gemm(
     let pipeline = kernels.load_pipeline_with_constants(device, Source::Gemm, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "gemm {trans_str} {dtype_str} b={b} m={m} n={n} k={k}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     impl EncoderParam for GemmParams {

@@ -29,6 +29,9 @@ pub fn call_index_select(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
 
+    encoder.set_label(&format!(
+        "index_select {name} ids={ids_size} src_dim={src_dim_size} right={right_size}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(

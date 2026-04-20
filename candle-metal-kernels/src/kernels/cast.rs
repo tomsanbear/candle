@@ -18,6 +18,7 @@ pub fn call_cast_contiguous(
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!("cast {kernel_name} len={length}"));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(encoder, (length, &input, output));
@@ -46,9 +47,9 @@ pub fn call_cast_strided(
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_compute_pipeline_state(&pipeline);
-
     let length: usize = shape.iter().product();
+    encoder.set_label(&format!("cast_strided {kernel_name} len={length}"));
+    encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(
         encoder,

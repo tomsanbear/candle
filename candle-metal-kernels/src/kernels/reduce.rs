@@ -22,6 +22,9 @@ pub fn call_reduce_contiguous(
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "reduce {kernel_name} len={length} out={out_length}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     let shape: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
@@ -78,6 +81,9 @@ pub fn call_reduce_strided(
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "reduce_strided {kernel_name} len={length} out={out_length}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     let shape: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
@@ -133,6 +139,9 @@ pub fn call_last_softmax(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "softmax {kernel_name} len={length} elements={elements}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(
@@ -182,6 +191,10 @@ pub fn call_rms_norm(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "rms_norm {kernel_name} rows={} cols={elements_to_sum}",
+        length / elements_to_sum.max(1)
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(
@@ -242,6 +255,10 @@ pub fn call_layer_norm(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "layer_norm {kernel_name} rows={} cols={elements_to_sum}",
+        length / elements_to_sum.max(1)
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(
@@ -305,6 +322,9 @@ pub fn call_rope_i(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "rope_i {kernel_name} bh={bh} td={td}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(
@@ -350,6 +370,9 @@ pub fn call_rope_thd(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "rope_thd {kernel_name} b={b} t={t} h={h} d={d}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(
@@ -396,6 +419,9 @@ pub fn call_rope(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "rope {kernel_name} bh={bh} td={td} d={d}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     set_params!(

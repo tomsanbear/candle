@@ -202,6 +202,17 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Runtime knob for `CANDLE_METAL_COMPUTE_PER_BUFFER`. Profilers flip
+    /// to `1` so each dispatch owns its own command buffer (1:1 per-kernel
+    /// attribution via the completion hook). Returns the previous value
+    /// so the caller can restore it when profiling ends.
+    pub fn set_compute_per_buffer(&self, value: usize) -> Result<usize> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        let prev = commands.compute_per_buffer();
+        commands.set_compute_per_buffer(value);
+        Ok(prev)
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }

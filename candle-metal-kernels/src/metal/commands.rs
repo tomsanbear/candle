@@ -57,8 +57,11 @@ pub struct Commands {
     pool: Vec<Arc<CommandBufferEntry>>,
     /// Single command queue for the entire device.
     command_queue: CommandQueue,
-    /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc) per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
-    compute_per_buffer: usize,
+    /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc) per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc).
+    /// Runtime-tunable via `set_compute_per_buffer` — programmatic profilers
+    /// flip this to `1` so each dispatch owns its own command buffer and the
+    /// pool-wide completion hook can attribute timings per-kernel.
+    compute_per_buffer: AtomicUsize,
     /// Optional global hook that the pool installs on every buffer it hands
     /// out. `None` means no instrumentation (zero overhead). Set via
     /// `set_completion_hook`; cleared by passing `None`.
@@ -91,7 +94,7 @@ impl Commands {
         Ok(Self {
             pool,
             command_queue,
-            compute_per_buffer,
+            compute_per_buffer: AtomicUsize::new(compute_per_buffer),
             completion_hook: RwLock::new(None),
         })
     }
@@ -104,6 +107,19 @@ impl Commands {
     /// kernel start/end times into a Chrome-JSON trace sink.
     pub fn set_completion_hook(&self, hook: Option<CompletionHook>) {
         *self.completion_hook.write().unwrap() = hook;
+    }
+
+    /// Runtime knob for the `compute_per_buffer` threshold. Profilers set
+    /// this to `1` alongside `set_completion_hook` so each dispatch owns
+    /// its own command buffer — giving per-kernel attribution for the
+    /// pool-wide completion hook. Callers are responsible for restoring
+    /// the previous value when profiling ends.
+    pub fn set_compute_per_buffer(&self, value: usize) {
+        self.compute_per_buffer.store(value.max(1), Ordering::Release);
+    }
+
+    pub fn compute_per_buffer(&self) -> usize {
+        self.compute_per_buffer.load(Ordering::Acquire)
     }
 
     /// Install the current completion hook (if any) on the given buffer.
@@ -212,7 +228,7 @@ impl Commands {
         let mut state = entry.state.lock()?;
 
         let count = entry.compute_count.fetch_add(1, Ordering::Relaxed);
-        let flush = count >= self.compute_per_buffer;
+        let flush = count >= self.compute_per_buffer.load(Ordering::Acquire);
 
         if flush {
             self.commit_swap_locked(&entry, &mut state, 1)?;

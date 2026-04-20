@@ -101,6 +101,17 @@ impl CommandBuffer {
         self.as_ref().setLabel(Some(&NSString::from_str(label)))
     }
 
+    /// Read back the buffer's label (as set by `set_label`). Used by
+    /// programmatic profilers to attribute timings to kernels.
+    pub fn label(&self) -> Option<String> {
+        unsafe {
+            self.raw.label().map(|ns| {
+                let c_str = core::ffi::CStr::from_ptr(ns.UTF8String());
+                c_str.to_string_lossy().into_owned()
+            })
+        }
+    }
+
     pub fn status(&self) -> MTLCommandBufferStatus {
         self.raw.status()
     }

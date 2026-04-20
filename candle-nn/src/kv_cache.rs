@@ -214,6 +214,28 @@ impl RotatingCache {
         self.all_data = None;
     }
 
+    /// Rewind the cache to the first `new_len` positions.
+    ///
+    /// The underlying pre-allocated buffer is left untouched; only the
+    /// cursor (`current_seq_len` + `offset`) is updated so future reads
+    /// via `current_data()` see only positions `[0, new_len)` and the
+    /// next append overwrites starting at position `new_len`.
+    ///
+    /// No-op if `new_len >= current_seq_len`. Used by speculative
+    /// decoding to drop rejected drafts' KV without re-allocating or
+    /// memcpying the cache tensor.
+    pub fn truncate_to(&mut self, new_len: usize) {
+        if new_len >= self.current_seq_len {
+            return;
+        }
+        self.current_seq_len = new_len;
+        self.offset = if self.max_seq_len == 0 {
+            0
+        } else {
+            new_len % self.max_seq_len
+        };
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<Tensor> {
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
@@ -373,6 +395,13 @@ impl RotatingKvCache {
         let out_k = self.k.append(k)?;
         let out_v = self.v.append(v)?;
         Ok((out_k, out_v))
+    }
+
+    /// Rewind both K and V caches to the first `new_len` positions.
+    /// See [`RotatingCache::truncate_to`].
+    pub fn truncate_to(&mut self, new_len: usize) {
+        self.k.truncate_to(new_len);
+        self.v.truncate_to(new_len);
     }
 
     pub fn offset(&self) -> usize {

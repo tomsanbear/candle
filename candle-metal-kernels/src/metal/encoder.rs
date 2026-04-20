@@ -9,13 +9,6 @@ use std::{ffi::c_void, ptr, sync::Arc};
 pub struct ComputeCommandEncoder {
     raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     semaphore: Arc<CommandSemaphore>,
-    /// Owning command buffer (weak-ish: the `Retained` ref-counts the
-    /// MTLCommandBuffer). When `set_label` is called we propagate the label
-    /// to the buffer so programmatic profilers can attribute pool-wide
-    /// completion events to specific kernels. `None` when the caller didn't
-    /// go through `CommandBuffer::compute_command_encoder()` (legacy
-    /// construction path).
-    owning_buffer: Option<Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>>,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -28,25 +21,7 @@ impl ComputeCommandEncoder {
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         semaphore: Arc<CommandSemaphore>,
     ) -> ComputeCommandEncoder {
-        ComputeCommandEncoder {
-            raw,
-            semaphore,
-            owning_buffer: None,
-        }
-    }
-
-    /// Variant of `new` that remembers the owning buffer so `set_label`
-    /// can propagate the label to it — useful for profilers.
-    pub fn new_with_buffer(
-        raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-        semaphore: Arc<CommandSemaphore>,
-        buffer: Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
-    ) -> ComputeCommandEncoder {
-        ComputeCommandEncoder {
-            raw,
-            semaphore,
-            owning_buffer: Some(buffer),
-        }
+        ComputeCommandEncoder { raw, semaphore }
     }
 
     pub(crate) fn signal_encoding_ended(&self) {
@@ -117,15 +92,6 @@ impl ComputeCommandEncoder {
     pub fn set_label(&self, label: &str) {
         let ns = NSString::from_str(label);
         self.raw.setLabel(Some(&ns));
-        // Also label the owning buffer so profilers can attribute pool-
-        // wide completion events (which fire per-buffer, not per-encoder)
-        // back to the kernel that last ran. For compute_per_buffer == 1
-        // this gives unambiguous per-kernel attribution; at larger pool
-        // batch sizes the label reflects whichever encoder was last set.
-        if let Some(buf) = &self.owning_buffer {
-            use objc2_metal::MTLCommandBuffer as _;
-            buf.setLabel(Some(&ns));
-        }
     }
 }
 

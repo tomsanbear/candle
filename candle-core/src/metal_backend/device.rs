@@ -232,13 +232,27 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<Arc<Buffer>> {
         let size = element_count * dtype.size_in_bytes();
-        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
-            return Ok(b.clone());
-        }
+        // Kernel output buffers cannot safely be recycled from a
+        // pool using `Arc::strong_count == 1` as a proxy for "free":
+        // under concurrency the last Rust Arc can drop while the
+        // owning command buffer is still uncommitted, which leaves
+        // the MTLBuffer reachable via the not-yet-submitted encoder
+        // while `new_buffer` happily hands it to a second kernel.
+        // The two kernels then race write-over-write on the GPU
+        // when the original CB eventually commits — symptom: the
+        // caller reads back the *input* of the first op instead of
+        // its output.
+        //
+        // `allocate_buffer` (shared-storage pool, used for blit
+        // destinations) avoids the race because its callers always
+        // follow with `wait_until_completed()`. Kernel outputs have
+        // no such sync point on the producer side, so we disable
+        // reuse here. The raw MTLDevice allocator has its own
+        // internal caching; empirically the per-kernel cost is
+        // dominated by dispatch overhead, not allocation.
         let size = buf_size(size);
+        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
         let subbuffers = buffers.entry(size).or_insert(vec![]);
-
         let new_buffer = self
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
@@ -293,16 +307,45 @@ impl MetalDevice {
         Ok(buffer)
     }
 
-    /// The critical allocator algorithm
+    /// The critical allocator algorithm.
+    ///
+    /// The pool recycles buffers whose `Arc::strong_count == 1` — i.e. only
+    /// the pool still holds a reference. For a single-threaded caller this
+    /// is a safe proxy for "the previous user is done with it": by the time
+    /// the caller's next `allocate_buffer` runs, ownership of the previous
+    /// tensor has been dropped, and the subsequent user-observable sync
+    /// (e.g. `to_cpu()` → `wait_until_completed`) drains any GPU work.
+    ///
+    /// With concurrent callers the proxy is NOT sufficient: thread A can
+    /// drop an intermediate tensor while thread A's owning command buffer
+    /// is still pending commit (or in flight on the GPU). strong_count
+    /// hits 1, thread B's allocator then hands the same buffer to a new
+    /// kernel, and the GPU races write-over-write between A's and B's work.
+    /// Symptom in practice: downstream consumers read back garbage values
+    /// (e.g. a BF16 weight that was supposed to be clamped to [-1, 1]
+    /// emerges as an arbitrary large float).
+    ///
+    /// Fix: hold the buffers **write lock** during the find-and-claim so two
+    /// concurrent callers can't both see the same `strong_count == 1`
+    /// buffer (classic TOCTOU under a read lock). The `Arc::clone` inside
+    /// `find_available_buffer` bumps strong_count to 2 while the lock is
+    /// still held — later callers that reacquire the lock will skip this
+    /// buffer. We then drop the write lock and call `wait_until_completed`
+    /// (which itself takes the commands pool's own lock, not ours) to drain
+    /// any pending GPU work on the claimed buffer before we hand it out.
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
-            // Cloning also ensures we increment the strong count
-            return Ok(b.clone());
+        let claimed = {
+            let buffers = self.buffers.write().map_err(MetalError::from)?;
+            find_available_buffer(size, &buffers)
+        };
+        if let Some(b) = claimed {
+            // b.strong_count is now >= 2; concurrent allocators will skip it.
+            self.wait_until_completed()?;
+            return Ok(b);
         }
         let size = buf_size(size);
+        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         let subbuffers = buffers.entry(size).or_insert(vec![]);
-
         let new_buffer = self
             .device
             .new_buffer(size, RESOURCE_OPTIONS)

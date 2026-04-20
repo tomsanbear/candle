@@ -318,6 +318,212 @@ fn unary_op(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Minimal regression: run the BF16 → F32 → abs/mean/clamp/broadcast_div/
+/// round/clamp quantise pipeline on `device`, and assert the final values
+/// are exactly in {-1, 0, 1}. This is the downstream (bitnet-rs) sequence
+/// that was producing garbage values on Metal when run concurrently
+/// across multiple threads.
+fn bitnet_quantize_pipeline(device: &Device) -> Result<()> {
+    if !device.is_metal() {
+        return Ok(());
+    }
+    let cpu = Device::Cpu;
+    // Realistic BitNet b1.58 weight magnitude (σ = 0.02). Shape matters —
+    // the original bug reproduced at (2560, 2560) but not at (16, 16) in
+    // isolation; include both.
+    for &(rows, cols) in &[(16usize, 16), (256, 256), (2560, 2560)] {
+        let w_cpu = Tensor::randn(0f32, 0.02f32, (rows, cols), &cpu)?.to_dtype(DType::BF16)?;
+        let w_dev = w_cpu.to_device(device)?;
+
+        // BF16 -> F32 (on-device no-op data but candle must emit a real
+        // cast kernel; the raw buffer widens 1x -> 2x).
+        let w_f32_cpu = w_cpu.to_dtype(DType::F32)?;
+        let w_f32_dev = w_dev.to_dtype(DType::F32)?;
+        let cpu_vec = w_f32_cpu.flatten_all()?.to_vec1::<f32>()?;
+        let dev_vec = w_f32_dev
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (&c, &d)) in cpu_vec.iter().zip(&dev_vec).enumerate() {
+            assert!(
+                (c - d).abs() <= f32::EPSILON,
+                "[{rows}x{cols}] to_dtype(F32) mismatch at {i}: cpu={c} dev={d}"
+            );
+        }
+
+        // .abs() element-wise.
+        let abs_cpu = w_f32_cpu.abs()?.flatten_all()?.to_vec1::<f32>()?;
+        let abs_dev = w_f32_dev
+            .abs()?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (&c, &d)) in abs_cpu.iter().zip(&abs_dev).enumerate() {
+            assert!(
+                (c - d).abs() <= f32::EPSILON,
+                "[{rows}x{cols}] abs mismatch at {i}: cpu={c} dev={d}"
+            );
+        }
+
+        // .mean_all() - reduction to scalar. Metal's reduction kernel can
+        // accumulate in fp32 over a flattened range; we expect exact match
+        // up to summation order within a few ULP.
+        let mean_cpu = w_f32_cpu.abs()?.mean_all()?.to_scalar::<f32>()?;
+        let mean_dev = w_f32_dev.abs()?.mean_all()?.to_scalar::<f32>()?;
+        assert!(
+            (mean_cpu - mean_dev).abs() <= mean_cpu.abs() * 1e-4,
+            "[{rows}x{cols}] mean_all mismatch: cpu={mean_cpu} dev={mean_dev}"
+        );
+
+        // .clamp(eps, MAX) on a scalar tensor. Trivial but verify.
+        let gamma_cpu = w_f32_cpu
+            .abs()?
+            .mean_all()?
+            .clamp(1e-5f32, f32::MAX)?
+            .to_scalar::<f32>()?;
+        let gamma_dev = w_f32_dev
+            .abs()?
+            .mean_all()?
+            .clamp(1e-5f32, f32::MAX)?
+            .to_scalar::<f32>()?;
+        assert!(
+            (gamma_cpu - gamma_dev).abs() <= gamma_cpu.abs() * 1e-4,
+            "[{rows}x{cols}] gamma clamp mismatch: cpu={gamma_cpu} dev={gamma_dev}"
+        );
+
+        // .broadcast_div(gamma) — divide every element by a scalar tensor.
+        let gamma_cpu_t = w_f32_cpu.abs()?.mean_all()?.clamp(1e-5f32, f32::MAX)?;
+        let gamma_dev_t = w_f32_dev.abs()?.mean_all()?.clamp(1e-5f32, f32::MAX)?;
+        let div_cpu = w_f32_cpu
+            .broadcast_div(&gamma_cpu_t)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let div_dev = w_f32_dev
+            .broadcast_div(&gamma_dev_t)?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (&c, &d)) in div_cpu.iter().zip(&div_dev).enumerate() {
+            assert!(
+                (c - d).abs() <= c.abs().max(1.0) * 1e-4,
+                "[{rows}x{cols}] broadcast_div mismatch at {i}: cpu={c} dev={d}"
+            );
+        }
+
+        // .round() — the bit we suspect.
+        let round_cpu = w_f32_cpu
+            .broadcast_div(&gamma_cpu_t)?
+            .round()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let round_dev = w_f32_dev
+            .broadcast_div(&gamma_dev_t)?
+            .round()?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (&c, &d)) in round_cpu.iter().zip(&round_dev).enumerate() {
+            assert!(
+                c == d,
+                "[{rows}x{cols}] round mismatch at {i}: cpu={c} dev={d}"
+            );
+        }
+
+        // .clamp(-1.0, 1.0) — the other bit we suspect.
+        let clip_cpu = w_f32_cpu
+            .broadcast_div(&gamma_cpu_t)?
+            .round()?
+            .clamp(-1.0f32, 1.0f32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let clip_dev = w_f32_dev
+            .broadcast_div(&gamma_dev_t)?
+            .round()?
+            .clamp(-1.0f32, 1.0f32)?
+            .to_device(&cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (&c, &d)) in clip_cpu.iter().zip(&clip_dev).enumerate() {
+            assert!(
+                c == d,
+                "[{rows}x{cols}] final clamp mismatch at {i}: cpu={c} dev={d}"
+            );
+            // Final values must be exactly ternary.
+            let vi = c as i32;
+            assert!(
+                c.is_finite() && (vi == -1 || vi == 0 || vi == 1) && (c - vi as f32).abs() < 1e-6,
+                "[{rows}x{cols}] non-ternary final value at {i}: {c} (expected {{-1, 0, 1}})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Minimal repro: the BF16→F32→abs→mean→broadcast_div→round→clamp
+/// pipeline run concurrently on many threads, each against its own
+/// tensor. The serial version passes (see `bitnet_quantize_pipeline`);
+/// this one fires when candle's Metal backend has a race on the shared
+/// MetalDevice resource pool.
+///
+/// Failure symptom observed in downstream bitnet-rs: a handful of
+/// [0, 0] elements emerge as arbitrary large floats (e.g. -328125.0)
+/// instead of one of {-1, 0, 1}.
+fn bitnet_quantize_pipeline_concurrent(device: &Device) -> Result<()> {
+    if !device.is_metal() {
+        return Ok(());
+    }
+    let cpu = Device::Cpu;
+    // Each thread gets its own tensor — no shared state other than the
+    // MetalDevice clone. Shape mirrors a BitNet b1.58 BitLinear.
+    const N_THREADS: usize = 30;
+    const ROWS: usize = 2560;
+    const COLS: usize = 2560;
+    let inputs: Vec<Tensor> = (0..N_THREADS)
+        .map(|i| {
+            // Use a distinct seed so each thread's tensor differs (avoid
+            // accidentally masking a race by all threads seeing identical
+            // numeric traffic).
+            let t = Tensor::randn(0f32 + i as f32 * 1e-4, 0.02f32, (ROWS, COLS), &cpu)?
+                .to_dtype(DType::BF16)?
+                .to_device(device)?;
+            Ok::<_, candle_core::Error>(t)
+        })
+        .collect::<std::result::Result<_, _>>()?;
+
+    let handles: Vec<_> = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| {
+            std::thread::spawn(move || -> Result<()> {
+                let w_f32 = w.to_dtype(DType::F32)?;
+                let gamma_t = w_f32.abs()?.mean_all()?.clamp(1e-5f32, f32::MAX)?;
+                let ternary = w_f32
+                    .broadcast_div(&gamma_t)?
+                    .round()?
+                    .clamp(-1.0f32, 1.0f32)?;
+                let flat = ternary
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                for (j, &v) in flat.iter().enumerate() {
+                    let vi = v as i32;
+                    assert!(
+                        v.is_finite()
+                            && (vi == -1 || vi == 0 || vi == 1)
+                            && (v - vi as f32).abs() < 1e-6,
+                        "thread {i} produced non-ternary value {v} at idx {j}"
+                    );
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("thread panicked")?;
+    }
+    Ok(())
+}
+
 fn binary_op(device: &Device) -> Result<()> {
     let data = &[[3f32, 1., 4., 1., 5.], [2., 1., 7., 8., 2.]];
     let tensor1 = Tensor::new(data, device)?;
@@ -1699,6 +1905,18 @@ test_device!(argmax, argmax_cpu, argmax_gpu, argmax_metal);
 test_device!(argmin, argmin_cpu, argmin_gpu, argmin_metal);
 test_device!(transpose, transpose_cpu, transpose_gpu, transpose_metal);
 test_device!(unary_op, unary_op_cpu, unary_op_gpu, unary_op_metal);
+test_device!(
+    bitnet_quantize_pipeline,
+    bqp_cpu,
+    bqp_gpu,
+    bqp_metal
+);
+test_device!(
+    bitnet_quantize_pipeline_concurrent,
+    bqpc_cpu,
+    bqpc_gpu,
+    bqpc_metal
+);
 test_device!(binary_op, binary_op_cpu, binary_op_gpu, binary_op_metal);
 test_device!(ternary_op, ternary_op_cpu, ternary_op_gpu, ternary_op_metal);
 test_device!(embeddings, embeddings_cpu, embeddings_gpu, embeddings_metal);

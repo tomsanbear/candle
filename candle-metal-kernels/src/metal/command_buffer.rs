@@ -3,6 +3,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use std::borrow::Cow;
+use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +117,53 @@ impl CommandBuffer {
 
     pub fn wait_until_completed(&self) {
         self.raw.waitUntilCompleted();
+    }
+
+    /// GPU-side kernel start time in seconds (CFTimeInterval epoch), valid
+    /// only after the buffer has completed. Pair with `kernel_end_time()`
+    /// for per-buffer GPU duration — the primary signal for our
+    /// `metal-profile`-feature profiler in bitnet-rs.
+    pub fn kernel_start_time(&self) -> f64 {
+        self.raw.kernelStartTime()
+    }
+
+    /// GPU-side kernel end time in seconds (CFTimeInterval epoch).
+    pub fn kernel_end_time(&self) -> f64 {
+        self.raw.kernelEndTime()
+    }
+
+    /// Register a completion callback that fires on a Metal-internal thread
+    /// as soon as the buffer finishes executing. `handler` receives this
+    /// `CommandBuffer` (cloned) so it can read `kernel_start_time` /
+    /// `kernel_end_time` without blocking the producer. Used by programmatic
+    /// GPU profilers (e.g. the `metal-profile` feature in bitnet-rs).
+    ///
+    /// Safety: the callback runs on a different thread than the caller.
+    /// The `Fn` closure must be `Send + Sync + 'static`.
+    pub fn add_completed_handler<F>(&self, handler: F)
+    where
+        F: Fn(&CommandBuffer) + Send + Sync + 'static,
+    {
+        // Clone a lightweight handle to this CommandBuffer so the closure
+        // keeps the underlying MTLCommandBuffer alive and can query timings.
+        let cb_copy = self.clone();
+        let block = block2::RcBlock::new(
+            move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                handler(&cb_copy);
+            },
+        );
+        // SAFETY: `addCompletedHandler:` retains the block; `RcBlock::as_ptr`
+        // yields a valid `*mut block2::DynBlock<...>` with the exact signature
+        // Metal expects (`^(id<MTLCommandBuffer>)`).
+        unsafe {
+            let ptr = block2::RcBlock::<
+                dyn Fn(NonNull<ProtocolObject<dyn MTLCommandBuffer>>),
+            >::as_ptr(&block);
+            self.raw.addCompletedHandler(ptr as _);
+        }
+        // `block` drops here, but Metal has retained the block internally;
+        // RcBlock semantics match ObjC's `copy` requirement for captured
+        // completion handlers.
     }
 }
 

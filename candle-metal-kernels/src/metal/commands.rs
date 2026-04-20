@@ -103,6 +103,22 @@ impl Commands {
         self.finalize_entry(entry, |cb| cb.compute_command_encoder())
     }
 
+    /// Like `command_encoder()` but also returns a clone of the owning
+    /// `CommandBuffer` so the caller can attach a completion handler (for
+    /// programmatic profiling / per-kernel GPU-time extraction) before the
+    /// encoder is dropped and the buffer is committed by the pool.
+    pub fn command_encoder_with_buffer(
+        &self,
+    ) -> Result<(bool, ComputeCommandEncoder, CommandBuffer), MetalKernelError> {
+        let entry = self.select_entry()?;
+        let mut buffer_clone: Option<CommandBuffer> = None;
+        let (flush, encoder) = self.finalize_entry(entry, |cb| {
+            buffer_clone = Some(cb.clone());
+            cb.compute_command_encoder()
+        })?;
+        Ok((flush, encoder, buffer_clone.expect("buffer captured")))
+    }
+
     pub fn blit_command_encoder(&self) -> Result<(bool, BlitCommandEncoder), MetalKernelError> {
         let entry = self.select_entry()?;
         self.finalize_entry(entry, |cb| cb.blit_command_encoder())

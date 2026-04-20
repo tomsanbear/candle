@@ -149,6 +149,24 @@ impl MetalDevice {
         Ok(command_encoder)
     }
 
+    /// Programmatic-profiling variant: also returns the owning `CommandBuffer`
+    /// so the caller can attach a completion handler (via
+    /// `CommandBuffer::add_completed_handler`) before dropping the encoder.
+    /// The buffer is committed by the pool as normal — this just gives the
+    /// caller a clone-reference in time to register timing callbacks.
+    pub fn command_encoder_with_buffer(
+        &self,
+    ) -> Result<(ComputeCommandEncoder, candle_metal_kernels::CommandBuffer)> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        let (flush, command_encoder, command_buffer) = commands
+            .command_encoder_with_buffer()
+            .map_err(MetalError::from)?;
+        if flush {
+            self.drop_unused_buffers()?
+        }
+        Ok((command_encoder, command_buffer))
+    }
+
     pub fn blit_command_encoder(&self) -> Result<BlitCommandEncoder> {
         let commands = self.commands.write().map_err(MetalError::from)?;
         let (flush, command_encoder) = commands.blit_command_encoder().map_err(MetalError::from)?;

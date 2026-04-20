@@ -182,6 +182,26 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Install or clear a per-buffer completion hook on this device's
+    /// command-buffer pool. When `Some`, every command buffer produced by
+    /// the pool — whether from `command_encoder()` or
+    /// `command_encoder_with_buffer()` — gets the hook registered via
+    /// `addCompletedHandler` before it's committed.
+    ///
+    /// Intended for programmatic profilers. bitnet-rs's `metal-profile`
+    /// feature sets a hook that records kernel_start_time / kernel_end_time
+    /// + the buffer's label into a Chrome-JSON trace sink, giving coverage
+    /// of *every* Metal kernel candle dispatches (sdpa, cat, contiguous,
+    /// argmax, linear, rms_norm, etc.) without per-kernel patches.
+    pub fn set_completion_hook(
+        &self,
+        hook: Option<candle_metal_kernels::metal::CompletionHook>,
+    ) -> Result<()> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.set_completion_hook(hook);
+        Ok(())
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }

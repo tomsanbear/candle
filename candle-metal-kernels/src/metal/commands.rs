@@ -5,7 +5,16 @@ use crate::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Closure installed via `Commands::set_completion_hook` that fires once
+/// per command buffer when it completes on the GPU. The hook runs on a
+/// Metal-internal thread and receives a `CommandBuffer` clone so it can
+/// call `kernel_start_time()` / `kernel_end_time()` / read the buffer's
+/// label. Intended for programmatic profilers (bitnet-rs's `metal-profile`
+/// feature) that want coverage of *every* command buffer candle creates,
+/// not just the ones whose dispatchers were patched individually.
+pub type CompletionHook = Arc<dyn Fn(&CommandBuffer) + Send + Sync + 'static>;
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
@@ -50,6 +59,10 @@ pub struct Commands {
     command_queue: CommandQueue,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc) per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
+    /// Optional global hook that the pool installs on every buffer it hands
+    /// out. `None` means no instrumentation (zero overhead). Set via
+    /// `set_completion_hook`; cleared by passing `None`.
+    completion_hook: RwLock<Option<CompletionHook>>,
 }
 
 unsafe impl Send for Commands {}
@@ -79,7 +92,31 @@ impl Commands {
             pool,
             command_queue,
             compute_per_buffer,
+            completion_hook: RwLock::new(None),
         })
+    }
+
+    /// Install or clear a per-buffer completion hook. When `Some`, every
+    /// command buffer this pool hands out — whether from `command_encoder`
+    /// or `command_encoder_with_buffer` — gets the hook registered via
+    /// `addCompletedHandler` before it's returned. Typical use: bitnet-rs's
+    /// `MetalProfiler` installs a hook that records each buffer's label +
+    /// kernel start/end times into a Chrome-JSON trace sink.
+    pub fn set_completion_hook(&self, hook: Option<CompletionHook>) {
+        *self.completion_hook.write().unwrap() = hook;
+    }
+
+    /// Install the current completion hook (if any) on the given buffer.
+    /// Called from inside `finalize_entry` so new encoders automatically
+    /// carry the hook. The buffer label is whatever the encoder set via
+    /// `set_label`; profilers should look at that label to identify the
+    /// kernel variant.
+    fn maybe_install_hook(&self, cb: &CommandBuffer) {
+        let guard = self.completion_hook.read().unwrap();
+        if let Some(hook) = guard.as_ref() {
+            let hook = Arc::clone(hook);
+            cb.add_completed_handler(move |b| hook(b));
+        }
     }
 
     fn create_pool_entry(
@@ -243,6 +280,10 @@ impl Commands {
         state: &mut EntryState,
         reset_to: usize,
     ) -> Result<(), MetalKernelError> {
+        // Install the profiler hook on this buffer (if any) *before* commit
+        // so Metal can retain the block before the buffer hits the GPU.
+        // A no-op when no hook is installed — zero overhead for production.
+        self.maybe_install_hook(&state.current);
         state.current.commit();
         let new_cb = create_command_buffer(&self.command_queue, Arc::clone(&entry.semaphore))?;
         let old_cb = std::mem::replace(&mut state.current, new_cb);

@@ -93,18 +93,18 @@ pub fn call_sdpa_full(
         }
         (8, 8, 1, 1)
     } else {
+        // Always use BQ=32 (WM=4, WN=1) = 128 threads / 4 simdgroups per TG.
+        // A prior experiment (rev d6a0462e) shipped a BQ=8 variant for ql ∈
+        // [2, 8] on the theory that padding to BQ=32 wasted ~75% of query
+        // threads. Profiling on M3 showed the opposite: the BQ=8 variant's
+        // `(WM=1, WN=1)` tile = 1 simdgroup/TG vs BQ=32's 4 simdgroups/TG,
+        // so BQ=8 ran ~25-30× slower per dispatch despite strictly less
+        // query work. The fix would need a BQ=8 × WM=4 instantiation, but
+        // the MMA 8×8 tile geometry forces partial-tile waste with that
+        // split — the right answer is to pad to BQ=32 and keep full
+        // simdgroup occupancy.
         let bk = if bd < 128 { 32 } else { 16 };
-        // For short Q sequences (speculative-decoding verify batches, short
-        // prefills), use BQ=8 to avoid padding Q to 32 and wasting up to
-        // 75% of query threads. The BQ=8 kernels are instantiated alongside
-        // the BQ=32 ones in `scaled_dot_product_attention.metal` for every
-        // supported head_dim.
-        let ql = q_shape[2];
-        if ql <= 8 {
-            (8, bk, 1, 1)
-        } else {
-            (32, bk, 4, 1)
-        }
+        (32, bk, 4, 1)
     };
 
     let b = q_shape[0];

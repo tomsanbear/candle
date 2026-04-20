@@ -78,7 +78,13 @@ impl CommandBuffer {
     pub fn compute_command_encoder(&self) -> ComputeCommandEncoder {
         self.as_ref()
             .computeCommandEncoder()
-            .map(|raw| ComputeCommandEncoder::new(raw, Arc::clone(&self.semaphore)))
+            .map(|raw| {
+                ComputeCommandEncoder::new_with_buffer(
+                    raw,
+                    Arc::clone(&self.semaphore),
+                    self.raw.clone(),
+                )
+            })
             .unwrap()
     }
 

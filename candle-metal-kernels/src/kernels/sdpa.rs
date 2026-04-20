@@ -143,6 +143,9 @@ pub fn call_sdpa_full(
     let pipeline = kernels.load_pipeline_with_constants(device, Source::Sdpa, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "sdpa_full b={b} h={h} d={d} ql={ql} kl={kl}"
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     let nq = (ql + bq - 1) / bq;
@@ -330,6 +333,12 @@ pub fn call_sdpa_vector(
     let pipeline = kernels.load_pipeline_with_constants(device, Source::Sdpa, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_label(&format!(
+        "sdpa_vector b={} d={} kl={}",
+        q_shape[0] * q_shape[1],
+        bk,
+        k_shape[2]
+    ));
     encoder.set_compute_pipeline_state(&pipeline);
 
     // q = (bs, qhead, seq, hidden)

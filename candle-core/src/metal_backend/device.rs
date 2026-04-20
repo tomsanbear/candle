@@ -12,10 +12,63 @@ use candle_metal_kernels::{
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::MetalError;
+
+thread_local! {
+    /// Per-thread, per-device private buffer pool. Each thread maintains its
+    /// own `BufferMap` for each `DeviceId` it has touched; pools are
+    /// completely disjoint between threads.
+    ///
+    /// ## Why thread-local?
+    ///
+    /// `find_available_buffer` uses `Arc::strong_count == 1` as a proxy for
+    /// "free" — i.e. the pool is the only owner, so the buffer is reusable.
+    /// This proxy is safe **within a single thread** because Metal serialises
+    /// command buffers on one queue in commit order: if thread A writes to
+    /// buffer X in CB1 then reuses X in CB2, the GPU runs CB1 before CB2 and
+    /// the final contents of X reflect CB2's write. Within the same CB,
+    /// encoders are inherently ordered. So intra-thread reuse via
+    /// strong-count is always correct.
+    ///
+    /// It is **not safe across threads**. Thread A can dispatch a kernel
+    /// writing X on an uncommitted CB1, the Tensor holding X can be sent to
+    /// thread B and dropped there, leaving `Arc::strong_count(X) == 1` (only
+    /// the shared pool remains). Thread B now asks for a buffer, the shared
+    /// pool hands back X, and thread B dispatches a kernel writing X on its
+    /// own CB (CB_B). If CB_B commits before CB1 (commit order is determined
+    /// by whichever thread's `commit()` call reaches the queue first), the
+    /// GPU runs CB_B then CB1, and A's write — which was supposed to be
+    /// stale — clobbers B's fresh result. The empirical symptom: downstream
+    /// consumers read garbage (e.g. BitNet b1.58's `round + clamp(-1,1)`
+    /// pipeline produces values outside [-1, 1]).
+    ///
+    /// Thread-local pools eliminate the class of race: a buffer is only ever
+    /// reused by the thread that created it, and that thread's own dispatch
+    /// sequence is totally ordered by Metal.
+    ///
+    /// ## Memory overhead
+    ///
+    /// Each thread's pool grows to its peak working set. For rayon workloads
+    /// with N long-lived workers, peak memory is ~N× the single-thread
+    /// baseline. In practice this is bounded (workers process similar shapes
+    /// so hit the same size buckets) and drops fully when the thread exits.
+    ///
+    /// ## Why not the shared-storage `buffers` pool too?
+    ///
+    /// `allocate_buffer` (shared-storage pool) sees far less traffic
+    /// (only blit destinations and CPU-visible allocations) and retains a
+    /// `wait_until_completed` guard after claiming a buffer, which is
+    /// correct even across threads. Converting it to thread-local is
+    /// possible but would cost extra memory for little benefit given its
+    /// hit rate; leaving it on the shared pool keeps the diff surgical.
+    static PRIVATE_POOL: RefCell<HashMap<DeviceId, BufferMap>> =
+        RefCell::new(HashMap::new());
+}
 
 /// Unique identifier for metal devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,10 +108,6 @@ pub struct MetalDevice {
     /// Whenever we actually allocate a new buffer, we make a full sweep to clean up unused buffers
     /// (strong_count = 1).
     pub(crate) buffers: Arc<RwLock<BufferMap>>,
-
-    /// Same as `buffers` but uses `PRIVATE_RESOURCE_OPTIONS` (StorageModePrivate on macOS).
-    /// Intermediate compute buffers don't need CPU access so Private avoids coherency overhead.
-    pub(crate) private_buffers: Arc<RwLock<BufferMap>>,
 
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`candle_metal_kernels`]
@@ -221,10 +270,24 @@ impl MetalDevice {
         &self.device
     }
 
-    /// Creates a new buffer (not necessarily zeroed).
+    /// Creates a new buffer (not necessarily zeroed), drawn from this
+    /// thread's private-storage pool for the current device. May reuse a
+    /// previously-returned buffer of the same size bucket if the caller has
+    /// dropped its last reference.
     ///
-    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
-    /// Falls back to StorageModeShared on iOS where Private is not always available.
+    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU
+    /// coherency overhead). Falls back to StorageModeShared on iOS where
+    /// Private is not always available.
+    ///
+    /// ## Thread-safety
+    ///
+    /// The pool is thread-local — see `PRIVATE_POOL` for the full rationale.
+    /// Short version: within a single thread, `Arc::strong_count == 1` is a
+    /// safe "free" proxy because Metal serialises the thread's command
+    /// buffers on the device queue in commit order, so a reused buffer's
+    /// old contents are always overwritten by the new dispatch before any
+    /// consumer reads. Cross-thread reuse via a shared pool is not safe
+    /// (see `PRIVATE_POOL` for the race).
     pub fn new_buffer(
         &self,
         element_count: usize,
@@ -232,34 +295,22 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<Arc<Buffer>> {
         let size = element_count * dtype.size_in_bytes();
-        // Kernel output buffers cannot safely be recycled from a
-        // pool using `Arc::strong_count == 1` as a proxy for "free":
-        // under concurrency the last Rust Arc can drop while the
-        // owning command buffer is still uncommitted, which leaves
-        // the MTLBuffer reachable via the not-yet-submitted encoder
-        // while `new_buffer` happily hands it to a second kernel.
-        // The two kernels then race write-over-write on the GPU
-        // when the original CB eventually commits — symptom: the
-        // caller reads back the *input* of the first op instead of
-        // its output.
-        //
-        // `allocate_buffer` (shared-storage pool, used for blit
-        // destinations) avoids the race because its callers always
-        // follow with `wait_until_completed()`. Kernel outputs have
-        // no such sync point on the producer side, so we disable
-        // reuse here. The raw MTLDevice allocator has its own
-        // internal caching; empirically the per-kernel cost is
-        // dominated by dispatch overhead, not allocation.
         let size = buf_size(size);
-        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
-        let new_buffer = self
-            .device
-            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        let new_buffer = Arc::new(new_buffer);
-        subbuffers.push(new_buffer.clone());
-        Ok(new_buffer)
+        PRIVATE_POOL.with(|pool| -> Result<Arc<Buffer>> {
+            let mut pool = pool.borrow_mut();
+            let device_pool = pool.entry(self.id).or_default();
+            if let Some(b) = find_available_buffer(size, device_pool) {
+                return Ok(b);
+            }
+            let subbuffers = device_pool.entry(size).or_insert_with(Vec::new);
+            let new_buffer = self
+                .device
+                .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+                .map_err(MetalError::from)?;
+            let new_buffer = Arc::new(new_buffer);
+            subbuffers.push(new_buffer.clone());
+            Ok(new_buffer)
+        })
     }
 
     /// Creates a new private buffer (not necessarily zeroed).

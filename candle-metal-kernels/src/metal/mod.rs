@@ -5,6 +5,8 @@ pub mod compute_pipeline;
 pub mod device;
 pub mod encoder;
 pub mod library;
+#[cfg(feature = "profile")]
+pub mod profile;
 
 pub use buffer::*;
 pub use command_buffer::*;
@@ -13,3 +15,5 @@ pub use compute_pipeline::*;
 pub use device::*;
 pub use encoder::*;
 pub use library::*;
+#[cfg(feature = "profile")]
+pub use profile::{MetalProfiler, ProfileError, TraceEvent};

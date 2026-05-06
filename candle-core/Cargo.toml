@@ -57,6 +57,10 @@ metal = [
     "dep:candle-metal-kernels",
     "candle-ug?/metal",
 ]
+# Low-perturbation per-encoder GPU profiler. Enables stage-boundary counter
+# sampling and Chrome Trace Event Format JSON output. See
+# `candle-metal-kernels/METAL_PROFILING.md` for workflows and limitations.
+metal-profile = ["metal", "candle-metal-kernels/profile"]
 ug = ["dep:candle-ug"]
 
 [[bench]]
@@ -66,6 +70,10 @@ harness = false
 [[example]]
 name = "metal_basics"
 required-features = ["metal"]
+
+[[example]]
+name = "metal_profile"
+required-features = ["metal-profile"]
 
 [[example]]
 name = "cuda_basics"

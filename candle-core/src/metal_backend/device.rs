@@ -1,5 +1,7 @@
 use crate::{DType, Result};
 
+#[cfg(feature = "metal-profile")]
+use candle_metal_kernels::metal::profile::{cpu_now_ns, ArgValue, Lane, MetalProfiler};
 #[cfg(feature = "ug")]
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
@@ -13,6 +15,8 @@ use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 
 use std::path::Path;
+#[cfg(feature = "metal-profile")]
+use std::sync::RwLockReadGuard;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::MetalError;
@@ -95,6 +99,23 @@ impl std::ops::Deref for MetalDevice {
     }
 }
 
+#[cfg(feature = "metal-profile")]
+struct AllocProfileRecord<'a> {
+    label: &'a str,
+    pool: &'static str,
+    storage: &'static str,
+    requested_bytes: usize,
+    rounded_bytes: usize,
+    reused: bool,
+}
+
+#[cfg(feature = "metal-profile")]
+struct AllocProfileContext<'a> {
+    _commands: RwLockReadGuard<'a, Commands>,
+    profiler: Option<Arc<MetalProfiler>>,
+    start_ns: Option<u64>,
+}
+
 impl MetalDevice {
     #[cfg(all(feature = "ug", not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn compile(
@@ -172,48 +193,133 @@ impl MetalDevice {
         &self.device
     }
 
+    #[cfg(feature = "metal-profile")]
+    fn alloc_profile_context(&self) -> Result<AllocProfileContext<'_>> {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        let profiler = commands.profiler();
+        let start_ns = profiler.as_ref().map(|_| cpu_now_ns());
+        Ok(AllocProfileContext {
+            _commands: commands,
+            profiler,
+            start_ns,
+        })
+    }
+
+    #[cfg(feature = "metal-profile")]
+    fn record_alloc_profile(ctx: &AllocProfileContext<'_>, rec: AllocProfileRecord<'_>) {
+        if let (Some(profiler), Some(start_ns)) = (&ctx.profiler, ctx.start_ns) {
+            profiler.record_cpu_event(
+                Lane::CpuAlloc,
+                rec.label,
+                start_ns,
+                cpu_now_ns(),
+                vec![
+                    ("pool".into(), ArgValue::String(rec.pool.into())),
+                    ("storage".into(), ArgValue::String(rec.storage.into())),
+                    (
+                        "requested_bytes".into(),
+                        ArgValue::U64(rec.requested_bytes as u64),
+                    ),
+                    (
+                        "rounded_bytes".into(),
+                        ArgValue::U64(rec.rounded_bytes as u64),
+                    ),
+                    ("reused".into(), ArgValue::String(rec.reused.to_string())),
+                ],
+            );
+        }
+    }
+
     /// Creates a new buffer (not necessarily zeroed).
     ///
     /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
     /// Falls back to StorageModeShared on iOS where Private is not always available.
+    // `name`, `rounded_size`, and `reused` are only consumed by the
+    // `metal-profile` allocation lane; mute the warning off-feature without
+    // hiding genuine unused-binding bugs in the on-feature build.
+    #[cfg_attr(not(feature = "metal-profile"), allow(unused_variables))]
     pub fn new_buffer(
         &self,
         element_count: usize,
         dtype: DType,
-        _name: &str,
+        name: &str,
     ) -> Result<Arc<Buffer>> {
-        let size = element_count * dtype.size_in_bytes();
-        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
-            return Ok(b.clone());
-        }
-        let size = buf_size(size);
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
+        let requested_size = element_count * dtype.size_in_bytes();
+        #[cfg(feature = "metal-profile")]
+        let profile_context = self.alloc_profile_context()?;
 
-        let new_buffer = self
-            .device
-            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        let new_buffer = Arc::new(new_buffer);
-        subbuffers.push(new_buffer.clone());
-        Ok(new_buffer)
+        let (buffer, rounded_size, reused) = {
+            let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
+            if let Some(b) = find_available_buffer(requested_size, &buffers) {
+                (b.clone(), b.length(), true)
+            } else {
+                let rounded_size = buf_size(requested_size);
+                let subbuffers = buffers.entry(rounded_size).or_insert(vec![]);
+
+                let new_buffer = self
+                    .device
+                    .new_buffer(rounded_size, PRIVATE_RESOURCE_OPTIONS)
+                    .map_err(MetalError::from)?;
+                let new_buffer = Arc::new(new_buffer);
+                subbuffers.push(new_buffer.clone());
+                (new_buffer, rounded_size, false)
+            }
+        };
+
+        #[cfg(feature = "metal-profile")]
+        {
+            buffer.set_label(name);
+            Self::record_alloc_profile(
+                &profile_context,
+                AllocProfileRecord {
+                    label: name,
+                    pool: "private_buffers",
+                    storage: "Private",
+                    requested_bytes: requested_size,
+                    rounded_bytes: rounded_size,
+                    reused,
+                },
+            );
+        }
+        Ok(buffer)
     }
 
     /// Creates a new private buffer (not necessarily zeroed).
     ///
     /// This is intentionally not in the Metal buffer pool to allow the efficient implementation of persistent buffers.
+    // `name` is only consumed by the `metal-profile` allocation lane.
+    #[cfg_attr(not(feature = "metal-profile"), allow(unused_variables))]
     pub fn new_private_buffer(
         &self,
         element_count: usize,
         dtype: DType,
-        _name: &str,
+        name: &str,
     ) -> Result<Arc<Buffer>> {
         let size = element_count * dtype.size_in_bytes();
+        #[cfg(feature = "metal-profile")]
+        let profile_context = self.alloc_profile_context()?;
+
         let buffer = self
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        Ok(Arc::new(buffer))
+        let buffer = Arc::new(buffer);
+        #[cfg(feature = "metal-profile")]
+        {
+            buffer.set_label(name);
+            Self::record_alloc_profile(
+                &profile_context,
+                AllocProfileRecord {
+                    label: name,
+                    pool: "unpooled_private",
+                    storage: "Private",
+                    requested_bytes: size,
+                    rounded_bytes: size,
+                    reused: false,
+                },
+            );
+        }
+        Ok(buffer)
     }
 
     /// Creates a new buffer from data.
@@ -222,16 +328,35 @@ impl MetalDevice {
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
         let size = core::mem::size_of_val(data);
+        #[cfg(feature = "metal-profile")]
+        let profile_context = self.alloc_profile_context()?;
+
         let new_buffer = self
             .device
             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
-
         let new_buffer = Arc::new(new_buffer);
-        subbuffers.push(new_buffer.clone());
+        {
+            let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+            let subbuffers = buffers.entry(size).or_insert(vec![]);
+            subbuffers.push(new_buffer.clone());
+        }
+
+        #[cfg(feature = "metal-profile")]
+        {
+            new_buffer.set_label("new_buffer_with_data");
+            Self::record_alloc_profile(
+                &profile_context,
+                AllocProfileRecord {
+                    label: "new_buffer_with_data",
+                    pool: "buffers",
+                    storage: "Shared",
+                    requested_bytes: size,
+                    rounded_bytes: size,
+                    reused: false,
+                },
+            );
+        }
         Ok(new_buffer)
     }
 
@@ -245,25 +370,55 @@ impl MetalDevice {
     }
 
     /// The critical allocator algorithm
+    // `rounded_size` and `reused` are only consumed by the `metal-profile`
+    // allocation lane.
+    #[cfg_attr(not(feature = "metal-profile"), allow(unused_variables))]
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
-            // Cloning also ensures we increment the strong count
-            return Ok(b.clone());
-        }
-        let size = buf_size(size);
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
+        #[cfg(feature = "metal-profile")]
+        let profile_context = self.alloc_profile_context()?;
 
-        let new_buffer = self
-            .device
-            .new_buffer(size, RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        let new_buffer = Arc::new(new_buffer);
-        subbuffers.push(new_buffer.clone());
-        Ok(new_buffer)
+        let (buffer, rounded_size, reused) = {
+            let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+            if let Some(b) = find_available_buffer(size, &buffers) {
+                // Cloning also ensures we increment the strong count.
+                (b.clone(), b.length(), true)
+            } else {
+                let rounded_size = buf_size(size);
+                let subbuffers = buffers.entry(rounded_size).or_insert(vec![]);
+
+                let new_buffer = self
+                    .device
+                    .new_buffer(rounded_size, RESOURCE_OPTIONS)
+                    .map_err(MetalError::from)?;
+                let new_buffer = Arc::new(new_buffer);
+                subbuffers.push(new_buffer.clone());
+                (new_buffer, rounded_size, false)
+            }
+        };
+
+        #[cfg(feature = "metal-profile")]
+        {
+            buffer.set_label("allocate_buffer");
+            Self::record_alloc_profile(
+                &profile_context,
+                AllocProfileRecord {
+                    label: "allocate_buffer",
+                    pool: "buffers",
+                    storage: "Shared",
+                    requested_bytes: size,
+                    rounded_bytes: rounded_size,
+                    reused,
+                },
+            );
+        }
+        Ok(buffer)
     }
 
-    /// Create a metal GPU capture trace on [`path`].
+    /// Start an Apple Metal GPU capture trace on [`path`].
+    ///
+    /// For command-line runs outside Xcode, set `MTL_CAPTURE_ENABLED=1` in the
+    /// environment before launching the process, otherwise Metal may reject
+    /// programmatic capture.
     pub fn capture<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
         let descriptor = MTLCaptureDescriptor::new();
@@ -284,10 +439,140 @@ impl MetalDevice {
             .map_err(|e| MetalError::from(e.to_string()))?;
         Ok(())
     }
+
+    /// Stop an active Apple Metal GPU capture, if one is running.
+    pub fn stop_capture(&self) -> Result<()> {
+        let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        if capture.isCapturing() {
+            capture.stopCapture();
+        }
+        Ok(())
+    }
+
+    /// Return whether the shared Metal capture manager is currently capturing.
+    pub fn is_capturing(&self) -> bool {
+        let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        capture.isCapturing()
+    }
+
+    /// Install a low-perturbation GPU profiler on this device. Subsequent
+    /// compute encoder constructions attach a `MTLCounterSampleBuffer` at stage
+    /// boundaries; the GPU's command processor writes one timestamp at the
+    /// begin and one at the end of each encoder. Resolution happens off-thread
+    /// in `addCompletedHandler` once each command buffer finishes.
+    ///
+    /// This does not change `compute_per_buffer`, the pool size, dispatch
+    /// scheduling, or add GPU synchronization. It does add CPU-side bookkeeping
+    /// while installed. CPU/GPU timestamp alignment has been validated on Apple
+    /// Silicon; other Metal devices should be locally verified.
+    ///
+    /// Errors if the device does not support `MTLCounterSamplingPoint::AtStageBoundary`
+    /// or does not expose the timestamp counter set.
+    #[cfg(feature = "metal-profile")]
+    pub fn install_profiler(&self) -> Result<()> {
+        let profiler = candle_metal_kernels::metal::profile::MetalProfiler::new(&self.device)
+            .map_err(|e| MetalError::from(e.to_string()))?;
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands
+            .install_profiler(Some(profiler))
+            .map_err(MetalError::from)?;
+        Ok(())
+    }
+
+    /// Remove any installed profiler. Pending profiled command buffers are
+    /// drained before replacement/removal so per-command-buffer profile state
+    /// cannot leak into a later profiling session. Subsequent encoders are
+    /// constructed via the unprofiled path.
+    #[cfg(feature = "metal-profile")]
+    pub fn uninstall_profiler(&self) -> Result<()> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.install_profiler(None).map_err(MetalError::from)?;
+        Ok(())
+    }
+
+    /// Drain pending command buffers (so all `addCompletedHandler` blocks fire)
+    /// and write recorded events to `path` in Chrome Trace Event Format JSON.
+    /// Returns the number of events written.
+    ///
+    /// The output is plain-text JSON, queryable programmatically with `jq`,
+    /// any JSON parser, or Perfetto's `trace_processor` SQL — no UI required.
+    /// Events remain in memory after this call so callers can take snapshots or
+    /// write the same trace again; use `flush_profile_and_clear` or
+    /// `profile_clear` for long-running processes.
+    #[cfg(feature = "metal-profile")]
+    pub fn flush_profile<P: AsRef<Path>>(&self, path: P) -> Result<usize> {
+        // Hold the device command lock across wait → write so MetalDevice
+        // callers cannot append new events between the completion drain and
+        // the JSON snapshot. This intentionally keeps events in memory.
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.flush_and_wait().map_err(MetalError::from)?;
+        let profiler = commands
+            .profiler()
+            .ok_or_else(|| MetalError::from("no profiler installed".to_string()))?;
+        profiler
+            .flush_chrome_trace(path)
+            .map_err(|e| MetalError::from(e.to_string()).into())
+    }
+
+    /// Snapshot the current trace events without flushing to disk. Returns
+    /// `None` if no profiler is installed.
+    #[cfg(feature = "metal-profile")]
+    pub fn profile_snapshot(&self) -> Result<Option<Vec<super::MetalTraceEvent>>> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.flush_and_wait().map_err(MetalError::from)?;
+        Ok(commands.profiler().map(|p| p.snapshot()))
+    }
+
+    /// Drain pending command buffers, write recorded events, then clear the
+    /// in-memory event sink. Prefer this for long-running processes that flush
+    /// periodically; `flush_profile` intentionally keeps events for later
+    /// snapshots or repeated writes.
+    #[cfg(feature = "metal-profile")]
+    pub fn flush_profile_and_clear<P: AsRef<Path>>(&self, path: P) -> Result<usize> {
+        // Hold the device command lock across wait → write → clear so no new
+        // MetalDevice work can append events between the write and the clear.
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.flush_and_wait().map_err(MetalError::from)?;
+        let profiler = commands
+            .profiler()
+            .ok_or_else(|| MetalError::from("no profiler installed".to_string()))?;
+        let n = profiler
+            .flush_chrome_trace(path)
+            .map_err(|e| MetalError::from(e.to_string()))?;
+        profiler.clear();
+        Ok(n)
+    }
+
+    /// Drop all recorded trace events. No-op if no profiler is installed.
+    #[cfg(feature = "metal-profile")]
+    pub fn profile_clear(&self) -> Result<()> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.flush_and_wait().map_err(MetalError::from)?;
+        if let Some(p) = commands.profiler() {
+            p.clear();
+        }
+        Ok(())
+    }
 }
 
 fn buf_size(size: usize) -> usize {
     size.next_power_of_two()
+}
+
+fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    let mut best_buffer: Option<&Arc<Buffer>> = None;
+    let mut best_buffer_size = usize::MAX;
+    for (buffer_size, subbuffers) in buffers.iter() {
+        if buffer_size >= &size && buffer_size < &best_buffer_size {
+            for sub in subbuffers {
+                if Arc::strong_count(sub) == 1 {
+                    best_buffer = Some(sub);
+                    best_buffer_size = *buffer_size;
+                }
+            }
+        }
+    }
+    best_buffer.cloned()
 }
 
 #[cfg(test)]
@@ -321,20 +606,49 @@ mod tests {
         // a 2-byte buffer. This must not be rounded down to 1.
         assert_eq!(buf_size(2), 2);
     }
-}
 
-fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
-    let mut best_buffer: Option<&Arc<Buffer>> = None;
-    let mut best_buffer_size = usize::MAX;
-    for (buffer_size, subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size {
-            for sub in subbuffers {
-                if Arc::strong_count(sub) == 1 {
-                    best_buffer = Some(sub);
-                    best_buffer_size = *buffer_size;
-                }
-            }
-        }
+    #[cfg(all(feature = "metal-profile", target_os = "macos"))]
+    #[test]
+    fn flush_profile_and_clear_clears_events() -> crate::Result<()> {
+        let device = crate::Device::new_metal(0)?;
+        let metal = match &device {
+            crate::Device::Metal(m) => m,
+            _ => unreachable!(),
+        };
+        metal.install_profiler()?;
+
+        let a = crate::Tensor::randn(0.0f32, 1.0, (8, 8), &device)?;
+        let _ = a.matmul(&a)?;
+        metal.wait_until_completed()?;
+
+        let path = std::env::temp_dir().join(format!(
+            "candle-metal-profile-test-{}.json",
+            std::process::id()
+        ));
+        let n = metal.flush_profile_and_clear(&path)?;
+        assert!(n > 0);
+        assert_eq!(
+            metal.profile_snapshot()?.map(|events| events.len()),
+            Some(0)
+        );
+
+        let _ = a.matmul(&a)?;
+        metal.wait_until_completed()?;
+        let n = metal.flush_profile(&path)?;
+        assert!(n > 0);
+        assert_eq!(
+            metal.profile_snapshot()?.map(|events| events.len()),
+            Some(n)
+        );
+
+        let _ = a.matmul(&a)?;
+        metal.profile_clear()?;
+        assert_eq!(
+            metal.profile_snapshot()?.map(|events| events.len()),
+            Some(0)
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
-    best_buffer.cloned()
 }

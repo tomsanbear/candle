@@ -14,6 +14,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
 mod device;
+#[cfg(feature = "metal-profile")]
+pub use candle_metal_kernels::metal::profile::TraceEvent as MetalTraceEvent;
 pub use device::{DeviceId, MetalDevice};
 
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
@@ -1588,6 +1590,7 @@ impl BackendStorage for MetalStorage {
             }
         };
         let encoder = self.device.command_encoder()?;
+        encoder.set_label("index_select");
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
         candle_metal_kernels::call_index_select(

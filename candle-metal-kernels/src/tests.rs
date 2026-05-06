@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "profile")]
+use crate::metal::MetalProfiler;
 use crate::metal::{create_command_buffer, CommandSemaphore, Commands};
 use core::ffi::c_void;
 use half::{bf16, f16};
@@ -2519,4 +2521,75 @@ fn commands_concurrent_acquisition() {
     }
 
     commands.wait_until_completed().unwrap();
+}
+
+#[cfg(feature = "profile")]
+#[test]
+fn commands_profile_lifecycle_concurrent_smoke() {
+    std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "2");
+    std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "4");
+
+    let device = Device::system_default().unwrap();
+    let queue = device.new_command_queue().unwrap();
+    let commands = Arc::new(Commands::new(queue).unwrap());
+    let profiler = MetalProfiler::new(&device).unwrap();
+    commands
+        .install_profiler(Some(Arc::clone(&profiler)))
+        .unwrap();
+
+    let mut handles = vec![];
+    for _ in 0..8 {
+        let c = Arc::clone(&commands);
+        handles.push(thread::spawn(move || {
+            for i in 0..4 {
+                if i % 2 == 0 {
+                    let (_flush, encoder) = c.command_encoder().unwrap();
+                    drop(encoder);
+                } else {
+                    let (_flush, encoder) = c.blit_command_encoder().unwrap();
+                    encoder.end_encoding();
+                }
+            }
+        }));
+    }
+
+    for _ in 0..4 {
+        commands.install_profiler(None).unwrap();
+        commands
+            .install_profiler(Some(Arc::clone(&profiler)))
+            .unwrap();
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+    commands.wait_until_completed().unwrap();
+    // This primarily guards profiler lifecycle synchronization: concurrent
+    // encoder creation plus install/uninstall/reinstall must not panic,
+    // deadlock, or leave command buffers unflushable. Some profile events may
+    // legitimately be dropped while the profiler is uninstalled.
+}
+
+#[cfg(feature = "profile")]
+#[test]
+fn commands_profile_flush_and_clear() {
+    let device = Device::system_default().unwrap();
+    let queue = device.new_command_queue().unwrap();
+    let commands = Commands::new(queue).unwrap();
+    let profiler = MetalProfiler::new(&device).unwrap();
+    commands
+        .install_profiler(Some(Arc::clone(&profiler)))
+        .unwrap();
+
+    let (_flush, encoder) = commands.command_encoder().unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    assert!(profiler.event_count() > 0);
+    profiler.clear();
+    assert_eq!(profiler.event_count(), 0);
+
+    let (_flush, encoder) = commands.command_encoder().unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    assert!(profiler.event_count() > 0);
 }

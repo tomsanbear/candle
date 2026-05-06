@@ -17,6 +17,7 @@
     - [Using the hub](inference/hub.md)
 - [Error management](error_manage.md)
 - [Tracing](tracing.md)
+- [Metal GPU Profiling](metal_profile.md)
 - [Training](training/training.md)
     - [Simplified](training/simplified.md)
     - [MNIST](training/mnist.md)

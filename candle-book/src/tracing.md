@@ -51,6 +51,12 @@ let _guard = {
 
 When using CUDA, Metal, or other asynchronous GPU backends, tracing may produce misleading timing data because operations are queued rather than executed immediately.
 
+### Metal
+
+For Metal-specific per-kernel GPU profiling that captures hardware timestamps
+without perturbing the engine's batching or scheduling, see
+[Metal GPU Profiling](metal_profile.md).
+
 ### CUDA
 
 For CUDA-specific profiling, you have two options:

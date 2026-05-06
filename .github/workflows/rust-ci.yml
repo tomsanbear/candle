@@ -28,6 +28,15 @@ jobs:
         if: matrix.os == 'macOS-latest' 
         run: cargo check --workspace --features metal
 
+      - name: Run macos with metal profiling
+        if: matrix.os == 'macOS-latest'
+        run: |
+          cargo check --manifest-path candle-metal-kernels/Cargo.toml --features profile
+          cargo check -p candle-core --example metal_profile --features metal-profile
+          cargo check -p candle-examples --example metal_profile_llm --features metal-profile
+          cargo test --manifest-path candle-metal-kernels/Cargo.toml --features profile commands_profile
+          cargo test -p candle-core --features metal-profile flush_profile_and_clear_clears_events
+
       - name: Run normal cpu
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
         run: cargo check --workspace

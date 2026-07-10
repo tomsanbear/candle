@@ -594,6 +594,19 @@ impl BackendStorage for MetalStorage {
                 (DType::BF16, DType::U32) => "cast_bf16_u32",
                 (DType::BF16, DType::U8) => "cast_bf16_u8",
 
+                (DType::I32, DType::BF16) => "cast_i32_bf16",
+                (DType::I32, DType::F16) => "cast_i32_f16",
+                (DType::I32, DType::F32) => "cast_i32_f32",
+                (DType::I32, DType::I64) => "cast_i32_i64",
+                (DType::I32, DType::U32) => "cast_i32_u32",
+                (DType::I32, DType::U8) => "cast_i32_u8",
+                (DType::BF16, DType::I32) => "cast_bf16_i32",
+                (DType::F16, DType::I32) => "cast_f16_i32",
+                (DType::F32, DType::I32) => "cast_f32_i32",
+                (DType::I64, DType::I32) => "cast_i64_i32",
+                (DType::U32, DType::I32) => "cast_u32_i32",
+                (DType::U8, DType::I32) => "cast_u8_i32",
+
                 (left, right) => {
                     crate::bail!("Metal contiguous to_dtype {left:?} {right:?} not implemented")
                 }
@@ -646,6 +659,19 @@ impl BackendStorage for MetalStorage {
                 (DType::U8, DType::F32) => "cast_u8_f32_strided",
                 (DType::U8, DType::I64) => "cast_u8_i64_strided",
                 (DType::U8, DType::U32) => "cast_u8_u32_strided",
+
+                (DType::I32, DType::BF16) => "cast_i32_bf16_strided",
+                (DType::I32, DType::F16) => "cast_i32_f16_strided",
+                (DType::I32, DType::F32) => "cast_i32_f32_strided",
+                (DType::I32, DType::I64) => "cast_i32_i64_strided",
+                (DType::I32, DType::U32) => "cast_i32_u32_strided",
+                (DType::I32, DType::U8) => "cast_i32_u8_strided",
+                (DType::BF16, DType::I32) => "cast_bf16_i32_strided",
+                (DType::F16, DType::I32) => "cast_f16_i32_strided",
+                (DType::F32, DType::I32) => "cast_f32_i32_strided",
+                (DType::I64, DType::I32) => "cast_i64_i32_strided",
+                (DType::U32, DType::I32) => "cast_u32_i32_strided",
+                (DType::U8, DType::I32) => "cast_u8_i32_strided",
 
                 (left, right) => {
                     crate::bail!("Metal strided to_dtype {left:?} {right:?} not implemented")

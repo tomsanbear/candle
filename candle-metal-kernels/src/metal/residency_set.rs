@@ -41,6 +41,22 @@ impl ResidencySet {
             set.commit();
         }
     }
+
+    /// Remove many buffers with a single `commit()`. `commit` is an OS-level
+    /// call priced per invocation, not per allocation, so bulk eviction (e.g.
+    /// an allocator sweep) must not commit per buffer.
+    pub fn remove_batch<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+        if let Some(set) = &self.raw {
+            let mut any = false;
+            for buf in bufs {
+                set.removeAllocation(as_allocation(buf));
+                any = true;
+            }
+            if any {
+                set.commit();
+            }
+        }
+    }
 }
 
 /// Cast a `&Buffer` to `&ProtocolObject<dyn MTLAllocation>`.

@@ -2099,6 +2099,7 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             residency_set,
+            sweep: Arc::new(crate::metal_backend::device::SweepState::new()),
         })
     }
 

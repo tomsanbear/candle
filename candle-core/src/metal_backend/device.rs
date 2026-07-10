@@ -12,6 +12,7 @@ use candle_metal_kernels::{
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::MetalError;
@@ -68,6 +69,53 @@ pub struct MetalDevice {
     pub(crate) seed_value: Arc<RwLock<u64>>,
     /// Residency set registered on the command queue.
     pub(crate) residency_set: Arc<ResidencySet>,
+    /// Gates how often waits sweep the buffer pools; see [`SweepState`].
+    pub(crate) sweep: Arc<SweepState>,
+}
+
+/// Decides when a GPU wait may sweep free buffers out of the pools.
+///
+/// Sweeping on *every* wait empties the free pools exactly when the next
+/// forward pass would reuse them: each decode step then re-creates its whole
+/// intermediate working set via `newBuffer` and pays a residency-set commit
+/// per buffer, twice. Skipping a sweep is always safe (it only delays memory
+/// release), so waits sweep only when enough fresh allocation has happened to
+/// matter, with a wait-count backstop so idle phases still release memory.
+pub(crate) struct SweepState {
+    waits_since_sweep: AtomicUsize,
+    fresh_alloc_bytes: AtomicUsize,
+}
+
+/// Sweep once new (non-pool-reuse) allocations exceed this many bytes...
+const SWEEP_FRESH_ALLOC_BYTES: usize = 256 * 1024 * 1024;
+/// ...or after this many waits, whichever comes first.
+const SWEEP_EVERY_N_WAITS: usize = 64;
+
+impl SweepState {
+    pub(crate) fn new() -> Self {
+        Self {
+            waits_since_sweep: AtomicUsize::new(0),
+            fresh_alloc_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn record_fresh_alloc(&self, bytes: usize) {
+        self.fresh_alloc_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Returns true when this wait should sweep, resetting the counters.
+    fn should_sweep(&self) -> bool {
+        let waits = self.waits_since_sweep.fetch_add(1, Ordering::Relaxed) + 1;
+        if waits >= SWEEP_EVERY_N_WAITS
+            || self.fresh_alloc_bytes.load(Ordering::Relaxed) >= SWEEP_FRESH_ALLOC_BYTES
+        {
+            self.waits_since_sweep.store(0, Ordering::Relaxed);
+            self.fresh_alloc_bytes.store(0, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -129,27 +177,43 @@ impl MetalDevice {
     }
 
     fn drop_unused_buffers(&self) -> Result<()> {
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        for subbuffers in buffers.values_mut() {
-            subbuffers.retain(|s| {
-                if Arc::strong_count(s) == 1 {
-                    self.residency_set.remove(s);
-                    false
-                } else {
-                    true
-                }
-            });
+        // Collect evictions and unregister them with one residency commit;
+        // the buffers deallocate when `removed` drops.
+        let mut removed: Vec<Arc<Buffer>> = Vec::new();
+        {
+            let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+            for subbuffers in buffers.values_mut() {
+                subbuffers.retain(|s| {
+                    if Arc::strong_count(s) == 1 {
+                        removed.push(s.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
-        let mut private_buffers = self.private_buffers.write().map_err(MetalError::from)?;
-        for subbuffers in private_buffers.values_mut() {
-            subbuffers.retain(|s| {
-                if Arc::strong_count(s) == 1 {
-                    self.residency_set.remove(s);
-                    false
-                } else {
-                    true
-                }
-            });
+        {
+            let mut private_buffers = self.private_buffers.write().map_err(MetalError::from)?;
+            for subbuffers in private_buffers.values_mut() {
+                subbuffers.retain(|s| {
+                    if Arc::strong_count(s) == 1 {
+                        removed.push(s.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        self.residency_set
+            .remove_batch(removed.iter().map(|b| b.as_ref()));
+        Ok(())
+    }
+
+    fn maybe_drop_unused_buffers(&self) -> Result<()> {
+        if self.sweep.should_sweep() {
+            self.drop_unused_buffers()?;
         }
         Ok(())
     }
@@ -172,7 +236,7 @@ impl MetalDevice {
             .wait_until_completed()
             .map_err(MetalError::from)?;
 
-        self.drop_unused_buffers()?;
+        self.maybe_drop_unused_buffers()?;
         Ok(())
     }
 
@@ -182,7 +246,7 @@ impl MetalDevice {
             .flush_and_wait_current()
             .map_err(MetalError::from)?;
 
-        self.drop_unused_buffers()?;
+        self.maybe_drop_unused_buffers()?;
         Ok(())
     }
 
@@ -223,6 +287,7 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
+        self.sweep.record_fresh_alloc(size);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
     }
@@ -262,6 +327,7 @@ impl MetalDevice {
 
         let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
+        self.sweep.record_fresh_alloc(size);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
     }
@@ -306,6 +372,7 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
+        self.sweep.record_fresh_alloc(size);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
     }

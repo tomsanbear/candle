@@ -537,17 +537,12 @@ mod tests {
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
-    let mut best_buffer: Option<&Arc<Buffer>> = None;
-    let mut best_buffer_size = usize::MAX;
-    for (buffer_size, subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size {
-            for sub in subbuffers {
-                if Arc::strong_count(sub) == 1 {
-                    best_buffer = Some(sub);
-                    best_buffer_size = *buffer_size;
-                }
-            }
+    // Buckets are ordered by size, so the first bucket at or above the request
+    // that holds a free buffer is the best fit.
+    for (_, subbuffers) in buffers.range(size..) {
+        if let Some(sub) = subbuffers.iter().find(|s| Arc::strong_count(s) == 1) {
+            return Some(sub.clone());
         }
     }
-    best_buffer.cloned()
+    None
 }

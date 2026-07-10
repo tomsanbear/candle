@@ -14,7 +14,7 @@ use objc2_foundation::NSRange;
 use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_metal::MTLCommandQueue;
-use std::collections::HashMap;
+use candle_metal_kernels::metal::BufferMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
@@ -2093,8 +2093,8 @@ impl BackendDevice for MetalDevice {
             id: DeviceId::new(),
             device,
             commands: Arc::new(commands),
-            buffers: Arc::new(RwLock::new(HashMap::new())),
-            private_buffers: Arc::new(RwLock::new(HashMap::new())),
+            buffers: Arc::new(RwLock::new(BufferMap::new())),
+            private_buffers: Arc::new(RwLock::new(BufferMap::new())),
             kernels,
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),

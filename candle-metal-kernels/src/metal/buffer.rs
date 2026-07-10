@@ -1,7 +1,7 @@
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{MTLBuffer, MTLResource};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 pub type MetalResource = ProtocolObject<dyn MTLResource>;
 pub type MTLResourceOptions = objc2_metal::MTLResourceOptions;
@@ -59,4 +59,7 @@ impl<'a> From<&'a Buffer> for &'a MetalResource {
     }
 }
 
-pub type BufferMap = HashMap<usize, Vec<Arc<Buffer>>>;
+// Ordered by bucket size so the allocator can range-scan `size..` and take
+// the first bucket with a free buffer (= best fit) instead of scanning every
+// bucket on each allocation.
+pub type BufferMap = BTreeMap<usize, Vec<Arc<Buffer>>>;

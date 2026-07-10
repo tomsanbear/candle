@@ -1777,21 +1777,43 @@ impl BackendStorage for MetalStorage {
                 )
             }
         };
-        candle_metal_kernels::call_mlx_gemm(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            dtype,
-            (b, m, n, k),
-            lhs_l.stride(),
-            lhs_l.start_offset() * self.dtype.size_in_bytes(),
-            &self.buffer,
-            rhs_l.stride(),
-            rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
-            &rhs.buffer,
-            &buffer,
-        )
-        .map_err(MetalError::from)?;
+        // Matrix-vector shapes get the dedicated gemv kernels: the gemm tile
+        // kernel leaves most of each tile idle at m == 1 (the decode hot
+        // path). call_mlx_gemv validates strides before encoding, so falling
+        // back to gemm on unsupported layouts is safe.
+        let gemv_done = (m == 1 || n == 1)
+            && candle_metal_kernels::call_mlx_gemv(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                dtype,
+                (b, m, n, k),
+                lhs_l.stride(),
+                lhs_l.start_offset() * self.dtype.size_in_bytes(),
+                &self.buffer,
+                rhs_l.stride(),
+                rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
+                &rhs.buffer,
+                &buffer,
+            )
+            .is_ok();
+        if !gemv_done {
+            candle_metal_kernels::call_mlx_gemm(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                dtype,
+                (b, m, n, k),
+                lhs_l.stride(),
+                lhs_l.start_offset() * self.dtype.size_in_bytes(),
+                &self.buffer,
+                rhs_l.stride(),
+                rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
+                &rhs.buffer,
+                &buffer,
+            )
+            .map_err(MetalError::from)?;
+        }
 
         Ok(Self::new(
             buffer,

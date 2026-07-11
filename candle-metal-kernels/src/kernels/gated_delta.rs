@@ -19,6 +19,87 @@ pub struct GatedDeltaParams {
     pub norm_eps: f32,
 }
 
+/// Fused GatedDeltaNet chunk step (l <= 12); see gated_delta_chunk.metal.
+/// Emits the rollback-capture intermediates alongside outputs and states.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gated_delta_chunk(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    params: GatedDeltaParams,
+    seq_len: usize,
+    proj: &Buffer,
+    conv_in: &Buffer,
+    state_in: &Buffer,
+    conv_w: &Buffer,
+    dt_bias: &Buffer,
+    a_log_exp: &Buffer,
+    norm_w: &Buffer,
+    out: &Buffer,
+    conv_out: &Buffer,
+    state_out: &Buffer,
+    cap_k: &Buffer,
+    cap_delta: &Buffer,
+    cap_gcs: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if params.dk != 128 || params.dv != 128 || seq_len == 0 || seq_len > 12 {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "gated_delta_chunk requires dk == dv == 128 and 1 <= l <= 12; got dk={} dv={} l={seq_len}",
+            params.dk, params.dv
+        )));
+    }
+    let pipeline =
+        kernels.load_pipeline(device, Source::GatedDeltaChunk, "gated_delta_chunk_bf16")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gated_delta_chunk l={seq_len}");
+
+    set_params!(
+        encoder,
+        (
+            proj,
+            conv_in,
+            state_in,
+            conv_w,
+            dt_bias,
+            a_log_exp,
+            norm_w,
+            Output::new(out),
+            Output::new(conv_out),
+            Output::new(state_out),
+            Output::new(cap_k),
+            Output::new(cap_delta),
+            Output::new(cap_gcs),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.conv_dim,
+            params.key_dim,
+            params.value_dim,
+            params.ksz,
+            seq_len as u32,
+            params.l2_eps,
+            params.norm_eps
+        )
+    );
+
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: params.heads as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dv as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Fused GatedDeltaNet single-token decode step; see gated_delta.metal for
 /// layouts and semantics. BF16 activations, F32 state, one dispatch of
 /// `heads` threadgroups x `dv` threads.

@@ -20,7 +20,7 @@ pub use binary::{call_binary_contiguous, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
 pub use fill::*;
-pub use gated_delta::{call_gated_delta_decode, GatedDeltaParams};
+pub use gated_delta::{call_gated_delta_chunk, call_gated_delta_decode, GatedDeltaParams};
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
 pub use quantized::{

@@ -163,45 +163,68 @@ kernel void gated_delta_chunk_bf16(
     device const float *s_in = state_in + (ulong)h * dk * dv;
     device float *s_out = state_out + (ulong)h * dk * dv;
 
+    // ---- Phase 3.5: cooperative pair dots + fused S0 pass. Replaces the
+    // 2*l^2 barrier-chained tg_sum reductions of v1 with one barrier: each
+    // thread owns whole (t, j) pairs; ks0/qs0 accumulate in register arrays
+    // over a single sweep of the state.
+    threadgroup float kk_sh[GDC_MAX_L * GDC_MAX_L];
+    threadgroup float qk_sh[GDC_MAX_L * GDC_MAX_L];
+    for (uint p = tid; p < l * l; p += dv) {
+        const uint t = p / l;
+        const uint j = p % l;
+        float kk = 0.0f;
+        float qk = 0.0f;
+        for (uint i = 0; i < dk; i++) {
+            const float kj = k_sh[j * dk + i];
+            kk += k_sh[t * dk + i] * kj;
+            qk += q_sh[t * dk + i] * kj;
+        }
+        kk_sh[p] = kk;
+        qk_sh[p] = qk;
+    }
+    float ks0[GDC_MAX_L];
+    float qs0[GDC_MAX_L];
+#pragma unroll
+    for (uint t = 0; t < GDC_MAX_L; t++) {
+        ks0[t] = 0.0f;
+        qs0[t] = 0.0f;
+    }
+    for (uint i = 0; i < dk; i++) {
+        const float s0 = s_in[i * dv + tid];
+#pragma unroll
+        for (uint t = 0; t < GDC_MAX_L; t++) {
+            if (t < l) {
+                ks0[t] = fma(k_sh[t * dk + i], s0, ks0[t]);
+                qs0[t] = fma(q_sh[t * dk + i], s0, qs0[t]);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // ---- Phase 4: forward substitution for the WY pseudo-values.
     // delta_t = beta_t * (v_t - gamma_t * k_t^T S0) - sum_{j<t} B[t,j] delta_j
-    // with B[t,j] = beta_t * exp(G_t - G_j) * (k_t . k_j).
+    // with B[t,j] = beta_t * exp(G_t - G_j) * (k_t . k_j). Each thread only
+    // touches its own column of delta_sh, so the t loop needs no barriers.
     for (uint t = 0; t < l; t++) {
-        // k_t^T S0 for this thread's v-column.
-        float ks0 = 0.0f;
-        for (uint i = 0; i < dk; i++) {
-            ks0 += k_sh[t * dk + i] * s_in[i * dv + tid];
-        }
         const float gamma_t = metal::precise::exp(gcs_sh[t]);
-        float acc = beta_sh[t] * (v_sh[t * dv + tid] - gamma_t * ks0);
+        float acc = beta_sh[t] * (v_sh[t * dv + tid] - gamma_t * ks0[t]);
         for (uint j = 0; j < t; j++) {
-            // k_t . k_j via per-thread partial over dk (tid indexes dk here
-            // because dk == dv).
-            const float part = k_sh[t * dk + tid] * k_sh[j * dk + tid];
-            const float dot = tg_sum_gdc(part, scratch, simd_group, simd_lane, n_simd_groups);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float b_tj = beta_sh[t] * metal::precise::exp(gcs_sh[t] - gcs_sh[j]) * dot;
+            const float b_tj = beta_sh[t] * metal::precise::exp(gcs_sh[t] - gcs_sh[j])
+                * kk_sh[t * l + j];
             acc -= b_tj * delta_sh[j * dv + tid];
         }
         delta_sh[t * dv + tid] = acc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Phase 5: outputs, final state, capture.
+    // ---- Phase 5: outputs (group RMSNorm needs one reduction per position).
     // o_t = gamma_t * q_t^T S0 + sum_{j<=t} exp(G_t - G_j) (q_t . k_j) delta_j
     for (uint t = 0; t < l; t++) {
-        float qs0 = 0.0f;
-        for (uint i = 0; i < dk; i++) {
-            qs0 += q_sh[t * dk + i] * s_in[i * dv + tid];
-        }
-        float o = metal::precise::exp(gcs_sh[t]) * qs0;
+        float o = metal::precise::exp(gcs_sh[t]) * qs0[t];
         for (uint j = 0; j <= t; j++) {
-            const float part = q_sh[t * dk + tid] * k_sh[j * dk + tid];
-            const float dot = tg_sum_gdc(part, scratch, simd_group, simd_lane, n_simd_groups);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            o += metal::precise::exp(gcs_sh[t] - gcs_sh[j]) * dot * delta_sh[j * dv + tid];
+            o += metal::precise::exp(gcs_sh[t] - gcs_sh[j]) * qk_sh[t * l + j]
+                * delta_sh[j * dv + tid];
         }
-        // Group RMSNorm + silu(z) gate, straight to output.
         const float o2 = tg_sum_gdc(o * o, scratch, simd_group, simd_lane, n_simd_groups);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float inv_rms = metal::precise::powr(o2 / float(dv) + norm_eps, -0.5f);
@@ -212,11 +235,19 @@ kernel void gated_delta_chunk_bf16(
 
     // Final state: S = exp(G_last) S0 + sum_j exp(G_last - G_j) k_j (x) delta_j
     const float g_last = gcs_sh[l - 1];
+    float decay_j[GDC_MAX_L];
+#pragma unroll
+    for (uint j = 0; j < GDC_MAX_L; j++) {
+        decay_j[j] = j < l ? metal::precise::exp(g_last - gcs_sh[j]) : 0.0f;
+    }
+    const float g_last_exp = metal::precise::exp(g_last);
     for (uint i = 0; i < dk; i++) {
-        float s = metal::precise::exp(g_last) * s_in[i * dv + tid];
-        for (uint j = 0; j < l; j++) {
-            s += metal::precise::exp(g_last - gcs_sh[j]) * k_sh[j * dk + i]
-                * delta_sh[j * dv + tid];
+        float s = g_last_exp * s_in[i * dv + tid];
+#pragma unroll
+        for (uint j = 0; j < GDC_MAX_L; j++) {
+            if (j < l) {
+                s = fma(decay_j[j] * k_sh[j * dk + i], delta_sh[j * dv + tid], s);
+            }
         }
         s_out[i * dv + tid] = s;
     }

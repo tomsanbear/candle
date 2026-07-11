@@ -24,12 +24,19 @@ pub enum GgmlDType {
     BF16,
 }
 
+/// True when `dtype` has BF16-activation (src1) mv kernel variants, i.e. the
+/// F32 cast round-trip around the matmul can be skipped.
+pub fn quantized_matmul_mv_bf16_src1_supported(dtype: GgmlDType) -> bool {
+    matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    src1_bf16: bool,
     (b, m, n, k): (usize, usize, usize, usize),
     lhs: &Buffer,
     lhs_offset: usize,
@@ -37,6 +44,12 @@ pub fn call_quantized_matmul_mv_t(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    if src1_bf16 && !quantized_matmul_mv_bf16_src1_supported(dtype) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "bf16 src1",
+            "qmatmul_mv",
+        ));
+    }
     // Everything is in reverse
     let ne00 = k as i64;
     let ne01 = n as i64;
@@ -123,22 +136,25 @@ pub fn call_quantized_matmul_mv_t(
         height: nth1,
         depth: 1,
     };
-    let name = match dtype {
-        GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f32",
-        GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
-        GgmlDType::Q2K => "kernel_mul_mv_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mv_q3_K_f32",
-        GgmlDType::Q4K => "kernel_mul_mv_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mv_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
-        GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
-        GgmlDType::F16 => "kernel_mul_mv_f16_f32",
-        GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
-        GgmlDType::F32 => "kernel_mul_mv_f32_f32",
+    let name = match (dtype, src1_bf16) {
+        (GgmlDType::Q8_0, true) => "kernel_mul_mv_q8_0_bf16",
+        (GgmlDType::Q4K, true) => "kernel_mul_mv_q4_K_bf16",
+        (GgmlDType::Q6K, true) => "kernel_mul_mv_q6_K_bf16",
+        (GgmlDType::Q4_0, _) => "kernel_mul_mv_q4_0_f32",
+        (GgmlDType::Q4_1, _) => "kernel_mul_mv_q4_1_f32",
+        (GgmlDType::Q5_0, _) => "kernel_mul_mv_q5_0_f32",
+        (GgmlDType::Q5_1, _) => "kernel_mul_mv_q5_1_f32",
+        (GgmlDType::Q8_0, false) => "kernel_mul_mv_q8_0_f32",
+        (GgmlDType::Q8_1, _) => "kernel_mul_mv_q8_1_f32",
+        (GgmlDType::Q2K, _) => "kernel_mul_mv_q2_K_f32",
+        (GgmlDType::Q3K, _) => "kernel_mul_mv_q3_K_f32",
+        (GgmlDType::Q4K, false) => "kernel_mul_mv_q4_K_f32",
+        (GgmlDType::Q5K, _) => "kernel_mul_mv_q5_K_f32",
+        (GgmlDType::Q6K, false) => "kernel_mul_mv_q6_K_f32",
+        (GgmlDType::Q8K, _) => "kernel_mul_mv_q8_K_f32",
+        (GgmlDType::F16, _) => "kernel_mul_mv_f16_f32",
+        (GgmlDType::BF16, _) => "kernel_mul_mv_bf16_f32",
+        (GgmlDType::F32, _) => "kernel_mul_mv_f32_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -197,6 +213,7 @@ pub fn call_quantized_matmul_mv_mc(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    src1_bf16: bool,
     (b, m, n, k): (usize, usize, usize, usize),
     lhs: &Buffer,
     lhs_offset: usize,
@@ -222,10 +239,13 @@ pub fn call_quantized_matmul_mv_mc(
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
 
-    let (name, nth0, nth1, align) = match dtype {
-        GgmlDType::Q8_0 => ("kernel_mul_mv_q8_0_f32_mc", 8, 8, 8),
-        GgmlDType::Q4K => ("kernel_mul_mv_q4_K_f32_mc", 4, 8, 4),
-        GgmlDType::Q6K => ("kernel_mul_mv_q6_K_f32_mc", 2, 32, 2),
+    let (name, nth0, nth1, align) = match (dtype, src1_bf16) {
+        (GgmlDType::Q8_0, false) => ("kernel_mul_mv_q8_0_f32_mc", 8, 8, 8),
+        (GgmlDType::Q8_0, true) => ("kernel_mul_mv_q8_0_bf16_mc", 8, 8, 8),
+        (GgmlDType::Q4K, false) => ("kernel_mul_mv_q4_K_f32_mc", 4, 8, 4),
+        (GgmlDType::Q4K, true) => ("kernel_mul_mv_q4_K_bf16_mc", 4, 8, 4),
+        (GgmlDType::Q6K, false) => ("kernel_mul_mv_q6_K_f32_mc", 2, 32, 2),
+        (GgmlDType::Q6K, true) => ("kernel_mul_mv_q6_K_bf16_mc", 2, 32, 2),
         _ => unreachable!("gated by quantized_matmul_mv_mc_columns"),
     };
     let thread_groups_count = MTLSize {

@@ -142,6 +142,21 @@ fn test_matmul_mv_mc() -> Result<()> {
                     max_err <= 1e-5,
                     "max rel error {max_err} too big for {dtype:?} m={m} shape={shape:?}"
                 );
+                // BF16 activations skip the F32 cast round-trip on the mv/mc
+                // routes; only the activation rounding (~2^-8 relative)
+                // separates them from the F32 reference.
+                let lhs_bf16 = lhs_mtl.to_dtype(candle_core::DType::BF16)?;
+                let got = matmul_mtl.forward(&lhs_bf16)?.to_device(&Device::Cpu)?;
+                let got = got.flatten_all()?.to_vec1::<f32>()?;
+                let mut max_err = 0f32;
+                for (e, g) in expected.iter().zip(got.iter()) {
+                    let err = (e - g).abs() / e.abs().max(1.0);
+                    max_err = max_err.max(err);
+                }
+                assert!(
+                    max_err <= 3e-2,
+                    "bf16 src1 max rel error {max_err} too big for {dtype:?} m={m} shape={shape:?}"
+                );
             }
         }
     }

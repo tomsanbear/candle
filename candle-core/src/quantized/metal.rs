@@ -341,12 +341,26 @@ impl QMetalStorage {
         let mc_supported = src_minus2 == m
             && (2..=12).contains(&m)
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some();
+        // BF16 activations go straight into the quantized-block kernels where
+        // a variant exists, skipping the F32 cast round-trip.
+        let src1_bf16 = match storage.dtype() {
+            DType::F32 => false,
+            DType::BF16
+                if candle_metal_kernels::quantized_matmul_mv_bf16_src1_supported(
+                    self.dtype.into(),
+                ) =>
+            {
+                true
+            }
+            dt => crate::bail!("unsupported src1 dtype {dt:?} for quantized matmul metal"),
+        };
         if mc_supported {
             candle_metal_kernels::call_quantized_matmul_mv_mc(
                 device.device(),
                 &encoder,
                 device.kernels(),
                 self.dtype.into(),
+                src1_bf16,
                 (1, m, n, k),
                 storage.buffer(),
                 layout.start_offset() * storage.dtype().size_in_bytes(),
@@ -361,6 +375,7 @@ impl QMetalStorage {
                 &encoder,
                 device.kernels(),
                 self.dtype.into(),
+                src1_bf16,
                 (1, m, n, k),
                 storage.buffer(),
                 layout.start_offset() * storage.dtype().size_in_bytes(),
@@ -376,6 +391,7 @@ impl QMetalStorage {
                     &encoder,
                     device.kernels(),
                     self.dtype.into(),
+                    src1_bf16,
                     (1, 1, n, k),
                     storage.buffer(),
                     (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
@@ -431,10 +447,19 @@ impl QMetalStorage {
         if self_shape.rank() == 2
             && (src_shape.rank() == 2 || (src_shape.rank() == 3 && src_shape.dims()[0] == 1))
             && (2..=12).contains(&src_shape.dim(D::Minus2)?)
-            && storage.dtype() == DType::F32
+            && matches!(storage.dtype(), DType::F32 | DType::BF16)
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some()
         {
             return self.fwd_mv(self_shape, storage, layout);
+        }
+        // The tile mm kernel only reads F32 activations; cast here so BF16
+        // callers (which skip the cast on the mv/mc routes above) still work
+        // on the large-m path.
+        if storage.dtype() == DType::BF16 {
+            use crate::backend::BackendStorage;
+            let storage = storage.to_dtype(layout, DType::F32)?;
+            let layout = crate::Layout::contiguous(layout.shape().clone());
+            return self.fwd(self_shape, &storage, &layout);
         }
 
         let last_k = dst_shape.pop().unwrap();

@@ -11,6 +11,7 @@ pub mod quantized;
 pub mod random;
 pub mod reduce;
 pub mod sdpa;
+pub mod skinny_gemm;
 pub mod sort;
 pub mod ternary;
 pub mod unary;
@@ -29,6 +30,7 @@ pub use quantized::{
 pub use random::*;
 pub use reduce::*;
 pub use sdpa::{call_sdpa_full, call_sdpa_vector, call_sdpa_vector_2pass, SdpaDType};
+pub use skinny_gemm::call_skinny_gemm;
 pub use sort::{call_arg_sort, call_mlx_arg_sort};
 pub use ternary::call_where_cond;
 pub use unary::*;

@@ -1797,7 +1797,26 @@ impl BackendStorage for MetalStorage {
                 &buffer,
             )
             .is_ok();
-        if !gemv_done {
+        // Skinny chunks (2 <= m <= 12, the speculative-verify and small-batch
+        // shapes) stream B once at gemv-class bandwidth; the tile gemm runs
+        // them at roughly half bandwidth. Layout-validated with gemm fallback.
+        let skinny_done = !gemv_done
+            && candle_metal_kernels::call_skinny_gemm(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                dtype,
+                (b, m, n, k),
+                lhs_l.stride(),
+                lhs_l.start_offset() * self.dtype.size_in_bytes(),
+                &self.buffer,
+                rhs_l.stride(),
+                rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
+                &rhs.buffer,
+                &buffer,
+            )
+            .is_ok();
+        if !gemv_done && !skinny_done {
             candle_metal_kernels::call_mlx_gemm(
                 &self.device.device,
                 &encoder,

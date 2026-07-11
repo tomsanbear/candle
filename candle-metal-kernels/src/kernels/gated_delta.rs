@@ -109,6 +109,7 @@ pub fn call_gated_delta_decode(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     params: GatedDeltaParams,
+    batch: usize,
     proj: &Buffer,
     conv_in: &Buffer,
     state_in: &Buffer,
@@ -154,13 +155,14 @@ pub fn call_gated_delta_decode(
             params.value_dim,
             params.ksz,
             params.l2_eps,
-            params.norm_eps
+            params.norm_eps,
+            batch as u32
         )
     );
 
     encoder.dispatch_thread_groups(
         MTLSize {
-            width: params.heads as usize,
+            width: params.heads as usize * batch.max(1),
             height: 1,
             depth: 1,
         },

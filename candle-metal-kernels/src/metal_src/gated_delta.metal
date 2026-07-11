@@ -74,11 +74,23 @@ kernel void gated_delta_decode_bf16(
     constant uint  &ksz        [[buffer(16)]],
     constant float &l2_eps     [[buffer(17)]],
     constant float &norm_eps   [[buffer(18)]],
-    uint h          [[threadgroup_position_in_grid]],
+    constant uint  &batch      [[buffer(19)]],
+    uint bh         [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const GdP p = {heads, dk, dv, conv_dim, key_dim, value_dim, ksz, l2_eps, norm_eps};
+    // Batched grid: one threadgroup per (stream, head); every per-stream
+    // buffer advances by its batch stride, weights/params stay shared.
+    const uint bi = bh / heads;
+    const uint h = bh % heads;
+    device const bfloat *proj_b = proj + (ulong)bi * (conv_dim + value_dim + 2 * heads);
+    device const bfloat *conv_in_b = conv_in + (ulong)bi * conv_dim * ksz;
+    device bfloat *conv_out_b = conv_out + (ulong)bi * conv_dim * ksz;
+    device const float *state_in_b = state_in + (ulong)bi * heads * dk * dv;
+    device float *state_out_b = state_out + (ulong)bi * heads * dk * dv;
+    device bfloat *out_b = out + (ulong)bi * value_dim;
+    (void)batch;
     threadgroup float q_sh[256];
     threadgroup float k_sh[256];
     threadgroup float scratch[8];
@@ -98,20 +110,20 @@ kernel void gated_delta_decode_bf16(
         const uint ch = chans[c];
         float win[GD_MAX_KSZ];
         for (uint t = 0; t + 1 < p.ksz; t++) {
-            win[t] = float(conv_in[ch * p.ksz + t + 1]);
+            win[t] = float(conv_in_b[ch * p.ksz + t + 1]);
         }
-        win[p.ksz - 1] = float(proj[ch]);
+        win[p.ksz - 1] = float(proj_b[ch]);
         float acc = 0.0f;
         for (uint t = 0; t < p.ksz; t++) {
             acc += float(conv_w[ch * p.ksz + t]) * win[t];
-            conv_out[ch * p.ksz + t] = bfloat(win[t]);
+            conv_out_b[ch * p.ksz + t] = bfloat(win[t]);
         }
         qkv[c] = acc / (1.0f + metal::precise::exp(-acc)); // silu
     }
 
     // ---- Phase 2: per-head gate scalars (uniform across the TG).
-    const float b_in = float(proj[p.conv_dim + p.value_dim + h]);
-    const float a_in = float(proj[p.conv_dim + p.value_dim + p.heads + h]);
+    const float b_in = float(proj_b[p.conv_dim + p.value_dim + h]);
+    const float a_in = float(proj_b[p.conv_dim + p.value_dim + p.heads + h]);
     // g = -a_log_exp * softplus(a_in + dt_bias); overflow degrades to
     // decay = 0 exactly like the tensor chain.
     const float g = -a_log_exp[h]
@@ -134,8 +146,8 @@ kernel void gated_delta_decode_bf16(
 
     // ---- Phase 4: gated delta rule; thread tid owns state column tid.
     // Loads/stores are coalesced: at step i all threads touch row i.
-    device const float *s_in = state_in + (ulong)h * p.dk * p.dv;
-    device float *s_out = state_out + (ulong)h * p.dk * p.dv;
+    device const float *s_in = state_in_b + (ulong)h * p.dk * p.dv;
+    device float *s_out = state_out_b + (ulong)h * p.dk * p.dv;
     float kv_mem = 0.0f;
     for (uint i = 0; i < p.dk; i++) {
         kv_mem += k_sh[i] * s_in[i * p.dv + tid];
@@ -153,7 +165,7 @@ kernel void gated_delta_decode_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float o2 = tg_sum(o * o, scratch, tid, simd_group, simd_lane, n_simd_groups);
     const float inv_rms = metal::precise::powr(o2 / float(p.dv) + p.norm_eps, -0.5f);
-    const float z_in = float(proj[p.conv_dim + h * p.dv + tid]);
+    const float z_in = float(proj_b[p.conv_dim + h * p.dv + tid]);
     const float z_silu = z_in / (1.0f + metal::precise::exp(-z_in));
-    out[h * p.dv + tid] = bfloat(o * inv_rms * norm_w[tid] * z_silu);
+    out_b[h * p.dv + tid] = bfloat(o * inv_rms * norm_w[tid] * z_silu);
 }

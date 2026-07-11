@@ -1797,10 +1797,19 @@ impl BackendStorage for MetalStorage {
                 &buffer,
             )
             .is_ok();
-        // Skinny chunks (2 <= m <= 12, the speculative-verify and small-batch
-        // shapes) stream B once at gemv-class bandwidth; the tile gemm runs
-        // them at roughly half bandwidth. Layout-validated with gemm fallback.
+        // Experimental skinny-gemm (2 <= m <= 12), opt-in: measured SLOWER
+        // than the tile gemm on M4 Max (gamma8 23.6 vs 17.1 ms verify) even
+        // with function-constant specialization — the simdgroup-per-column
+        // layout has worse B reuse than the tile kernel. Kept behind
+        // CANDLE_SKINNY_GEMM=1 for further tuning.
+        fn skinny_gemm_enabled() -> bool {
+            static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *FLAG.get_or_init(|| {
+                std::env::var("CANDLE_SKINNY_GEMM").is_ok_and(|v| v == "1")
+            })
+        }
         let skinny_done = !gemv_done
+            && skinny_gemm_enabled()
             && candle_metal_kernels::call_skinny_gemm(
                 &self.device.device,
                 &encoder,

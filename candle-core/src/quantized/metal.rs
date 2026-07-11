@@ -421,10 +421,12 @@ impl QMetalStorage {
         // Small-m matmuls (speculative-verify chunks, small batches) are
         // weight-read-bound; the tile mm kernel under-occupies the GPU there
         // while the multi-column mv variants stream the weights near-once.
-        // The tile kernel keeps m > 8, where its occupancy recovers.
+        // The tile kernel keeps m > 12, where its occupancy recovers
+        // (measured: even ceil(m/NC) = 2..3 weight passes beat the tile
+        // kernel below that).
         if self_shape.rank() == 2
             && src_shape.rank() <= 3
-            && (2..=8).contains(&src_shape.dim(D::Minus2)?)
+            && (2..=12).contains(&src_shape.dim(D::Minus2)?)
             && storage.dtype() == DType::F32
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some()
         {

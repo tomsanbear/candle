@@ -319,22 +319,47 @@ impl QMetalStorage {
             .with_label("qmatmul")
             .build()?;
         let encoder = device.command_encoder()?;
-        // In some cases it would be better to use the mm variant, though it has its drawbacks
-        // around memory alignment.
-        for batch_id in 0..m {
+        // The quantized-block mv kernels address src1 rows by r1*ne10
+        // (element counts), so a single dispatch with ne11 = m covers every
+        // row — the old per-row loop re-dispatched (and re-read the whole
+        // weight) m times. The f16/bf16/f32 mv kernels address via nb11,
+        // which this call zeroes, so those keep the per-row loop.
+        let single_dispatch = !matches!(
+            self.dtype,
+            crate::quantized::GgmlDType::F16
+                | crate::quantized::GgmlDType::BF16
+                | crate::quantized::GgmlDType::F32
+        );
+        if single_dispatch {
             candle_metal_kernels::call_quantized_matmul_mv_t(
                 device.device(),
                 &encoder,
                 device.kernels(),
                 self.dtype.into(),
-                (1, 1, n, k),
+                (1, m, n, k),
                 storage.buffer(),
-                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
                 &self.buffer,
-                batch_id * n * DType::F32.size_in_bytes(),
+                0,
                 &dst,
             )
             .map_err(MetalError::from)?;
+        } else {
+            for batch_id in 0..m {
+                candle_metal_kernels::call_quantized_matmul_mv_t(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    self.dtype.into(),
+                    (1, 1, n, k),
+                    storage.buffer(),
+                    (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
+                    &self.buffer,
+                    batch_id * n * DType::F32.size_in_bytes(),
+                    &dst,
+                )
+                .map_err(MetalError::from)?;
+            }
         }
         let dst_storage =
             crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);

@@ -174,3 +174,173 @@ pub fn call_gated_delta_decode(
     );
     Ok(())
 }
+
+/// Buffers staged between the v2 sub-kernels; allocated by the caller so the
+/// capture tensors (kn = cap_k, cap_gcs, cap_delta) come back as ordinary
+/// tensors for the host-side rollback math.
+#[allow(clippy::too_many_arguments)]
+pub struct GatedDeltaV2Stages<'a> {
+    /// f32 [b*heads, l, dk] — l2-normed keys; doubles as the cap_k capture.
+    pub kn: &'a Buffer,
+    /// f32 [b*heads, l, dk] — l2-normed, 1/sqrt(dk)-scaled queries.
+    pub qn: &'a Buffer,
+    /// f32 [b*heads, l, dv] — conv'd + silu'd values.
+    pub vc: &'a Buffer,
+    /// f32 [b*heads, l] — per-step log decay.
+    pub g_step: &'a Buffer,
+    /// f32 [b*heads, l] — sigmoid(b) write gate.
+    pub beta: &'a Buffer,
+    /// f32 [b*heads, l] — inclusive log-decay cumsum (cap_gcs capture).
+    pub cap_gcs: &'a Buffer,
+    /// f32 [b*heads, l, dv] — WY pseudo-values (cap_delta capture).
+    pub cap_delta: &'a Buffer,
+    /// f32 [b, l, value_dim] — pre-norm outputs.
+    pub o_pre: &'a Buffer,
+}
+
+/// Fused GatedDeltaNet v2: unified decode/chunk (1 <= l <= 12) across three
+/// dispatches (prep, delta core, epilogue). State layout is TRANSPOSED vs the
+/// v1 kernels: f32 [b, heads, dv, dk]. See gated_delta_v2.metal.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gated_delta_v2(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    params: GatedDeltaParams,
+    seq_len: usize,
+    batch: usize,
+    proj: &Buffer,
+    conv_in: &Buffer,
+    state_in: &Buffer,
+    conv_w: &Buffer,
+    dt_bias: &Buffer,
+    a_log_exp: &Buffer,
+    norm_w: &Buffer,
+    out: &Buffer,
+    conv_out: &Buffer,
+    state_out: &Buffer,
+    stages: GatedDeltaV2Stages<'_>,
+) -> Result<(), MetalKernelError> {
+    if params.dk != 128 || params.dv != 128 || seq_len == 0 || seq_len > 12 {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "gated_delta_v2 requires dk == dv == 128 and 1 <= l <= 12; got dk={} dv={} l={seq_len}",
+            params.dk, params.dv
+        )));
+    }
+    let bh = params.heads as usize * batch.max(1);
+    let l = seq_len as u32;
+
+    let prep = kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_prep_bf16")?;
+    let core = kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_core")?;
+    let epilogue =
+        kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_epilogue_bf16")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+
+    encoder.set_compute_pipeline_state(&prep);
+    debug_group!(encoder, "gated_delta_v2_prep l={seq_len}");
+    set_params!(
+        encoder,
+        (
+            proj,
+            conv_in,
+            conv_w,
+            dt_bias,
+            a_log_exp,
+            Output::new(conv_out),
+            Output::new(stages.kn),
+            Output::new(stages.qn),
+            Output::new(stages.vc),
+            Output::new(stages.g_step),
+            Output::new(stages.beta),
+            Output::new(stages.cap_gcs),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.conv_dim,
+            params.key_dim,
+            params.value_dim,
+            params.ksz,
+            l,
+            params.l2_eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: bh,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dk as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    encoder.set_compute_pipeline_state(&core);
+    debug_group!(encoder, "gated_delta_v2_core l={seq_len}");
+    set_params!(
+        encoder,
+        (
+            state_in,
+            Output::new(state_out),
+            stages.kn,
+            stages.qn,
+            stages.vc,
+            stages.g_step,
+            stages.beta,
+            Output::new(stages.cap_delta),
+            Output::new(stages.o_pre),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.value_dim,
+            l
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: params.dv as usize / 4,
+            height: bh,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 4,
+            depth: 1,
+        },
+    );
+
+    encoder.set_compute_pipeline_state(&epilogue);
+    debug_group!(encoder, "gated_delta_v2_epilogue l={seq_len}");
+    set_params!(
+        encoder,
+        (
+            stages.o_pre,
+            proj,
+            norm_w,
+            Output::new(out),
+            params.heads,
+            params.dv,
+            params.conv_dim,
+            params.value_dim,
+            l,
+            params.norm_eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: bh,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dv as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}

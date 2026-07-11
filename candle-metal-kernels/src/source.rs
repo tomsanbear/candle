@@ -16,6 +16,7 @@ pub const UNARY: &str = include_str!("metal_src/unary.metal");
 pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.metal");
 pub const GATED_DELTA: &str = include_str!("metal_src/gated_delta.metal");
 pub const GATED_DELTA_CHUNK: &str = include_str!("metal_src/gated_delta_chunk.metal");
+pub const GATED_DELTA_V2: &str = include_str!("metal_src/gated_delta_v2.metal");
 pub const SKINNY_GEMM: &str = include_str!("metal_src/skinny_gemm.metal");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,5 +39,6 @@ pub enum Source {
     Sdpa,
     GatedDelta,
     GatedDeltaChunk,
+    GatedDeltaV2,
     SkinnyGemm,
 }

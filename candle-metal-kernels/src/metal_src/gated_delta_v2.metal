@@ -1,0 +1,295 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// Fused GatedDeltaNet v2 (unified decode/chunk, 1 <= l <= 12).
+//
+// v1 ran one threadgroup per value head (16 TGs on a 32-core GPU: half the
+// machine idle) with each thread walking dk=128 sequentially. v2 re-grids the
+// delta-rule core to the MLX gated_delta geometry: one simdgroup per
+// (head, value-column), dk split across the 32 lanes (4 registers each,
+// simd_sum for the dots), 512 threadgroups at heads=16, dv=128. The state is
+// stored TRANSPOSED relative to v1 — [heads, dv, dk] — so a simdgroup's
+// column loads are contiguous and the column lives in registers across the
+// whole l-loop.
+//
+// The layer splits into three dispatches (v1 fused everything into one):
+//   prep     — conv + silu + l2norm + gate scalars (cheap, head-parallel);
+//              stages normed q/k, conv'd v, per-step decay, beta; also emits
+//              the k / log-decay-cumsum rollback captures and the rolling
+//              conv window.
+//   core     — the recurrent delta rule; emits pre-norm outputs and the
+//              pseudo-value (delta) capture.
+//   epilogue — group RMSNorm + silu(z) output gating (needs the head's full
+//              dv row, which the split grid can't reduce across).
+//
+// The sequential-recurrence deltas equal the WY forward-substitution
+// pseudo-values of the v1 chunk kernel, so the captures keep their layouts
+// and the host-side closed-form rollback is unchanged.
+//
+// Layouts (contiguous):
+//   proj      bf16 [l, conv_dim + value_dim + 2*heads]  (qkv | z | b | a per position)
+//   conv_*    bf16 [conv_dim, ksz]  rolling window, oldest first
+//   state_*   f32  [heads, dv, dk]  (v2 layout — transposed vs v1)
+//   qn/kn     f32  [heads, l, dk]   (kn doubles as cap_k)
+//   vc        f32  [heads, l, dv]
+//   g_step    f32  [heads, l]       per-step log decay
+//   beta_s    f32  [heads, l]
+//   cap_gcs   f32  [heads, l]       inclusive log-decay cumsum
+//   cap_delta f32  [heads, l, dv]
+//   o_pre     f32  [l, value_dim]
+//   out       bf16 [l, value_dim]
+
+#define GD2_MAX_L 12
+#define GD2_MAX_KSZ 8
+
+static inline float tg_sum_128(float x,
+                               threadgroup float *scratch,
+                               uint tid,
+                               uint simd_group,
+                               uint simd_lane,
+                               uint n_simd_groups) {
+    float partial = simd_sum(x);
+    if (simd_lane == 0) {
+        scratch[simd_group] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint s = 0; s < n_simd_groups; s++) {
+        total += scratch[s];
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// prep: grid (heads * batch) TGs x dk threads. Thread tid owns conv channel
+// tid within each of the head's three channel blocks (q, k, v), exactly like
+// the v1 phase-1 loop, then the per-position l2 norms run as TG reductions.
+// ---------------------------------------------------------------------------
+kernel void gated_delta_v2_prep_bf16(
+    device const bfloat *proj      [[buffer(0)]],
+    device const bfloat *conv_in   [[buffer(1)]],
+    device const bfloat *conv_w    [[buffer(2)]],
+    device const float  *dt_bias   [[buffer(3)]],
+    device const float  *a_log_exp [[buffer(4)]],
+    device bfloat       *conv_out  [[buffer(5)]],
+    device float        *kn        [[buffer(6)]],  // = cap_k
+    device float        *qn        [[buffer(7)]],
+    device float        *vc        [[buffer(8)]],
+    device float        *g_step    [[buffer(9)]],
+    device float        *beta_s    [[buffer(10)]],
+    device float        *cap_gcs   [[buffer(11)]],
+    constant uint  &heads      [[buffer(12)]],
+    constant uint  &dk         [[buffer(13)]],
+    constant uint  &dv         [[buffer(14)]],
+    constant uint  &conv_dim   [[buffer(15)]],
+    constant uint  &key_dim    [[buffer(16)]],
+    constant uint  &value_dim  [[buffer(17)]],
+    constant uint  &ksz        [[buffer(18)]],
+    constant uint  &seq_len    [[buffer(19)]],
+    constant float &l2_eps     [[buffer(20)]],
+    uint bh         [[threadgroup_position_in_grid]],
+    uint tid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint bi = bh / heads;
+    const uint h = bh % heads;
+    const uint l = seq_len;
+    const uint row_stride = conv_dim + value_dim + 2 * heads;
+    device const bfloat *proj_b = proj + (ulong)bi * l * row_stride;
+    device const bfloat *conv_in_b = conv_in + (ulong)bi * conv_dim * ksz;
+    device bfloat *conv_out_b = conv_out + (ulong)bi * conv_dim * ksz;
+    const ulong hb = (ulong)(bi * heads + h);
+
+    threadgroup float q_raw[GD2_MAX_L * 128];
+    threadgroup float k_raw[GD2_MAX_L * 128];
+    threadgroup float scratch[4];
+    const uint n_simd_groups = dk / 32;
+
+    // Conv + silu for this thread's q, k and v channels across the chunk;
+    // window semantics identical to v1 (state holds the last ksz inputs).
+    const uint chans[3] = {
+        h * dk + tid,
+        key_dim + h * dk + tid,
+        2 * key_dim + h * dv + tid,
+    };
+    for (uint c = 0; c < 3; c++) {
+        const uint ch = chans[c];
+        float win[GD2_MAX_KSZ];
+        for (uint t = 0; t + 1 < ksz; t++) {
+            win[t] = float(conv_in_b[ch * ksz + t + 1]);
+        }
+        for (uint pos = 0; pos < l; pos++) {
+            win[ksz - 1] = float(proj_b[pos * row_stride + ch]);
+            float acc = 0.0f;
+            for (uint t = 0; t < ksz; t++) {
+                acc += float(conv_w[ch * ksz + t]) * win[t];
+            }
+            const float y = acc / (1.0f + metal::precise::exp(-acc));
+            if (c == 0) q_raw[pos * dk + tid] = y;
+            else if (c == 1) k_raw[pos * dk + tid] = y;
+            else vc[(hb * l + pos) * dv + tid] = y;
+            for (uint t = 0; t + 1 < ksz; t++) win[t] = win[t + 1];
+        }
+        // Final rolling window = last ksz inputs on this channel.
+        for (uint t = 0; t < ksz; t++) {
+            const int src = int(l) - int(ksz) + int(t);
+            float val;
+            if (src >= 0) {
+                val = float(proj_b[uint(src) * row_stride + ch]);
+            } else {
+                val = float(conv_in_b[ch * ksz + uint(int(ksz) + src)]);
+            }
+            conv_out_b[ch * ksz + t] = bfloat(val);
+        }
+    }
+
+    // Gate scalars + decay cumsum (thread 0; uniform per head).
+    if (tid == 0) {
+        float run = 0.0f;
+        for (uint pos = 0; pos < l; pos++) {
+            const float b_in =
+                float(proj_b[pos * row_stride + conv_dim + value_dim + h]);
+            const float a_in =
+                float(proj_b[pos * row_stride + conv_dim + value_dim + heads + h]);
+            const float g = -a_log_exp[h]
+                * metal::precise::log(1.0f + metal::precise::exp(a_in + dt_bias[h]));
+            g_step[hb * l + pos] = g;
+            run += g;
+            cap_gcs[hb * l + pos] = run;
+            beta_s[hb * l + pos] = 1.0f / (1.0f + metal::precise::exp(-b_in));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Per-position l2 norms; q additionally scaled by 1/sqrt(dk).
+    for (uint pos = 0; pos < l; pos++) {
+        const float qv = q_raw[pos * dk + tid];
+        const float kv = k_raw[pos * dk + tid];
+        const float q2 =
+            tg_sum_128(qv * qv, scratch, tid, simd_group, simd_lane, n_simd_groups);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float k2 =
+            tg_sum_128(kv * kv, scratch, tid, simd_group, simd_lane, n_simd_groups);
+        qn[(hb * l + pos) * dk + tid] = qv
+            * metal::precise::powr(q2 + l2_eps, -0.5f)
+            * metal::precise::rsqrt(float(dk));
+        kn[(hb * l + pos) * dk + tid] = kv
+            * metal::precise::powr(k2 + l2_eps, -0.5f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// core: grid (dv/4, heads * batch) TGs, TG (32, 4). One simdgroup per value
+// column; lane owns 4 contiguous dk slots of the transposed state column in
+// registers across the whole l-loop.
+// ---------------------------------------------------------------------------
+kernel void gated_delta_v2_core(
+    device const float *state_in  [[buffer(0)]],
+    device float       *state_out [[buffer(1)]],
+    device const float *kn        [[buffer(2)]],
+    device const float *qn        [[buffer(3)]],
+    device const float *vc        [[buffer(4)]],
+    device const float *g_step    [[buffer(5)]],
+    device const float *beta_s    [[buffer(6)]],
+    device float       *cap_delta [[buffer(7)]],
+    device float       *o_pre     [[buffer(8)]],
+    constant uint &heads     [[buffer(9)]],
+    constant uint &dk        [[buffer(10)]],
+    constant uint &dv        [[buffer(11)]],
+    constant uint &value_dim [[buffer(12)]],
+    constant uint &seq_len   [[buffer(13)]],
+    uint2 tg        [[threadgroup_position_in_grid]],
+    uint2 tp        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]]) {
+    const uint bh = tg.y;           // batch * heads index
+    const uint h = bh % heads;
+    const uint col = tg.x * 4 + tp.y;
+    const uint lane = tp.x;
+    const uint l = seq_len;
+    const uint n_per_lane = dk / 32; // 4 at dk=128
+
+    device const float *s_in = state_in + ((ulong)bh * dv + col) * dk;
+    device float *s_out = state_out + ((ulong)bh * dv + col) * dk;
+
+    float state[4];
+    for (uint i = 0; i < n_per_lane; i++) {
+        state[i] = s_in[lane * n_per_lane + i];
+    }
+
+    const ulong hb = (ulong)bh;
+    for (uint t = 0; t < l; t++) {
+        const float decay = metal::precise::exp(g_step[hb * l + t]);
+        device const float *k_t = kn + (hb * l + t) * dk + lane * n_per_lane;
+        device const float *q_t = qn + (hb * l + t) * dk + lane * n_per_lane;
+        float kv_mem = 0.0f;
+        for (uint i = 0; i < n_per_lane; i++) {
+            state[i] *= decay;
+            kv_mem = fma(state[i], k_t[i], kv_mem);
+        }
+        kv_mem = simd_sum(kv_mem);
+
+        const float delta =
+            (vc[(hb * l + t) * dv + col] - kv_mem) * beta_s[hb * l + t];
+
+        float o = 0.0f;
+        for (uint i = 0; i < n_per_lane; i++) {
+            state[i] = fma(k_t[i], delta, state[i]);
+            o = fma(state[i], q_t[i], o);
+        }
+        o = simd_sum(o);
+        if (simd_lane == 0) {
+            cap_delta[(hb * l + t) * dv + col] = delta;
+            // o_pre is [b, l, value_dim].
+            o_pre[((ulong)(bh / heads) * l + t) * value_dim + h * dv + col] = o;
+        }
+    }
+
+    for (uint i = 0; i < n_per_lane; i++) {
+        s_out[lane * n_per_lane + i] = state[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// epilogue: grid (heads * batch) TGs x dv threads. Group RMSNorm over the
+// head's output row + silu(z) gating, per position.
+// ---------------------------------------------------------------------------
+kernel void gated_delta_v2_epilogue_bf16(
+    device const float  *o_pre  [[buffer(0)]],
+    device const bfloat *proj   [[buffer(1)]],
+    device const float  *norm_w [[buffer(2)]],
+    device bfloat       *out    [[buffer(3)]],
+    constant uint  &heads     [[buffer(4)]],
+    constant uint  &dv        [[buffer(5)]],
+    constant uint  &conv_dim  [[buffer(6)]],
+    constant uint  &value_dim [[buffer(7)]],
+    constant uint  &seq_len   [[buffer(8)]],
+    constant float &norm_eps  [[buffer(9)]],
+    uint bh         [[threadgroup_position_in_grid]],
+    uint tid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint bi = bh / heads;
+    const uint h = bh % heads;
+    const uint l = seq_len;
+    const uint row_stride = conv_dim + value_dim + 2 * heads;
+    device const float *o_pre_b = o_pre + (ulong)bi * l * value_dim;
+    device const bfloat *proj_b = proj + (ulong)bi * l * row_stride;
+    device bfloat *out_b = out + (ulong)bi * l * value_dim;
+
+    threadgroup float scratch[4];
+    const uint n_simd_groups = dv / 32;
+
+    for (uint t = 0; t < l; t++) {
+        const float o = o_pre_b[(ulong)t * value_dim + h * dv + tid];
+        const float o2 =
+            tg_sum_128(o * o, scratch, tid, simd_group, simd_lane, n_simd_groups);
+        const float inv_rms =
+            metal::precise::powr(o2 / float(dv) + norm_eps, -0.5f);
+        const float z_in = float(proj_b[t * row_stride + conv_dim + h * dv + tid]);
+        const float z_silu = z_in / (1.0f + metal::precise::exp(-z_in));
+        out_b[(ulong)t * value_dim + h * dv + tid] =
+            bfloat(o * inv_rms * norm_w[tid] * z_silu);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

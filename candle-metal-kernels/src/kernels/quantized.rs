@@ -176,6 +176,104 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+/// Column count handled per threadgroup by the multi-column mv kernels, or
+/// None when the dtype has no `_mc` variant. Must match the NC_MV_* defines in
+/// quantized.metal.
+pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
+    match dtype {
+        GgmlDType::Q8_0 => Some(8),
+        GgmlDType::Q4K => Some(4),
+        GgmlDType::Q6K => Some(8),
+        _ => None,
+    }
+}
+
+/// Weight-shared small-m quantized matmul: one dispatch covering all m src1
+/// rows, reading the quantized weights ceil(m / NC) times instead of m times.
+/// See the multi-column section of quantized.metal.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_mc(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let nc = quantized_matmul_mv_mc_columns(dtype).ok_or_else(|| {
+        MetalKernelError::UnsupportedDTypeForOp("no mc variant", "qmatmul_mv_mc")
+    })?;
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+
+    let (name, nth0, nth1, align) = match dtype {
+        GgmlDType::Q8_0 => ("kernel_mul_mv_q8_0_f32_mc", 8, 8, 8),
+        GgmlDType::Q4K => ("kernel_mul_mv_q4_K_f32_mc", 4, 8, 4),
+        GgmlDType::Q6K => ("kernel_mul_mv_q6_K_f32_mc", 2, 32, 2),
+        _ => unreachable!("gated by quantized_matmul_mv_mc_columns"),
+    };
+    let thread_groups_count = MTLSize {
+        width: divide(ne01 as usize, align),
+        height: divide(m, nc),
+        depth: (ne12 * ne13) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_mc {name} B={b} M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            ne12,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// - src0 is usually weight
 /// - src1 is usually xs
 #[allow(clippy::too_many_arguments)]

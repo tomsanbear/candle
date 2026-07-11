@@ -89,6 +89,64 @@ fn test_matmul_mm() -> Result<()> {
     Ok(())
 }
 
+/// The multi-column mv kernels (small-m weight-shared matmul) against the CPU
+/// reference on identical quantized weights. Rank-2 inputs at m = 2..=8 route
+/// through the fwd() small-m branch; rank-3 [m, 1, k] inputs route through
+/// fwd_mv for every m, covering the multi-column tails (m not a multiple of
+/// the kernel's NC).
+#[cfg(feature = "metal")]
+#[test]
+fn test_matmul_mv_mc() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let (k, n) = (512, 300);
+    for dtype in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q6K] {
+        let rhs = (0..(k * n))
+            .map(|v| ((v * 7919) % 97) as f32 / 97.0 - 0.5)
+            .collect::<Vec<_>>();
+        let rhs_mtl = Tensor::from_slice(&rhs, (n, k), &device)?;
+        let qtensor_mtl = quantized::QTensor::quantize(&rhs_mtl, dtype)?;
+        let matmul_mtl = quantized::QMatMul::from_qtensor(qtensor_mtl)?;
+        for m in [2usize, 3, 4, 5, 7, 8, 9, 11, 16, 32] {
+            let lhs = (0..(m * k))
+                .map(|v| ((v * 104729) % 89) as f32 / 89.0 - 0.5)
+                .collect::<Vec<_>>();
+            // Reference: the single-row mv kernel applied per row. The mc
+            // kernels keep the same per-thread decomposition and accumulation
+            // order, so batching must not change the numerics.
+            let mut expected = Vec::with_capacity(m * n);
+            for row in lhs.chunks(k) {
+                let row = Tensor::from_slice(row, (1, k), &device)?;
+                let out = matmul_mtl.forward(&row)?.to_device(&Device::Cpu)?;
+                expected.extend(out.flatten_all()?.to_vec1::<f32>()?);
+            }
+            // Rank-2 inputs above m = 8 route to the tile mm kernel, whose
+            // half-precision dequant is out of scope here; the rank-3 shape
+            // routes through fwd_mv (and so the mc kernels) for every m.
+            let shapes: &[Vec<usize>] = if m <= 8 {
+                &[vec![m, k], vec![m, 1, k]]
+            } else {
+                &[vec![m, 1, k]]
+            };
+            for shape in shapes.iter().cloned() {
+                let lhs_mtl = Tensor::from_slice(&lhs, shape.clone(), &device)?;
+                let got = matmul_mtl.forward(&lhs_mtl)?.to_device(&Device::Cpu)?;
+                let got = got.flatten_all()?.to_vec1::<f32>()?;
+                assert_eq!(expected.len(), got.len());
+                let mut max_err = 0f32;
+                for (e, g) in expected.iter().zip(got.iter()) {
+                    let err = (e - g).abs() / e.abs().max(1.0);
+                    max_err = max_err.max(err);
+                }
+                assert!(
+                    max_err <= 1e-5,
+                    "max rel error {max_err} too big for {dtype:?} m={m} shape={shape:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn quantized_matmul(device: &Device) -> Result<()> {
     let (m, k, n) = (3, 64, 4);
     let lhs_s = (0..(m * k)).map(|v| v as f32).collect::<Vec<_>>();

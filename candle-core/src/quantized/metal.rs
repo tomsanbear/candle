@@ -330,7 +330,28 @@ impl QMetalStorage {
                 | crate::quantized::GgmlDType::BF16
                 | crate::quantized::GgmlDType::F32
         );
-        if single_dispatch {
+        // Multi-column variants additionally share each weight read across up
+        // to NC src1 rows, so the weight streams from DRAM ceil(m / NC) times
+        // instead of m times — the difference between a verify chunk or an
+        // N-stream decode step costing ~m single-token forwards and costing
+        // ~1.
+        let mc_supported = m > 1
+            && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some();
+        if mc_supported {
+            candle_metal_kernels::call_quantized_matmul_mv_mc(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                (1, m, n, k),
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                &self.buffer,
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else if single_dispatch {
             candle_metal_kernels::call_quantized_matmul_mv_t(
                 device.device(),
                 &encoder,
@@ -395,6 +416,18 @@ impl QMetalStorage {
         }
 
         if src_shape.dim(D::Minus2)? == 1 {
+            return self.fwd_mv(self_shape, storage, layout);
+        }
+        // Small-m matmuls (speculative-verify chunks, small batches) are
+        // weight-read-bound; the tile mm kernel under-occupies the GPU there
+        // while the multi-column mv variants stream the weights near-once.
+        // The tile kernel keeps m > 8, where its occupancy recovers.
+        if self_shape.rank() == 2
+            && src_shape.rank() <= 3
+            && (2..=8).contains(&src_shape.dim(D::Minus2)?)
+            && storage.dtype() == DType::F32
+            && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some()
+        {
             return self.fwd_mv(self_shape, storage, layout);
         }
 

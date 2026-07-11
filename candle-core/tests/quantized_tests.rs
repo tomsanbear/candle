@@ -119,11 +119,12 @@ fn test_matmul_mv_mc() -> Result<()> {
                 let out = matmul_mtl.forward(&row)?.to_device(&Device::Cpu)?;
                 expected.extend(out.flatten_all()?.to_vec1::<f32>()?);
             }
-            // Rank-2 inputs above m = 12 route to the tile mm kernel, whose
-            // half-precision dequant is out of scope here; the rank-3 shape
-            // routes through fwd_mv (and so the mc kernels) for every m.
+            // [m, k] and [1, m, k] take the mc kernels up to m = 12 (above
+            // that, the tile mm kernel with its half-precision dequant, out
+            // of scope here); [m, 1, k] is batch-shaped and stays on the
+            // per-row mv grid at every m.
             let shapes: &[Vec<usize>] = if m <= 12 {
-                &[vec![m, k], vec![m, 1, k]]
+                &[vec![m, k], vec![1, m, k], vec![m, 1, k]]
             } else {
                 &[vec![m, 1, k]]
             };

@@ -330,12 +330,16 @@ impl QMetalStorage {
                 | crate::quantized::GgmlDType::BF16
                 | crate::quantized::GgmlDType::F32
         );
-        // Multi-column variants additionally share each weight read across up
-        // to NC src1 rows, so the weight streams from DRAM ceil(m / NC) times
-        // instead of m times — the difference between a verify chunk or an
-        // N-stream decode step costing ~m single-token forwards and costing
-        // ~1.
-        let mc_supported = m > 1
+        // Multi-column variants share each weight read across up to NC src1
+        // rows. They only pay off for sequence-shaped inputs ([1, l, k],
+        // l = 2..=12 — speculative-verify chunks), where the alternative was
+        // the under-occupied tile mm kernel. For batch-shaped inputs
+        // ([N, 1, k], N-stream decode) the per-row mv grid's concurrent
+        // readers keep each (cache-sized) weight matrix resident, so mc's
+        // extra per-thread arithmetic is a measured net loss there.
+        let src_minus2 = layout.shape().dims()[layout.shape().rank() - 2];
+        let mc_supported = src_minus2 == m
+            && (2..=12).contains(&m)
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some();
         if mc_supported {
             candle_metal_kernels::call_quantized_matmul_mv_mc(
@@ -425,7 +429,7 @@ impl QMetalStorage {
         // (measured: even ceil(m/NC) = 2..3 weight passes beat the tile
         // kernel below that).
         if self_shape.rank() == 2
-            && src_shape.rank() <= 3
+            && (src_shape.rank() == 2 || (src_shape.rank() == 3 && src_shape.dims()[0] == 1))
             && (2..=12).contains(&src_shape.dim(D::Minus2)?)
             && storage.dtype() == DType::F32
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some()

@@ -18,6 +18,11 @@ using namespace metal;
 #define SK_K_TILE 512
 #define SK_SG_PER_TG 8
 
+// m as a function constant: the accumulator loop must fully unroll so the
+// per-lane accumulators live in registers — a runtime-indexed array spills
+// to thread memory and runs slower than the tile gemm it replaces.
+constant ushort M_FC [[function_constant(0)]];
+
 kernel void skinny_gemm_nt_bf16(
     device const bfloat *a [[buffer(0)]],   // [M, K] row-major
     device const bfloat *b [[buffer(1)]],   // [N, K] row-major
@@ -35,6 +40,7 @@ kernel void skinny_gemm_nt_bf16(
     const bool active = n_i < n_dim;
 
     float acc[SK_MAX_M];
+#pragma unroll
     for (uint j = 0; j < SK_MAX_M; j++) {
         acc[j] = 0.0f;
     }
@@ -43,7 +49,7 @@ kernel void skinny_gemm_nt_bf16(
     for (uint kt = 0; kt < k_dim; kt += SK_K_TILE) {
         const uint tile = min((uint)SK_K_TILE, k_dim - kt);
         // Cooperative A-tile load (all threads, barrier-synchronized).
-        for (uint idx = tid; idx < m_dim * tile; idx += n_threads) {
+        for (uint idx = tid; idx < M_FC * tile; idx += n_threads) {
             const uint row = idx / tile;
             const uint col = idx % tile;
             a_sh[row * SK_K_TILE + col] = float(a[row * k_dim + kt + col]);
@@ -54,8 +60,11 @@ kernel void skinny_gemm_nt_bf16(
             device const bfloat *b_row = b + (ulong)n_i * k_dim + kt;
             for (uint kk = simd_lane; kk < tile; kk += 32) {
                 const float bv = float(b_row[kk]);
-                for (uint j = 0; j < m_dim; j++) {
-                    acc[j] = fma(bv, a_sh[j * SK_K_TILE + kk], acc[j]);
+#pragma unroll
+                for (uint j = 0; j < SK_MAX_M; j++) {
+                    if (j < M_FC) {
+                        acc[j] = fma(bv, a_sh[j * SK_K_TILE + kk], acc[j]);
+                    }
                 }
             }
         }
@@ -63,10 +72,13 @@ kernel void skinny_gemm_nt_bf16(
     }
 
     if (active) {
-        for (uint j = 0; j < m_dim; j++) {
-            const float total = simd_sum(acc[j]);
-            if (simd_lane == 0) {
-                c[(ulong)j * n_dim + n_i] = bfloat(total);
+#pragma unroll
+        for (uint j = 0; j < SK_MAX_M; j++) {
+            if (j < M_FC) {
+                const float total = simd_sum(acc[j]);
+                if (simd_lane == 0) {
+                    c[(ulong)j * n_dim + n_i] = bfloat(total);
+                }
             }
         }
     }

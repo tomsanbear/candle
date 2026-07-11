@@ -1,7 +1,8 @@
+use crate::metal::Value;
 use crate::utils::EncoderProvider;
 use crate::{
-    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, GemmDType, Kernels,
-    MetalKernelError, Output, Source,
+    debug_group, set_params, Buffer, ComputeCommandEncoder, ConstantValues, Device, GemmDType,
+    Kernels, MetalKernelError, Output, Source,
 };
 use objc2_metal::MTLSize;
 
@@ -49,7 +50,16 @@ pub fn call_skinny_gemm(
         });
     }
 
-    let pipeline = kernels.load_pipeline(device, Source::SkinnyGemm, "skinny_gemm_nt_bf16")?;
+    // m is a function constant so the accumulator loop unrolls into
+    // registers; the pipeline cache keys on (name, constants), so at most
+    // SK_MAX_M-1 specializations compile per process.
+    let constants = Some(ConstantValues::new(vec![(0, Value::U16(m as u16))]));
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::SkinnyGemm,
+        "skinny_gemm_nt_bf16".to_string(),
+        constants,
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

@@ -441,12 +441,17 @@ impl QMetalStorage {
         // Small-m matmuls (speculative-verify chunks, small batches) are
         // weight-read-bound; the tile mm kernel under-occupies the GPU there
         // while the multi-column mv variants stream the weights near-once.
-        // The tile kernel keeps m > 12, where its occupancy recovers
-        // (measured: even ceil(m/NC) = 2..3 weight passes beat the tile
-        // kernel below that).
+        // Crossover measured 2026-07-12 (dispatch-level qmv/qmm bench,
+        // 248094x1024): the tile kernel is FLAT in m (~2.4-2.5 ms q4_K,
+        // weights read once, tile waste free) while mc costs one weight
+        // pass per NC columns — q4_K mc wins at m<=7 (1.66-2.6 ms), loses
+        // from m=8 (2.6+ vs 2.4); q8_0 mc's single pass at m=8 (3.0 ms)
+        // already loses to the tile (2.4). Raising NC to 8 was measured
+        // worse everywhere (register pressure). So: mc for 2..=7, tile
+        // kernel from 8 up.
         if self_shape.rank() == 2
             && (src_shape.rank() == 2 || (src_shape.rank() == 3 && src_shape.dims()[0] == 1))
-            && (2..=12).contains(&src_shape.dim(D::Minus2)?)
+            && (2..=7).contains(&src_shape.dim(D::Minus2)?)
             && matches!(storage.dtype(), DType::F32 | DType::BF16)
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some()
         {

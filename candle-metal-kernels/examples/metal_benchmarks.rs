@@ -246,10 +246,95 @@ fn run_qmv(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result
     Ok(())
 }
 
+/// Same measurement, but through the simdgroup mm kernel (f32 activations —
+/// the mm template has no bf16-src1 variant). Answers whether the existing
+/// 64x32-tile matrix kernel already beats the mc path at verify-chunk widths
+/// by amortizing dequant across the full tile.
+fn run_qmm(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result<()> {
+    const WARMUP_ITERS: usize = 3;
+    const MIN_DUR: f64 = 1.5;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+
+    let (weights, weight_bytes) = q_weight_bytes(dtype, n, k);
+    let row_bytes = weight_bytes / n;
+    let rhs = device
+        .new_buffer_with_data(
+            weights.as_ptr() as *const core::ffi::c_void,
+            weights.len(),
+            options,
+        )
+        .unwrap();
+    let acts: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) / 97.0).collect();
+    let lhs = device
+        .new_buffer_with_data(
+            acts.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts.as_slice()),
+            options,
+        )
+        .unwrap();
+    let dst = device
+        .new_buffer(m * n * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    let src0_shape = [1usize, 1, n, k];
+    let src0_stride = [weight_bytes, weight_bytes, row_bytes, 0];
+    let src1_shape = [1usize, 1, m, k];
+    let src1_stride = [4 * k * m, 4 * k * m, 4 * k, 4];
+    let dst_shape = [1usize, 1, m, n];
+
+    let inner = (50_000_000 / weight_bytes).clamp(4, 512);
+    let mut sum_dt = 0f64;
+    let mut iters = 0usize;
+    for idx in 0.. {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        let start_time = std::time::Instant::now();
+        for _ in 0..inner {
+            candle_metal_kernels::call_quantized_matmul_mm_t(
+                &device,
+                &encoder,
+                &kernels,
+                dtype,
+                &src0_shape,
+                &src0_stride,
+                &rhs,
+                &src1_shape,
+                &src1_stride,
+                &lhs,
+                0,
+                &dst_shape,
+                0,
+                &dst,
+            )?;
+        }
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let dt = start_time.elapsed().as_secs_f64();
+        if idx < WARMUP_ITERS {
+            continue;
+        }
+        sum_dt += dt;
+        iters += inner;
+        if sum_dt > MIN_DUR {
+            break;
+        }
+    }
+    let ms = 1e3 * sum_dt / iters as f64;
+    let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
+    println!("{dtype:?} {name:>10} n={n:6} k={k:5} m={m} [mm]  {ms:8.3} ms  {gbs:6.1} GB/s");
+    Ok(())
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
     Qmv,
+    Qmm,
 }
 
 #[derive(Parser, Debug)]
@@ -277,6 +362,14 @@ fn main() -> Result<()> {
                     for m in [1usize, 4] {
                         run_qmv(dtype, name, n, k, m)?;
                     }
+                }
+            }
+        }
+        Task::Qmm => {
+            for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0] {
+                for m in [4usize, 8, 12] {
+                    run_qmv(dtype, "lm_head", 248094, 1024, m)?;
+                    run_qmm(dtype, "lm_head", 248094, 1024, m)?;
                 }
             }
         }

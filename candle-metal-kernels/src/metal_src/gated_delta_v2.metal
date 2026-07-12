@@ -251,6 +251,151 @@ kernel void gated_delta_v2_core(
 }
 
 // ---------------------------------------------------------------------------
+// decode: fused prep+core for the single-token step (l = 1). The v1 decode
+// kernel runs `heads` threadgroups and a threadgroup cannot span GPU cores,
+// so it caps at 16 of ~40 cores regardless of thread count; the per-head
+// RMSNorm is what pins that geometry. Splitting the norm off instead lets
+// the state stream run at the core grid's full occupancy: grid
+// (dv/4, batch*heads) TGs of (32, 4), one simdgroup per value column, lane
+// owns 4 contiguous dk slots of the transposed state column in registers.
+// All reductions are simd-scope (per-lane partials + simd_sum) — no
+// threadgroup barriers, no staged kn/qn/vc round-trip; conv and gate
+// scalars are recomputed redundantly per lane (a handful of MACs). Pairs
+// with gated_delta_v2_epilogue_bf16 at l = 1 for the norm + z gate.
+// ---------------------------------------------------------------------------
+kernel void gated_delta_v2_decode_bf16(
+    device const bfloat *proj      [[buffer(0)]],
+    device const bfloat *conv_in   [[buffer(1)]],
+    device const float  *state_in  [[buffer(2)]],
+    device const bfloat *conv_w    [[buffer(3)]],
+    device const float  *dt_bias   [[buffer(4)]],
+    device const float  *a_log_exp [[buffer(5)]],
+    device bfloat       *conv_out  [[buffer(6)]],
+    device float        *state_out [[buffer(7)]],
+    device float        *o_pre     [[buffer(8)]],
+    constant uint  &heads      [[buffer(9)]],
+    constant uint  &dk         [[buffer(10)]],
+    constant uint  &dv         [[buffer(11)]],
+    constant uint  &conv_dim   [[buffer(12)]],
+    constant uint  &key_dim    [[buffer(13)]],
+    constant uint  &value_dim  [[buffer(14)]],
+    constant uint  &ksz        [[buffer(15)]],
+    constant float &l2_eps     [[buffer(16)]],
+    uint2 tg        [[threadgroup_position_in_grid]],
+    uint2 tp        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]]) {
+    const uint bh = tg.y;
+    const uint bi = bh / heads;
+    const uint h = bh % heads;
+    const uint col = tg.x * 4 + tp.y;
+    const uint lane = tp.x;
+    const uint n_per_lane = dk / 32; // 4 at dk=128
+
+    device const bfloat *proj_b = proj + (ulong)bi * (conv_dim + value_dim + 2 * heads);
+    device const bfloat *conv_in_b = conv_in + (ulong)bi * conv_dim * ksz;
+    device bfloat *conv_out_b = conv_out + (ulong)bi * conv_dim * ksz;
+
+    // Conv + silu for this lane's q/k channel slots. Window = last ksz
+    // inputs: retained conv_in tail + the new token's raw input.
+    float qc[4];
+    float kc[4];
+    for (uint i = 0; i < n_per_lane; i++) {
+        const uint slot = lane * n_per_lane + i;
+        const uint chq = h * dk + slot;
+        const uint chk = key_dim + h * dk + slot;
+        float accq = 0.0f;
+        float acck = 0.0f;
+        for (uint t = 0; t + 1 < ksz; t++) {
+            accq += float(conv_w[chq * ksz + t]) * float(conv_in_b[chq * ksz + t + 1]);
+            acck += float(conv_w[chk * ksz + t]) * float(conv_in_b[chk * ksz + t + 1]);
+        }
+        accq += float(conv_w[chq * ksz + ksz - 1]) * float(proj_b[chq]);
+        acck += float(conv_w[chk * ksz + ksz - 1]) * float(proj_b[chk]);
+        qc[i] = accq / (1.0f + metal::precise::exp(-accq));
+        kc[i] = acck / (1.0f + metal::precise::exp(-acck));
+    }
+    // This simdgroup's value column channel (redundant per lane).
+    const uint chv = 2 * key_dim + h * dv + col;
+    float accv = 0.0f;
+    for (uint t = 0; t + 1 < ksz; t++) {
+        accv += float(conv_w[chv * ksz + t]) * float(conv_in_b[chv * ksz + t + 1]);
+    }
+    accv += float(conv_w[chv * ksz + ksz - 1]) * float(proj_b[chv]);
+    const float v_c = accv / (1.0f + metal::precise::exp(-accv));
+
+    // Gate scalars (redundant per lane; identical inputs).
+    const float b_in = float(proj_b[conv_dim + value_dim + h]);
+    const float a_in = float(proj_b[conv_dim + value_dim + heads + h]);
+    const float g = -a_log_exp[h]
+        * metal::precise::log(1.0f + metal::precise::exp(a_in + dt_bias[h]));
+    const float decay = metal::precise::exp(g);
+    const float beta = 1.0f / (1.0f + metal::precise::exp(-b_in));
+
+    // l2 norms over dk via simd_sum of per-lane partials.
+    float q2p = 0.0f;
+    float k2p = 0.0f;
+    for (uint i = 0; i < n_per_lane; i++) {
+        q2p = fma(qc[i], qc[i], q2p);
+        k2p = fma(kc[i], kc[i], k2p);
+    }
+    const float q2 = simd_sum(q2p);
+    const float k2 = simd_sum(k2p);
+    const float qs = metal::precise::powr(q2 + l2_eps, -0.5f)
+        * metal::precise::rsqrt(float(dk));
+    const float ks = metal::precise::powr(k2 + l2_eps, -0.5f);
+    for (uint i = 0; i < n_per_lane; i++) {
+        qc[i] *= qs;
+        kc[i] *= ks;
+    }
+
+    // Delta rule on this column; state slots live in registers.
+    device const float *s_in = state_in + ((ulong)bh * dv + col) * dk;
+    device float *s_out = state_out + ((ulong)bh * dv + col) * dk;
+    float state[4];
+    float kvp = 0.0f;
+    for (uint i = 0; i < n_per_lane; i++) {
+        state[i] = s_in[lane * n_per_lane + i] * decay;
+        kvp = fma(state[i], kc[i], kvp);
+    }
+    const float kv_mem = simd_sum(kvp);
+    const float delta = (v_c - kv_mem) * beta;
+    float op = 0.0f;
+    for (uint i = 0; i < n_per_lane; i++) {
+        state[i] = fma(kc[i], delta, state[i]);
+        op = fma(state[i], qc[i], op);
+        s_out[lane * n_per_lane + i] = state[i];
+    }
+    const float o = simd_sum(op);
+    if (simd_lane == 0) {
+        o_pre[(ulong)bi * value_dim + h * dv + col] = o;
+    }
+
+    // Rolling conv window write-back, single writer per channel: the
+    // (tg.x == 0, tp.y == 0) simdgroup covers this head's q/k channels
+    // (lane-owned slots); each column's simdgroup lane 0 covers its v
+    // channel.
+    if (tg.x == 0 && tp.y == 0) {
+        for (uint i = 0; i < n_per_lane; i++) {
+            const uint slot = lane * n_per_lane + i;
+            const uint chans2[2] = {h * dk + slot, key_dim + h * dk + slot};
+            for (uint c = 0; c < 2; c++) {
+                const uint ch = chans2[c];
+                for (uint t = 0; t + 1 < ksz; t++) {
+                    conv_out_b[ch * ksz + t] = conv_in_b[ch * ksz + t + 1];
+                }
+                conv_out_b[ch * ksz + ksz - 1] = proj_b[ch];
+            }
+        }
+    }
+    if (simd_lane == 0) {
+        for (uint t = 0; t + 1 < ksz; t++) {
+            conv_out_b[chv * ksz + t] = conv_in_b[chv * ksz + t + 1];
+        }
+        conv_out_b[chv * ksz + ksz - 1] = proj_b[chv];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // prep_tree: tree-verify variant of prep. The flattened chunk is
 // [anchor, a_1..a_w | b_1..b_w]: main segment rows [0, seg1), alternate
 // segment rows [seg1, seg1+alt_len), branching after row branch_after-1 of

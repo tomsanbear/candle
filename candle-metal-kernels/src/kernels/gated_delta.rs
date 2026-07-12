@@ -345,6 +345,115 @@ pub fn call_gated_delta_v2(
     Ok(())
 }
 
+/// Fused GatedDeltaNet v2 single-token decode: fused prep+core at l = 1
+/// (grid (dv/4, batch*heads) — full-occupancy state streaming, simd-scope
+/// reductions only) followed by the epilogue kernel for the per-head
+/// RMSNorm + silu(z) gate. Two dispatches on one encoder. State layout is
+/// TRANSPOSED (f32 [b, heads, dv, dk]) like the other v2 kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gated_delta_v2_decode(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    params: GatedDeltaParams,
+    batch: usize,
+    proj: &Buffer,
+    conv_in: &Buffer,
+    state_in: &Buffer,
+    conv_w: &Buffer,
+    dt_bias: &Buffer,
+    a_log_exp: &Buffer,
+    norm_w: &Buffer,
+    out: &Buffer,
+    conv_out: &Buffer,
+    state_out: &Buffer,
+    o_pre: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if params.dk != 128 || params.dv != 128 {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "gated_delta_v2_decode requires dk == dv == 128; got dk={} dv={}",
+            params.dk, params.dv
+        )));
+    }
+    let bh = params.heads as usize * batch.max(1);
+
+    let core =
+        kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_decode_bf16")?;
+    let epilogue =
+        kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_epilogue_bf16")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+
+    encoder.set_compute_pipeline_state(&core);
+    debug_group!(encoder, "gated_delta_v2_decode heads={}", params.heads);
+    set_params!(
+        encoder,
+        (
+            proj,
+            conv_in,
+            state_in,
+            conv_w,
+            dt_bias,
+            a_log_exp,
+            Output::new(conv_out),
+            Output::new(state_out),
+            Output::new(o_pre),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.conv_dim,
+            params.key_dim,
+            params.value_dim,
+            params.ksz,
+            params.l2_eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: params.dv as usize / 4,
+            height: bh,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 4,
+            depth: 1,
+        },
+    );
+
+    encoder.set_compute_pipeline_state(&epilogue);
+    debug_group!(encoder, "gated_delta_v2_decode_epilogue");
+    set_params!(
+        encoder,
+        (
+            o_pre,
+            proj,
+            norm_w,
+            Output::new(out),
+            params.heads,
+            params.dv,
+            params.conv_dim,
+            params.value_dim,
+            1u32,
+            params.norm_eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: bh,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dv as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Fused GatedDeltaNet v2 tree-verify step: main segment [anchor, a_1..a_w]
 /// (rows [0, seg1)) and alternate segment [b_1..b_w] (rows [seg1, seg1+alt))
 /// in ONE prep/core/epilogue pass. The alternate restarts inside the core

@@ -330,6 +330,112 @@ fn run_qmm(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result
     Ok(())
 }
 
+/// Barrier-semantics decision experiment: N independent GEMV chains, each a
+/// strict same-buffer dependency chain, dispatched (a) sequentially chain
+/// after chain, (b) interleaved A1 B1 A2 B2... In (b) the encoder's
+/// auto-barrier fires on every same-chain hazard; with GLOBAL barriers those
+/// drains also stall the other chain and (b) ≈ (a). If the interleave runs
+/// materially faster than sequential, independent work flows past barriers
+/// and scoped-barrier work in the backend is worth building.
+fn run_barrier_probe(n: usize, k: usize, depth: usize, chains: usize) -> Result<()> {
+    const WARMUP: usize = 3;
+    const MIN_DUR: f64 = 1.0;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+
+    let (weights, weight_bytes) = q_weight_bytes(GgmlDType::Q4K, n, k);
+    let rhs = device
+        .new_buffer_with_data(
+            weights.as_ptr() as *const core::ffi::c_void,
+            weights.len(),
+            options,
+        )
+        .unwrap();
+    // Each chain re-dispatches onto its own dst: the WAW hazard on dst makes
+    // the chain strictly serial through the encoder's auto-barrier, while
+    // different chains share nothing (rhs is read-only).
+    let mut lhs = Vec::new();
+    let mut dst = Vec::new();
+    for _ in 0..chains {
+        let acts: Vec<bf16> = (0..k)
+            .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 977.0))
+            .collect();
+        lhs.push(
+            device
+                .new_buffer_with_data(
+                    acts.as_ptr() as *const core::ffi::c_void,
+                    std::mem::size_of_val(acts.as_slice()),
+                    options,
+                )
+                .unwrap(),
+        );
+        dst.push(device.new_buffer(n * 4, options).unwrap());
+    }
+
+    let mut measure = |interleave: bool| -> Result<f64> {
+        let mut sum_dt = 0f64;
+        let mut iters = 0usize;
+        for idx in 0.. {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            let start = std::time::Instant::now();
+            let gemv = |c: usize| {
+                candle_metal_kernels::call_quantized_matmul_mv_t(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    GgmlDType::Q4K,
+                    true,
+                    (1, 1, n, k),
+                    &lhs[c],
+                    0,
+                    &rhs,
+                    0,
+                    &dst[c],
+                )
+            };
+            if interleave {
+                for _ in 0..depth {
+                    for c in 0..chains {
+                        gemv(c)?;
+                    }
+                }
+            } else {
+                for c in 0..chains {
+                    for _ in 0..depth {
+                        gemv(c)?;
+                    }
+                }
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let dt = start.elapsed().as_secs_f64();
+            if idx < WARMUP {
+                continue;
+            }
+            sum_dt += dt;
+            iters += depth * chains;
+            if sum_dt > MIN_DUR {
+                break;
+            }
+        }
+        Ok(1e3 * sum_dt / iters as f64)
+    };
+
+    let seq_ms = measure(false)?;
+    let int_ms = measure(true)?;
+    println!(
+        "barrier-probe q4k n=k={n} depth={depth} chains={chains} ({} MB/chain-step): sequential {seq_ms:.4} ms/dispatch, interleaved {int_ms:.4} ms/dispatch, ratio {:.2} (1.0 = barriers serialize everything; ~1/{chains} = full overlap)",
+        weight_bytes / 1_000_000,
+        int_ms / seq_ms,
+    );
+    Ok(())
+}
+
 /// Splits AoS q4_K bytes into the SoA planes the `_soa` kernel reads:
 /// [n*nb 16B headers | n*nb 128B quant blocks].
 fn q4k_soa_bytes(aos: &[u8], n: usize, k: usize) -> Vec<u8> {
@@ -613,6 +719,8 @@ enum Task {
     QmvCapture,
     /// q4_K mv SoA plane-split vs AoS: correctness + GB/s (the repack gate).
     QmvSoa,
+    /// Do independent chains overlap past global auto-barriers? (scoped-barrier gate)
+    BarrierProbe,
 }
 
 #[derive(Parser, Debug)]
@@ -657,6 +765,14 @@ fn main() -> Result<()> {
                 ("o_or_down", 1024, 3072),
             ] {
                 run_qmv_soa(name, n, k)?;
+            }
+        }
+        Task::BarrierProbe => {
+            // Decode-representative small shapes: chains of skinny GEMVs.
+            for (n, k) in [(3072usize, 1024usize), (1024, 3072), (6144, 1024)] {
+                for chains in [2usize, 4] {
+                    run_barrier_probe(n, k, 64, chains)?;
+                }
             }
         }
         Task::Qmm => {

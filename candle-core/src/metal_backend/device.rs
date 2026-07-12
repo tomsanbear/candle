@@ -398,6 +398,14 @@ impl MetalDevice {
             .map_err(|e| MetalError::from(e.to_string()))?;
         Ok(())
     }
+
+    /// Stop a capture started with [`Self::capture`], finalizing the
+    /// .gputrace document. Bounded captures (e.g. a single decode step)
+    /// need this — process exit does not reliably flush the trace.
+    pub fn stop_capture(&self) {
+        let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        capture.stopCapture();
+    }
 }
 
 fn buf_size(size: usize) -> usize {

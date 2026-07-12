@@ -330,11 +330,131 @@ fn run_qmm(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result
     Ok(())
 }
 
+/// Wraps one bounded command buffer of qmv dispatches in an Xcode .gputrace
+/// capture — the occupancy/limiter evidence the q4_K SoA-repack decision is
+/// gated on. Requires METAL_CAPTURE_ENABLED=1 in the environment; open the
+/// resulting bundle in Xcode (GPU trace) for per-encoder counters
+/// (per-dispatch timestamps are unavailable on Apple Silicon).
+fn run_qmv_capture(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result<()> {
+    use objc2_foundation::NSURL;
+    use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
+
+    if std::env::var("METAL_CAPTURE_ENABLED").is_err() {
+        anyhow::bail!(
+            "GPU capture needs METAL_CAPTURE_ENABLED=1 in the environment \
+             (undocumented Metal requirement)"
+        );
+    }
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+
+    let (weights, weight_bytes) = q_weight_bytes(dtype, n, k);
+    let rhs = device
+        .new_buffer_with_data(
+            weights.as_ptr() as *const core::ffi::c_void,
+            weights.len(),
+            options,
+        )
+        .unwrap();
+    let acts: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 97.0))
+        .collect();
+    let lhs = device
+        .new_buffer_with_data(
+            acts.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts.as_slice()),
+            options,
+        )
+        .unwrap();
+    let dst = device
+        .new_buffer(m * n * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    let dispatch = |count: usize| -> Result<()> {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        for _ in 0..count {
+            candle_metal_kernels::call_quantized_matmul_mv_t(
+                &device,
+                &encoder,
+                &kernels,
+                dtype,
+                true,
+                (1, m, n, k),
+                &lhs,
+                0,
+                &rhs,
+                0,
+                &dst,
+            )?;
+        }
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        Ok(())
+    };
+
+    // Occupancy evidence readable without Xcode: maxTotalThreadsPerThreadgroup
+    // reflects the compiled kernel's register pressure (1024 = unconstrained;
+    // lower = registers cap resident simdgroups per core).
+    {
+        use objc2_metal::MTLComputePipelineState;
+        let pipeline = kernels.load_pipeline(
+            &device,
+            candle_metal_kernels::source::Source::Quantized,
+            "kernel_mul_mv_q4_K_bf16",
+        )?;
+        let raw = pipeline.as_ref();
+        println!(
+            "kernel_mul_mv_q4_K_bf16: maxTotalThreadsPerThreadgroup={} threadExecutionWidth={} staticThreadgroupMemory={}B",
+            pipeline.max_total_threads_per_threadgroup(),
+            raw.threadExecutionWidth(),
+            raw.staticThreadgroupMemoryLength(),
+        );
+    }
+
+    // Warm up past the shader-compile transient so the capture shows
+    // steady-state execution.
+    for _ in 0..3 {
+        dispatch(8)?;
+    }
+
+    let path = std::env::current_dir()?.join(format!("qmv-{name}-m{m}.gputrace"));
+    if path.exists() {
+        std::fs::remove_dir_all(&path)?;
+    }
+    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    let descriptor = MTLCaptureDescriptor::new();
+    descriptor.setDestination(MTLCaptureDestination::GPUTraceDocument);
+    descriptor.set_capture_device(device.as_ref());
+    let url = NSURL::from_file_path(&path);
+    descriptor.setOutputURL(url.as_deref());
+    manager
+        .startCaptureWithDescriptor_error(&descriptor)
+        .map_err(|e| anyhow::anyhow!("startCapture failed: {e}"))?;
+
+    // One bounded buffer: enough dispatches to show steady occupancy,
+    // small enough that Xcode can load the trace.
+    dispatch(32)?;
+
+    manager.stopCapture();
+    println!(
+        "{dtype:?} {name} n={n} k={k} m={m}: captured 32 dispatches ({} MB weights) -> {}",
+        weight_bytes / 1_000_000,
+        path.display()
+    );
+    Ok(())
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
     Qmv,
     Qmm,
+    /// GPU capture of the q4_K mv kernel (lm_head + mlp_wide shapes at m=1).
+    QmvCapture,
 }
 
 #[derive(Parser, Debug)]
@@ -363,6 +483,11 @@ fn main() -> Result<()> {
                         run_qmv(dtype, name, n, k, m)?;
                     }
                 }
+            }
+        }
+        Task::QmvCapture => {
+            for (name, n, k) in [("lm_head", 248094usize, 1024usize), ("mlp_wide", 6144, 1024)] {
+                run_qmv_capture(GgmlDType::Q4K, name, n, k, 1)?;
             }
         }
         Task::Qmm => {

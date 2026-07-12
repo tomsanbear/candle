@@ -367,9 +367,17 @@ fn main() -> Result<()> {
         }
         Task::Qmm => {
             for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0] {
-                for m in [4usize, 8, 12] {
-                    run_qmv(dtype, "lm_head", 248094, 1024, m)?;
-                    run_qmm(dtype, "lm_head", 248094, 1024, m)?;
+                for (name, n) in [
+                    ("lm_head", 248094usize),
+                    ("dn_qkvz", 12288),
+                    ("mlp_fused", 6144),
+                    ("attn_qkv", 3072),
+                    ("o_or_down", 1024),
+                ] {
+                    for m in [8usize, 12] {
+                        run_qmv(dtype, name, n, 1024, m)?;
+                        run_qmm(dtype, name, n, 1024, m)?;
+                    }
                 }
             }
         }

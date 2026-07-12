@@ -449,9 +449,17 @@ impl QMetalStorage {
         // already loses to the tile (2.4). Raising NC to 8 was measured
         // worse everywhere (register pressure). So: mc for 2..=7, tile
         // kernel from 8 up.
+        // At m in 8..=12 the tile kernel's win is confined to huge-n weights
+        // (lm_head 248k: -12%/-32% at m=8/12); at n <= 12k it is a
+        // kernel-level tie that LOSES end-to-end because the tile path also
+        // pays a bf16->f32 activation cast per call. So skinny weights stay
+        // on the bf16-direct mc route through m=12.
+        let m_small = src_shape.dim(D::Minus2)?;
+        let mc_wins = (2..=7).contains(&m_small)
+            || ((8..=12).contains(&m_small) && self_shape.dim(D::Minus2)? < 32768);
         if self_shape.rank() == 2
             && (src_shape.rank() == 2 || (src_shape.rank() == 3 && src_shape.dims()[0] == 1))
-            && (2..=7).contains(&src_shape.dim(D::Minus2)?)
+            && mc_wins
             && matches!(storage.dtype(), DType::F32 | DType::BF16)
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some()
         {

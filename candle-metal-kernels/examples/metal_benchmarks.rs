@@ -330,6 +330,162 @@ fn run_qmm(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result
     Ok(())
 }
 
+/// Splits AoS q4_K bytes into the SoA planes the `_soa` kernel reads:
+/// [n*nb 16B headers | n*nb 128B quant blocks].
+fn q4k_soa_bytes(aos: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let nb = k / 256;
+    let blocks = n * nb;
+    assert_eq!(aos.len(), blocks * 144);
+    let mut soa = vec![0u8; blocks * 144];
+    let (hdrs, quants) = soa.split_at_mut(blocks * 16);
+    for b in 0..blocks {
+        let o = b * 144;
+        hdrs[b * 16..(b + 1) * 16].copy_from_slice(&aos[o..o + 16]);
+        quants[b * 128..(b + 1) * 128].copy_from_slice(&aos[o + 16..o + 144]);
+    }
+    soa
+}
+
+/// q4_K mv AoS vs SoA plane-split: correctness cross-check (identical
+/// arithmetic — results must match bitwise) then the same dispatch-level
+/// timing as run_qmv on both layouts.
+fn run_qmv_soa(name: &str, n: usize, k: usize) -> Result<()> {
+    const WARMUP_ITERS: usize = 3;
+    const MIN_DUR: f64 = 1.5;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+    let m = 1usize;
+
+    let (aos, weight_bytes) = q_weight_bytes(GgmlDType::Q4K, n, k);
+    let soa = q4k_soa_bytes(&aos, n, k);
+    let rhs_aos = device
+        .new_buffer_with_data(aos.as_ptr() as *const core::ffi::c_void, aos.len(), options)
+        .unwrap();
+    let rhs_soa = device
+        .new_buffer_with_data(soa.as_ptr() as *const core::ffi::c_void, soa.len(), options)
+        .unwrap();
+    let acts: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 97.0))
+        .collect();
+    let lhs = device
+        .new_buffer_with_data(
+            acts.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts.as_slice()),
+            options,
+        )
+        .unwrap();
+    let dst_a = device
+        .new_buffer(m * n * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    let dst_s = device
+        .new_buffer(m * n * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    // Correctness: one dispatch per layout, bitwise-compare dst.
+    {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        candle_metal_kernels::call_quantized_matmul_mv_t(
+            &device,
+            &encoder,
+            &kernels,
+            GgmlDType::Q4K,
+            true,
+            (1, m, n, k),
+            &lhs,
+            0,
+            &rhs_aos,
+            0,
+            &dst_a,
+        )?;
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_soa(
+            &device,
+            &encoder,
+            &kernels,
+            (1, m, n, k),
+            &lhs,
+            0,
+            &rhs_soa,
+            0,
+            &dst_s,
+        )?;
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let a = unsafe { std::slice::from_raw_parts(dst_a.contents() as *const f32, m * n) };
+        let s = unsafe { std::slice::from_raw_parts(dst_s.contents() as *const f32, m * n) };
+        let mut max_abs = 0f32;
+        for i in 0..m * n {
+            max_abs = max_abs.max((a[i] - s[i]).abs());
+        }
+        anyhow::ensure!(
+            max_abs == 0.0,
+            "SoA kernel diverges from AoS: max |diff| = {max_abs}"
+        );
+        println!("q4_K {name}: SoA vs AoS bitwise-identical over {} outputs", m * n);
+    }
+
+    // Timing, both layouts, same protocol as run_qmv.
+    let inner = (50_000_000 / weight_bytes).clamp(4, 512);
+    for (layout, rhs, dst) in [("aos", &rhs_aos, &dst_a), ("soa", &rhs_soa, &dst_s)] {
+        let mut sum_dt = 0f64;
+        let mut iters = 0usize;
+        for idx in 0.. {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            let start_time = std::time::Instant::now();
+            for _ in 0..inner {
+                if layout == "aos" {
+                    candle_metal_kernels::call_quantized_matmul_mv_t(
+                        &device,
+                        &encoder,
+                        &kernels,
+                        GgmlDType::Q4K,
+                        true,
+                        (1, m, n, k),
+                        &lhs,
+                        0,
+                        rhs,
+                        0,
+                        dst,
+                    )?;
+                } else {
+                    candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_soa(
+                        &device,
+                        &encoder,
+                        &kernels,
+                        (1, m, n, k),
+                        &lhs,
+                        0,
+                        rhs,
+                        0,
+                        dst,
+                    )?;
+                }
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let dt = start_time.elapsed().as_secs_f64();
+            if idx < WARMUP_ITERS {
+                continue;
+            }
+            sum_dt += dt;
+            iters += inner;
+            if sum_dt > MIN_DUR {
+                break;
+            }
+        }
+        let ms = 1e3 * sum_dt / iters as f64;
+        let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
+        println!("Q4K-{layout} {name:>10} n={n:6} k={k:5} m={m}  {ms:8.3} ms  {gbs:6.1} GB/s");
+    }
+    Ok(())
+}
+
 /// Wraps one bounded command buffer of qmv dispatches in an Xcode .gputrace
 /// capture — the occupancy/limiter evidence the q4_K SoA-repack decision is
 /// gated on. Requires METAL_CAPTURE_ENABLED=1 in the environment; open the
@@ -455,6 +611,8 @@ enum Task {
     Qmm,
     /// GPU capture of the q4_K mv kernel (lm_head + mlp_wide shapes at m=1).
     QmvCapture,
+    /// q4_K mv SoA plane-split vs AoS: correctness + GB/s (the repack gate).
+    QmvSoa,
 }
 
 #[derive(Parser, Debug)]
@@ -488,6 +646,17 @@ fn main() -> Result<()> {
         Task::QmvCapture => {
             for (name, n, k) in [("lm_head", 248094usize, 1024usize), ("mlp_wide", 6144, 1024)] {
                 run_qmv_capture(GgmlDType::Q4K, name, n, k, 1)?;
+            }
+        }
+        Task::QmvSoa => {
+            for (name, n, k) in [
+                ("lm_head", 248094usize, 1024usize),
+                ("dn_qkvz", 12288, 1024),
+                ("mlp_wide", 6144, 1024),
+                ("attn_qkv", 3072, 1024),
+                ("o_or_down", 1024, 3072),
+            ] {
+                run_qmv_soa(name, n, k)?;
             }
         }
         Task::Qmm => {

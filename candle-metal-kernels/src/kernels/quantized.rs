@@ -30,6 +30,84 @@ pub fn quantized_matmul_mv_bf16_src1_supported(dtype: GgmlDType) -> bool {
     matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K)
 }
 
+/// SoA plane-split q4_K mv experiment (bench-only until the micro gate
+/// passes): `rhs` holds [n*nb 16B headers | n*nb 128B quant planes] instead
+/// of interleaved 144B blocks. Same grid geometry as the AoS q4_K mv path.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16_soa(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    // Q4K mv geometry: 32-thread TGs (one simdgroup), N_DST=4 rows each.
+    let thread_groups_count = MTLSize {
+        width: divide(ne01 as usize, 4),
+        height: ne11 as usize,
+        depth: ne12 as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 4,
+        height: 8,
+        depth: 1,
+    };
+    let pipeline =
+        kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q4_K_bf16_soa")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_q4k_soa M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_t(
     device: &Device,

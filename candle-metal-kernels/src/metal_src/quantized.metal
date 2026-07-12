@@ -2536,6 +2536,9 @@ void kernel_mul_mv_q8_0_impl_t(
         }
 
         for (int row = 0; row < nr; row++) {
+            // Tail guard: the store below is already row-guarded, but the
+            // x[ib+row*nb] reads must not walk past src0 either.
+            if (first_row + row >= ne01) break;
             device const int8_t * qs = x[ib+row*nb].qs + NB_Q8_0*il;
             float sumq = 0.f;
             for (int iq = 0; iq < NB_Q8_0; ++iq) {
@@ -4714,7 +4717,9 @@ void kernel_mul_mv_q2_K_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
+        // 248094-row lm_head): the tail threadgroup must not write past dst.
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -5005,6 +5010,9 @@ void kernel_mul_mv_q4_K_impl_t(
         device const half     * dh = &x[ib].d;
 
         for (int row = 0; row < N_DST; row++) {
+            // Tail guard: row reads below walk row*step into src0; rows past
+            // ne01 would read out of bounds (uniform break, no divergence).
+            if (first_row + row >= ne01) break;
 
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
@@ -5044,7 +5052,9 @@ void kernel_mul_mv_q4_K_impl_t(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
+        // 248094-row lm_head): the tail threadgroup must not write past dst.
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -5316,6 +5326,10 @@ void kernel_mul_mv_q6_K_impl_t(
     const int     im = tgpig.z;
 
     const int row = 2 * r0 + sgitg;
+    // Tail guard for odd ne01 (uniform per simdgroup; no barriers below).
+    if (row >= ne01) {
+        return;
+    }
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
@@ -5945,7 +5959,9 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
+        // 248094-row lm_head): the tail threadgroup must not write past dst.
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -6197,7 +6213,9 @@ void kernel_mul_mv_iq1_s_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
+        // 248094-row lm_head): the tail threadgroup must not write past dst.
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -6296,7 +6314,9 @@ void kernel_mul_mv_iq1_m_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
+        // 248094-row lm_head): the tail threadgroup must not write past dst.
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -8058,6 +8078,9 @@ kernel void kernel_mul_mv_q4_K_mc_t(
         device const half     * dh_b = &x[ib].d;
 
         for (int row = 0; row < N_DST; row++) {
+            // Tail guard (see the single-column kernel): row*step reads and
+            // the store below must not touch rows past ne01.
+            if (first_row + row >= ne01) break;
 
             device const uint16_t * sc = sc_b + row*step;
             device const uint16_t * q1 = q1_b + row*step;
@@ -8120,7 +8143,7 @@ kernel void kernel_mul_mv_q4_K_mc_t(
     for (int row = 0; row < N_DST; ++row) {
         for (int c = 0; c < NC_MV_Q4_K; ++c) {
             const float tot = simd_sum(sumf[row][c]);
-            if (tiisg == 0 && c < nc) {
+            if (tiisg == 0 && c < nc && first_row + row < ne01) {
                 dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = tot;
             }
         }
@@ -8171,6 +8194,10 @@ kernel void kernel_mul_mv_q6_K_mc_t(
     const int     im = tgpig.z;
 
     const int row = 2 * r0 + sgitg;
+    // Tail guard for odd ne01 (uniform per simdgroup; no barriers below).
+    if (row >= ne01) {
+        return;
+    }
 
     const int r1_base = tgpig.y * NC_MV_Q6_K;
     const int nc = min((int)NC_MV_Q6_K, (int)(ne11 - r1_base));

@@ -251,6 +251,269 @@ kernel void gated_delta_v2_core(
 }
 
 // ---------------------------------------------------------------------------
+// prep_tree: tree-verify variant of prep. The flattened chunk is
+// [anchor, a_1..a_w | b_1..b_w]: main segment rows [0, seg1), alternate
+// segment rows [seg1, seg1+alt_len), branching after row branch_after-1 of
+// the main segment. One dispatch stages BOTH segments: the alternate's conv
+// window re-seeds from the branch ancestry (retained conv_in tail plus main
+// rows < branch_after — pure row arithmetic, no sequential dependency), and
+// the log-decay cumsum restarts at the segment boundary so each segment's
+// captures are identical to what its own separate dispatch would emit (the
+// host rollback math is unchanged). Single stream; grid `heads` TGs x dk.
+// ---------------------------------------------------------------------------
+kernel void gated_delta_v2_prep_tree_bf16(
+    device const bfloat *proj      [[buffer(0)]],
+    device const bfloat *conv_in   [[buffer(1)]],
+    device const bfloat *conv_w    [[buffer(2)]],
+    device const float  *dt_bias   [[buffer(3)]],
+    device const float  *a_log_exp [[buffer(4)]],
+    device bfloat       *conv_out  [[buffer(5)]],
+    device float        *kn        [[buffer(6)]],
+    device float        *qn        [[buffer(7)]],
+    device float        *vc        [[buffer(8)]],
+    device float        *g_step    [[buffer(9)]],
+    device float        *beta_s    [[buffer(10)]],
+    device float        *cap_gcs   [[buffer(11)]],
+    constant uint  &heads        [[buffer(12)]],
+    constant uint  &dk           [[buffer(13)]],
+    constant uint  &dv           [[buffer(14)]],
+    constant uint  &conv_dim     [[buffer(15)]],
+    constant uint  &key_dim      [[buffer(16)]],
+    constant uint  &value_dim    [[buffer(17)]],
+    constant uint  &ksz          [[buffer(18)]],
+    constant uint  &seg1         [[buffer(19)]],
+    constant uint  &alt_len      [[buffer(20)]],
+    constant uint  &branch_after [[buffer(21)]],
+    constant float &l2_eps       [[buffer(22)]],
+    uint h          [[threadgroup_position_in_grid]],
+    uint tid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint l_total = seg1 + alt_len;
+    const uint row_stride = conv_dim + value_dim + 2 * heads;
+    const ulong hb = (ulong)h;
+
+    threadgroup float q_raw[GD2_MAX_L * 128];
+    threadgroup float k_raw[GD2_MAX_L * 128];
+    threadgroup float scratch[4];
+    const uint n_simd_groups = dk / 32;
+
+    const uint chans[3] = {
+        h * dk + tid,
+        key_dim + h * dk + tid,
+        2 * key_dim + h * dv + tid,
+    };
+    for (uint c = 0; c < 3; c++) {
+        const uint ch = chans[c];
+        float win[GD2_MAX_KSZ];
+        // Main segment: window slides from the live conv_in exactly like prep.
+        for (uint t = 0; t + 1 < ksz; t++) {
+            win[t] = float(conv_in[ch * ksz + t + 1]);
+        }
+        for (uint pos = 0; pos < seg1; pos++) {
+            win[ksz - 1] = float(proj[pos * row_stride + ch]);
+            float acc = 0.0f;
+            for (uint t = 0; t < ksz; t++) {
+                acc += float(conv_w[ch * ksz + t]) * win[t];
+            }
+            const float y = acc / (1.0f + metal::precise::exp(-acc));
+            if (c == 0) q_raw[pos * dk + tid] = y;
+            else if (c == 1) k_raw[pos * dk + tid] = y;
+            else vc[(hb * l_total + pos) * dv + tid] = y;
+            for (uint t = 0; t + 1 < ksz; t++) win[t] = win[t + 1];
+        }
+        // Live conv window continues from the MAIN segment's end (the host
+        // keeps main as the live state; the alternate's window is capture-
+        // reconstructed on rollback if it wins).
+        for (uint t = 0; t < ksz; t++) {
+            const int src = int(seg1) - int(ksz) + int(t);
+            float val;
+            if (src >= 0) {
+                val = float(proj[uint(src) * row_stride + ch]);
+            } else {
+                val = float(conv_in[ch * ksz + uint(int(ksz) + src)]);
+            }
+            conv_out[ch * ksz + t] = bfloat(val);
+        }
+        // Alternate segment: re-seed the window with the last ksz-1 inputs
+        // before b_1 = tail of [conv_in slots 1..ksz-1, main rows 0..branch_after).
+        for (uint t = 0; t + 1 < ksz; t++) {
+            const uint j = branch_after + t; // index into that combined sequence
+            win[t] = j < ksz - 1
+                ? float(conv_in[ch * ksz + 1 + j])
+                : float(proj[(j - (ksz - 1)) * row_stride + ch]);
+        }
+        for (uint pos = seg1; pos < l_total; pos++) {
+            win[ksz - 1] = float(proj[pos * row_stride + ch]);
+            float acc = 0.0f;
+            for (uint t = 0; t < ksz; t++) {
+                acc += float(conv_w[ch * ksz + t]) * win[t];
+            }
+            const float y = acc / (1.0f + metal::precise::exp(-acc));
+            if (c == 0) q_raw[pos * dk + tid] = y;
+            else if (c == 1) k_raw[pos * dk + tid] = y;
+            else vc[(hb * l_total + pos) * dv + tid] = y;
+            for (uint t = 0; t + 1 < ksz; t++) win[t] = win[t + 1];
+        }
+    }
+
+    // Gate scalars + decay cumsum; the running sum restarts at the segment
+    // boundary so cap_gcs is per-segment, matching two-dispatch semantics.
+    if (tid == 0) {
+        float run = 0.0f;
+        for (uint pos = 0; pos < l_total; pos++) {
+            if (pos == seg1) run = 0.0f;
+            const float b_in =
+                float(proj[pos * row_stride + conv_dim + value_dim + h]);
+            const float a_in =
+                float(proj[pos * row_stride + conv_dim + value_dim + heads + h]);
+            const float g = -a_log_exp[h]
+                * metal::precise::log(1.0f + metal::precise::exp(a_in + dt_bias[h]));
+            g_step[hb * l_total + pos] = g;
+            run += g;
+            cap_gcs[hb * l_total + pos] = run;
+            beta_s[hb * l_total + pos] = 1.0f / (1.0f + metal::precise::exp(-b_in));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = 0; pos < l_total; pos++) {
+        const float qv = q_raw[pos * dk + tid];
+        const float kv = k_raw[pos * dk + tid];
+        const float q2 =
+            tg_sum_128(qv * qv, scratch, tid, simd_group, simd_lane, n_simd_groups);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float k2 =
+            tg_sum_128(kv * kv, scratch, tid, simd_group, simd_lane, n_simd_groups);
+        qn[(hb * l_total + pos) * dk + tid] = qv
+            * metal::precise::powr(q2 + l2_eps, -0.5f)
+            * metal::precise::rsqrt(float(dk));
+        kn[(hb * l_total + pos) * dk + tid] = kv
+            * metal::precise::powr(k2 + l2_eps, -0.5f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// core_tree: tree-verify variant of core. Registers carry the state through
+// the main segment; at the branch point each lane snapshots its slots (also
+// written to state_mid — the alternate capture's S0 for host rollback), and
+// after the main segment's end state is written the registers reload the
+// snapshot and the alternate segment runs in the same dispatch. The branch
+// seed is bit-for-bit the kernel's own recurrence at the branch position —
+// the closed form the host used to recompute. Single stream.
+// ---------------------------------------------------------------------------
+kernel void gated_delta_v2_core_tree(
+    device const float *state_in  [[buffer(0)]],
+    device float       *state_out [[buffer(1)]],
+    device const float *kn        [[buffer(2)]],
+    device const float *qn        [[buffer(3)]],
+    device const float *vc        [[buffer(4)]],
+    device const float *g_step    [[buffer(5)]],
+    device const float *beta_s    [[buffer(6)]],
+    device float       *cap_delta [[buffer(7)]],
+    device float       *o_pre     [[buffer(8)]],
+    device float       *state_mid [[buffer(9)]],
+    constant uint &heads        [[buffer(10)]],
+    constant uint &dk           [[buffer(11)]],
+    constant uint &dv           [[buffer(12)]],
+    constant uint &value_dim    [[buffer(13)]],
+    constant uint &seg1         [[buffer(14)]],
+    constant uint &alt_len      [[buffer(15)]],
+    constant uint &branch_after [[buffer(16)]],
+    uint2 tg        [[threadgroup_position_in_grid]],
+    uint2 tp        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]]) {
+    const uint bh = tg.y; // head index; single stream
+    const uint h = bh % heads;
+    const uint col = tg.x * 4 + tp.y;
+    const uint lane = tp.x;
+    const uint l_total = seg1 + alt_len;
+    const uint n_per_lane = dk / 32;
+
+    device const float *s_in = state_in + ((ulong)bh * dv + col) * dk;
+    device float *s_out = state_out + ((ulong)bh * dv + col) * dk;
+    device float *s_mid = state_mid + ((ulong)bh * dv + col) * dk;
+
+    float state[4];
+    float state_br[4];
+    for (uint i = 0; i < n_per_lane; i++) {
+        state[i] = s_in[lane * n_per_lane + i];
+        state_br[i] = state[i];
+    }
+
+    const ulong hb = (ulong)bh;
+    for (uint t = 0; t < seg1; t++) {
+        const float decay = metal::precise::exp(g_step[hb * l_total + t]);
+        device const float *k_t = kn + (hb * l_total + t) * dk + lane * n_per_lane;
+        device const float *q_t = qn + (hb * l_total + t) * dk + lane * n_per_lane;
+        float kv_mem = 0.0f;
+        for (uint i = 0; i < n_per_lane; i++) {
+            state[i] *= decay;
+            kv_mem = fma(state[i], k_t[i], kv_mem);
+        }
+        kv_mem = simd_sum(kv_mem);
+
+        const float delta =
+            (vc[(hb * l_total + t) * dv + col] - kv_mem) * beta_s[hb * l_total + t];
+
+        float o = 0.0f;
+        for (uint i = 0; i < n_per_lane; i++) {
+            state[i] = fma(k_t[i], delta, state[i]);
+            o = fma(state[i], q_t[i], o);
+        }
+        o = simd_sum(o);
+        if (simd_lane == 0) {
+            cap_delta[(hb * l_total + t) * dv + col] = delta;
+            o_pre[(ulong)t * value_dim + h * dv + col] = o;
+        }
+        if (t + 1 == branch_after) {
+            for (uint i = 0; i < n_per_lane; i++) {
+                state_br[i] = state[i];
+            }
+        }
+    }
+
+    // Main-segment end state = the live state the host keeps.
+    for (uint i = 0; i < n_per_lane; i++) {
+        s_out[lane * n_per_lane + i] = state[i];
+    }
+    // Branch-point state = the alternate capture's S0.
+    for (uint i = 0; i < n_per_lane; i++) {
+        s_mid[lane * n_per_lane + i] = state_br[i];
+        state[i] = state_br[i];
+    }
+
+    for (uint t = seg1; t < l_total; t++) {
+        const float decay = metal::precise::exp(g_step[hb * l_total + t]);
+        device const float *k_t = kn + (hb * l_total + t) * dk + lane * n_per_lane;
+        device const float *q_t = qn + (hb * l_total + t) * dk + lane * n_per_lane;
+        float kv_mem = 0.0f;
+        for (uint i = 0; i < n_per_lane; i++) {
+            state[i] *= decay;
+            kv_mem = fma(state[i], k_t[i], kv_mem);
+        }
+        kv_mem = simd_sum(kv_mem);
+
+        const float delta =
+            (vc[(hb * l_total + t) * dv + col] - kv_mem) * beta_s[hb * l_total + t];
+
+        float o = 0.0f;
+        for (uint i = 0; i < n_per_lane; i++) {
+            state[i] = fma(k_t[i], delta, state[i]);
+            o = fma(state[i], q_t[i], o);
+        }
+        o = simd_sum(o);
+        if (simd_lane == 0) {
+            cap_delta[(hb * l_total + t) * dv + col] = delta;
+            o_pre[(ulong)t * value_dim + h * dv + col] = o;
+        }
+    }
+    // The alternate segment's end state is never installed (rollback
+    // reconstructs the winning prefix from captures), so it is not written.
+}
+
+// ---------------------------------------------------------------------------
 // epilogue: grid (heads * batch) TGs x dv threads. Group RMSNorm over the
 // head's output row + silu(z) gating, per position.
 // ---------------------------------------------------------------------------

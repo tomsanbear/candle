@@ -344,3 +344,171 @@ pub fn call_gated_delta_v2(
     );
     Ok(())
 }
+
+/// Fused GatedDeltaNet v2 tree-verify step: main segment [anchor, a_1..a_w]
+/// (rows [0, seg1)) and alternate segment [b_1..b_w] (rows [seg1, seg1+alt))
+/// in ONE prep/core/epilogue pass. The alternate restarts inside the core
+/// dispatch from the state after main row `branch_after`-1; that branch-point
+/// state is also written to `state_mid` (the alternate capture's S0 for the
+/// host's closed-form rollback). Staging/capture buffers span all
+/// seg1+alt_len rows; cap_gcs restarts its cumsum at the segment boundary so
+/// each segment's capture slice matches a separate dispatch. Single stream.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gated_delta_v2_tree(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    params: GatedDeltaParams,
+    seg1: usize,
+    alt_len: usize,
+    branch_after: usize,
+    proj: &Buffer,
+    conv_in: &Buffer,
+    state_in: &Buffer,
+    conv_w: &Buffer,
+    dt_bias: &Buffer,
+    a_log_exp: &Buffer,
+    norm_w: &Buffer,
+    out: &Buffer,
+    conv_out: &Buffer,
+    state_out: &Buffer,
+    state_mid: &Buffer,
+    stages: GatedDeltaV2Stages<'_>,
+) -> Result<(), MetalKernelError> {
+    let l_total = seg1 + alt_len;
+    if params.dk != 128
+        || params.dv != 128
+        || seg1 == 0
+        || alt_len == 0
+        || l_total > 12
+        || branch_after == 0
+        || branch_after > seg1
+    {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "gated_delta_v2_tree requires dk == dv == 128, 1 <= branch_after <= seg1 and \
+             2 <= seg1+alt <= 12; got dk={} dv={} seg1={seg1} alt={alt_len} branch_after={branch_after}",
+            params.dk, params.dv
+        )));
+    }
+    let heads = params.heads as usize;
+
+    let prep =
+        kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_prep_tree_bf16")?;
+    let core = kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_core_tree")?;
+    let epilogue =
+        kernels.load_pipeline(device, Source::GatedDeltaV2, "gated_delta_v2_epilogue_bf16")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+
+    encoder.set_compute_pipeline_state(&prep);
+    debug_group!(encoder, "gated_delta_v2_prep_tree l={l_total}");
+    set_params!(
+        encoder,
+        (
+            proj,
+            conv_in,
+            conv_w,
+            dt_bias,
+            a_log_exp,
+            Output::new(conv_out),
+            Output::new(stages.kn),
+            Output::new(stages.qn),
+            Output::new(stages.vc),
+            Output::new(stages.g_step),
+            Output::new(stages.beta),
+            Output::new(stages.cap_gcs),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.conv_dim,
+            params.key_dim,
+            params.value_dim,
+            params.ksz,
+            seg1 as u32,
+            alt_len as u32,
+            branch_after as u32,
+            params.l2_eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dk as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    encoder.set_compute_pipeline_state(&core);
+    debug_group!(encoder, "gated_delta_v2_core_tree l={l_total}");
+    set_params!(
+        encoder,
+        (
+            state_in,
+            Output::new(state_out),
+            stages.kn,
+            stages.qn,
+            stages.vc,
+            stages.g_step,
+            stages.beta,
+            Output::new(stages.cap_delta),
+            Output::new(stages.o_pre),
+            Output::new(state_mid),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.value_dim,
+            seg1 as u32,
+            alt_len as u32,
+            branch_after as u32
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: params.dv as usize / 4,
+            height: heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 4,
+            depth: 1,
+        },
+    );
+
+    encoder.set_compute_pipeline_state(&epilogue);
+    debug_group!(encoder, "gated_delta_v2_epilogue l={l_total}");
+    set_params!(
+        encoder,
+        (
+            stages.o_pre,
+            proj,
+            norm_w,
+            Output::new(out),
+            params.heads,
+            params.dv,
+            params.conv_dim,
+            params.value_dim,
+            l_total as u32,
+            params.norm_eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dv as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}

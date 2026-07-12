@@ -1,11 +1,11 @@
 use anyhow::Result;
 use candle_metal_kernels::{
     metal::{Commands, Device, ResidencySet},
-    GemmDType, RESOURCE_OPTIONS,
+    GemmDType, GgmlDType, RESOURCE_OPTIONS,
 };
 /// This example contains some simple benchmarks so that it's easy to run them in perf etc.
 use clap::{Parser, Subcommand};
-use half::f16;
+use half::{bf16, f16};
 
 fn run_gemm(f32: bool, n: usize) -> Result<()> {
     const WARMUP_ITERS: usize = 2;
@@ -101,9 +101,155 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Deterministic, numerically-tame quantized weight bytes: unit scales, zero
+/// mins, patterned quants. Timing-neutral vs real weights; never NaN/Inf.
+fn q_weight_bytes(dtype: GgmlDType, n: usize, k: usize) -> (Vec<u8>, usize) {
+    let (block_elems, block_bytes) = match dtype {
+        GgmlDType::Q4K => (256usize, 144usize),
+        GgmlDType::Q6K => (256, 210),
+        GgmlDType::Q8_0 => (32, 34),
+        _ => unimplemented!("bench covers the bf16-direct mv dtypes"),
+    };
+    assert_eq!(k % block_elems, 0);
+    let blocks_per_row = k / block_elems;
+    let total = n * blocks_per_row * block_bytes;
+    let mut bytes = vec![0u8; total];
+    let one_f16 = 0x3C00u16.to_le_bytes();
+    for b in 0..n * blocks_per_row {
+        let o = b * block_bytes;
+        match dtype {
+            GgmlDType::Q4K => {
+                // half d = 1.0, half dmin = 0.0, scales[12], qs[128]
+                bytes[o..o + 2].copy_from_slice(&one_f16);
+                for i in 0..12 {
+                    bytes[o + 4 + i] = 17 + (i as u8);
+                }
+                for i in 0..128 {
+                    bytes[o + 16 + i] = ((b + i) % 251) as u8;
+                }
+            }
+            GgmlDType::Q6K => {
+                // ql[128], qh[64], scales[16] (i8), half d = 1.0
+                for i in 0..192 {
+                    bytes[o + i] = ((b + i) % 251) as u8;
+                }
+                for i in 0..16 {
+                    bytes[o + 192 + i] = 3;
+                }
+                bytes[o + 208..o + 210].copy_from_slice(&one_f16);
+            }
+            GgmlDType::Q8_0 => {
+                // half d = 1.0, i8 qs[32]
+                bytes[o..o + 2].copy_from_slice(&one_f16);
+                for i in 0..32 {
+                    bytes[o + 2 + i] = ((b + i) % 251) as u8;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    (bytes, total)
+}
+
+/// Quantized matvec / multi-column benchmark on the bf16-activation kernels
+/// (the deployed lmbrrr path). One dispatch per timed iteration, wall time
+/// from encode to wait_until_completed; reports effective weight GB/s.
+fn run_qmv(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -> Result<()> {
+    const WARMUP_ITERS: usize = 3;
+    const MIN_DUR: f64 = 1.5;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+
+    let (weights, weight_bytes) = q_weight_bytes(dtype, n, k);
+    let rhs = device
+        .new_buffer_with_data(
+            weights.as_ptr() as *const core::ffi::c_void,
+            weights.len(),
+            options,
+        )
+        .unwrap();
+    let acts: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 97.0))
+        .collect();
+    let lhs = device
+        .new_buffer_with_data(
+            acts.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts.as_slice()),
+            options,
+        )
+        .unwrap();
+    let dst = device
+        .new_buffer(m * n * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    // Many dispatches per command buffer: a single-dispatch commit is
+    // dominated by the ~1-3 ms commit + wait_until_completed latency.
+    // Hazard tracking on dst serializes the dispatches, which is the
+    // sequential-execution timing we want.
+    let inner = (50_000_000 / weight_bytes).clamp(4, 512);
+    let mut sum_dt = 0f64;
+    let mut iters = 0usize;
+    for idx in 0.. {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        let start_time = std::time::Instant::now();
+        for _ in 0..inner {
+            if m == 1 {
+                candle_metal_kernels::call_quantized_matmul_mv_t(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    dtype,
+                    true,
+                    (1, m, n, k),
+                    &lhs,
+                    0,
+                    &rhs,
+                    0,
+                    &dst,
+                )?;
+            } else {
+                candle_metal_kernels::call_quantized_matmul_mv_mc(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    dtype,
+                    true,
+                    (1, m, n, k),
+                    &lhs,
+                    0,
+                    &rhs,
+                    0,
+                    &dst,
+                )?;
+            }
+        }
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let dt = start_time.elapsed().as_secs_f64();
+        if idx < WARMUP_ITERS {
+            continue;
+        }
+        sum_dt += dt;
+        iters += inner;
+        if sum_dt > MIN_DUR {
+            break;
+        }
+    }
+    let ms = 1e3 * sum_dt / iters as f64;
+    let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
+    println!("{dtype:?} {name:>10} n={n:6} k={k:5} m={m}  {ms:8.3} ms  {gbs:6.1} GB/s");
+    Ok(())
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
+    Qmv,
 }
 
 #[derive(Parser, Debug)]
@@ -121,6 +267,16 @@ fn main() -> Result<()> {
             for f32 in [false, true] {
                 for n in [512, 1024, 2048, 4096] {
                     run_gemm(f32, n)?;
+                }
+            }
+        }
+        Task::Qmv => {
+            for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0, GgmlDType::Q6K] {
+                for (name, n, k) in [("lm_head", 248094usize, 1024usize), ("mlp_wide", 6144, 1024)]
+                {
+                    for m in [1usize, 4] {
+                        run_qmv(dtype, name, n, k, m)?;
+                    }
                 }
             }
         }

@@ -1019,7 +1019,7 @@ fn run_markov_chain() -> Result<()> {
         (tokens, chain_inputs)
     };
 
-    let buf = |bytes: &[u8]| -> Buffer {
+    let buf = |bytes: &[u8]| {
         device
             .new_buffer_with_data(bytes.as_ptr() as *const core::ffi::c_void, bytes.len(), options)
             .unwrap()

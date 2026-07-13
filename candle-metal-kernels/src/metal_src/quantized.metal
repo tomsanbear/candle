@@ -2484,11 +2484,14 @@ kernel void kernel_mul_mv_q5_1_f32(
 
 #define NB_Q8_0 8
 
-template <typename YT>
+// DT: dst element type. All accumulation stays float; DT only changes the
+// final store, so <YT, bfloat> is bit-identical to <YT, float> followed by
+// the cast_f32_bf16 kernel (same static_cast on the same accumulator value).
+template <typename YT, typename DT = float>
 void kernel_mul_mv_q8_0_impl_t(
         device const  void * src0,
         device const    YT * src1,
-        device       float * dst,
+        device          DT * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -2553,7 +2556,7 @@ void kernel_mul_mv_q8_0_impl_t(
     for (int row = 0; row < nr; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = tot;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
         }
     }
 }
@@ -2605,6 +2608,35 @@ kernel void kernel_mul_mv_q8_0_bf16(
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_impl_t<bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+// bf16 activations AND bf16 dst: skips the cast_f32_bf16 dispatch the
+// F32-dst variant forces on every bf16-pipeline caller.
+[[host_name("kernel_mul_mv_q8_0_bf16_bf16")]]
+kernel void kernel_mul_mv_q8_0_bf16_bf16(
+        device const   void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_impl_t<bfloat, bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 #endif
 
@@ -4940,11 +4972,13 @@ kernel void kernel_mul_mv_q3_K_f32(
     kernel_mul_mv_q3_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-template <typename YT>
+// DT: dst element type (see the q8_0 impl note — bf16 dst is bit-identical
+// to F32 dst + cast_f32_bf16).
+template <typename YT, typename DT = float>
 void kernel_mul_mv_q4_K_impl_t(
         device const  void * src0,
         device const    YT * src1,
-        device       float * dst,
+        device          DT * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5059,7 +5093,7 @@ void kernel_mul_mv_q4_K_impl_t(
         // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
         // 248094-row lm_head): the tail threadgroup must not write past dst.
         if (tiisg == 0 && first_row + row < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(all_sum);
         }
     }
 }
@@ -5111,6 +5145,34 @@ kernel void kernel_mul_mv_q4_K_bf16(
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q4_K_impl_t<bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+// bf16 activations AND bf16 dst (see the q8_0 bf16_bf16 note).
+[[host_name("kernel_mul_mv_q4_K_bf16_bf16")]]
+kernel void kernel_mul_mv_q4_K_bf16_bf16(
+        device const   void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_impl_t<bfloat, bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 #endif
 
@@ -5417,11 +5479,13 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-template <typename YT>
+// DT: dst element type (see the q8_0 impl note — bf16 dst is bit-identical
+// to F32 dst + cast_f32_bf16).
+template <typename YT, typename DT = float>
 void kernel_mul_mv_q6_K_impl_t(
         device const  void * src0,
         device const    YT * src1,
-        device       float * dst,
+        device          DT * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5500,7 +5564,7 @@ void kernel_mul_mv_q6_K_impl_t(
 
     const float tot = simd_sum(sumf);
     if (tiisg == 0) {
-        dst[r1*ne0 + im*ne0*ne1 + row] = tot;
+        dst[r1*ne0 + im*ne0*ne1 + row] = static_cast<DT>(tot);
     }
 }
 
@@ -5551,6 +5615,34 @@ kernel void kernel_mul_mv_q6_K_bf16(
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q6_K_impl_t<bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+// bf16 activations AND bf16 dst (see the q8_0 bf16_bf16 note).
+[[host_name("kernel_mul_mv_q6_K_bf16_bf16")]]
+kernel void kernel_mul_mv_q6_K_bf16_bf16(
+        device const   void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q6_K_impl_t<bfloat, bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 #endif
 
@@ -8047,11 +8139,11 @@ kernel void kernel_pool_2d_avg_f32(
 
 #define NC_MV_Q8_0 8
 
-template <typename YT>
+template <typename YT, typename DT = float>
 kernel void kernel_mul_mv_q8_0_mc_t(
         device const  void * src0,
         device const  char * src1,
-        device       float * dst,
+        device          DT * dst,
         constant   int64_t & ne00,
         constant   int64_t & ne01,
         constant   int64_t & ne02,
@@ -8121,7 +8213,7 @@ kernel void kernel_mul_mv_q8_0_mc_t(
         for (int c = 0; c < NC_MV_Q8_0; ++c) {
             const float tot = simd_sum(sumf[row][c]);
             if (tiisg == 0 && first_row + row < ne01 && c < nc) {
-                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = tot;
+                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
             }
         }
     }
@@ -8131,15 +8223,17 @@ typedef decltype(kernel_mul_mv_q8_0_mc_t<float>) mul_mv_q8_0_mc_t;
 template [[host_name("kernel_mul_mv_q8_0_f32_mc")]] kernel mul_mv_q8_0_mc_t kernel_mul_mv_q8_0_mc_t<float>;
 #if defined(__HAVE_BFLOAT__)
 template [[host_name("kernel_mul_mv_q8_0_bf16_mc")]] kernel mul_mv_q8_0_mc_t kernel_mul_mv_q8_0_mc_t<bfloat>;
+typedef decltype(kernel_mul_mv_q8_0_mc_t<bfloat, bfloat>) mul_mv_q8_0_mc_bf16dst_t;
+template [[host_name("kernel_mul_mv_q8_0_bf16_bf16_mc")]] kernel mul_mv_q8_0_mc_bf16dst_t kernel_mul_mv_q8_0_mc_t<bfloat, bfloat>;
 #endif
 
 #define NC_MV_Q4_K 4
 
-template <typename YT>
+template <typename YT, typename DT = float>
 kernel void kernel_mul_mv_q4_K_mc_t(
         device const  void * src0,
         device const  char * src1,
-        device       float * dst,
+        device          DT * dst,
         constant   int64_t & ne00,
         constant   int64_t & ne01,
         constant   int64_t & ne02,
@@ -8264,7 +8358,7 @@ kernel void kernel_mul_mv_q4_K_mc_t(
         for (int c = 0; c < NC_MV_Q4_K; ++c) {
             const float tot = simd_sum(sumf[row][c]);
             if (tiisg == 0 && c < nc && first_row + row < ne01) {
-                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = tot;
+                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
             }
         }
     }
@@ -8274,15 +8368,17 @@ typedef decltype(kernel_mul_mv_q4_K_mc_t<float>) mul_mv_q4_K_mc_t;
 template [[host_name("kernel_mul_mv_q4_K_f32_mc")]] kernel mul_mv_q4_K_mc_t kernel_mul_mv_q4_K_mc_t<float>;
 #if defined(__HAVE_BFLOAT__)
 template [[host_name("kernel_mul_mv_q4_K_bf16_mc")]] kernel mul_mv_q4_K_mc_t kernel_mul_mv_q4_K_mc_t<bfloat>;
+typedef decltype(kernel_mul_mv_q4_K_mc_t<bfloat, bfloat>) mul_mv_q4_K_mc_bf16dst_t;
+template [[host_name("kernel_mul_mv_q4_K_bf16_bf16_mc")]] kernel mul_mv_q4_K_mc_bf16dst_t kernel_mul_mv_q4_K_mc_t<bfloat, bfloat>;
 #endif
 
 #define NC_MV_Q6_K 8
 
-template <typename YT>
+template <typename YT, typename DT = float>
 kernel void kernel_mul_mv_q6_K_mc_t(
         device const  void * src0,
         device const  char * src1,
-        device       float * dst,
+        device          DT * dst,
         constant   int64_t & ne00,
         constant   int64_t & ne01,
         constant   int64_t & ne02,
@@ -8386,7 +8482,7 @@ kernel void kernel_mul_mv_q6_K_mc_t(
     for (int c = 0; c < NC_MV_Q6_K; ++c) {
         const float tot = simd_sum(sumf[c]);
         if (tiisg == 0 && c < nc) {
-            dst[(r1_base+c)*ne0 + im*ne0*ne1 + row] = tot;
+            dst[(r1_base+c)*ne0 + im*ne0*ne1 + row] = static_cast<DT>(tot);
         }
     }
 }
@@ -8395,4 +8491,6 @@ typedef decltype(kernel_mul_mv_q6_K_mc_t<float>) mul_mv_q6_K_mc_t;
 template [[host_name("kernel_mul_mv_q6_K_f32_mc")]] kernel mul_mv_q6_K_mc_t kernel_mul_mv_q6_K_mc_t<float>;
 #if defined(__HAVE_BFLOAT__)
 template [[host_name("kernel_mul_mv_q6_K_bf16_mc")]] kernel mul_mv_q6_K_mc_t kernel_mul_mv_q6_K_mc_t<bfloat>;
+typedef decltype(kernel_mul_mv_q6_K_mc_t<bfloat, bfloat>) mul_mv_q6_K_mc_bf16dst_t;
+template [[host_name("kernel_mul_mv_q6_K_bf16_bf16_mc")]] kernel mul_mv_q6_K_mc_bf16dst_t kernel_mul_mv_q6_K_mc_t<bfloat, bfloat>;
 #endif

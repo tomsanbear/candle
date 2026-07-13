@@ -313,11 +313,6 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
-        let dst = device
-            .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
-            .with_label("qmatmul")
-            .build()?;
         let encoder = device.command_encoder()?;
         // The quantized-block mv kernels address src1 rows by r1*ne10
         // (element counts), so a single dispatch with ne11 = m covers every
@@ -354,6 +349,20 @@ impl QMetalStorage {
             }
             dt => crate::bail!("unsupported src1 dtype {dt:?} for quantized matmul metal"),
         };
+        // BF16 activations get a BF16 dst where the kernel variant exists:
+        // the kernels accumulate in F32 and convert at the store, so this is
+        // bit-identical to the F32 dst + the cast_f32_bf16 dispatch callers
+        // in a BF16 pipeline would otherwise pay per matmul. F32 activations
+        // (and the per-batch dense-ggml loop below) keep the F32 dst.
+        let dst_bf16 = src1_bf16
+            && (mc_supported || single_dispatch)
+            && candle_metal_kernels::quantized_matmul_mv_bf16_dst_supported(self.dtype.into());
+        let dst_dtype = if dst_bf16 { DType::BF16 } else { DType::F32 };
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_shape.elem_count(), dst_dtype)
+            .with_label("qmatmul")
+            .build()?;
         if mc_supported {
             candle_metal_kernels::call_quantized_matmul_mv_mc(
                 device.device(),
@@ -361,6 +370,7 @@ impl QMetalStorage {
                 device.kernels(),
                 self.dtype.into(),
                 src1_bf16,
+                dst_bf16,
                 (1, m, n, k),
                 storage.buffer(),
                 layout.start_offset() * storage.dtype().size_in_bytes(),
@@ -376,6 +386,7 @@ impl QMetalStorage {
                 device.kernels(),
                 self.dtype.into(),
                 src1_bf16,
+                dst_bf16,
                 (1, m, n, k),
                 storage.buffer(),
                 layout.start_offset() * storage.dtype().size_in_bytes(),
@@ -392,6 +403,7 @@ impl QMetalStorage {
                     device.kernels(),
                     self.dtype.into(),
                     src1_bf16,
+                    false,
                     (1, 1, n, k),
                     storage.buffer(),
                     (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
@@ -403,7 +415,7 @@ impl QMetalStorage {
             }
         }
         let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), dst_dtype);
         Ok((dst_storage, dst_shape))
     }
 

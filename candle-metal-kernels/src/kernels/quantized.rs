@@ -30,6 +30,14 @@ pub fn quantized_matmul_mv_bf16_src1_supported(dtype: GgmlDType) -> bool {
     matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K)
 }
 
+/// True when `dtype` has BF16-dst mv/mc kernel variants (only with BF16
+/// src1). The kernels accumulate in F32 either way and convert at the final
+/// store, so a BF16 dst is bit-identical to an F32 dst followed by a
+/// cast_f32_bf16 dispatch — it just skips that dispatch.
+pub fn quantized_matmul_mv_bf16_dst_supported(dtype: GgmlDType) -> bool {
+    matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K)
+}
+
 /// SoA plane-split q4_K mv experiment (bench-only until the micro gate
 /// passes): `rhs` holds [n*nb 16B headers | n*nb 128B quant planes] instead
 /// of interleaved 144B blocks. Same grid geometry as the AoS q4_K mv path.
@@ -115,6 +123,7 @@ pub fn call_quantized_matmul_mv_t(
     kernels: &Kernels,
     dtype: GgmlDType,
     src1_bf16: bool,
+    dst_bf16: bool,
     (b, m, n, k): (usize, usize, usize, usize),
     lhs: &Buffer,
     lhs_offset: usize,
@@ -125,6 +134,12 @@ pub fn call_quantized_matmul_mv_t(
     if src1_bf16 && !quantized_matmul_mv_bf16_src1_supported(dtype) {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
             "bf16 src1",
+            "qmatmul_mv",
+        ));
+    }
+    if dst_bf16 && !(src1_bf16 && quantized_matmul_mv_bf16_dst_supported(dtype)) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "bf16 dst",
             "qmatmul_mv",
         ));
     }
@@ -215,6 +230,9 @@ pub fn call_quantized_matmul_mv_t(
         depth: 1,
     };
     let name = match (dtype, src1_bf16) {
+        (GgmlDType::Q8_0, true) if dst_bf16 => "kernel_mul_mv_q8_0_bf16_bf16",
+        (GgmlDType::Q4K, true) if dst_bf16 => "kernel_mul_mv_q4_K_bf16_bf16",
+        (GgmlDType::Q6K, true) if dst_bf16 => "kernel_mul_mv_q6_K_bf16_bf16",
         (GgmlDType::Q8_0, true) => "kernel_mul_mv_q8_0_bf16",
         (GgmlDType::Q4K, true) => "kernel_mul_mv_q4_K_bf16",
         (GgmlDType::Q6K, true) => "kernel_mul_mv_q6_K_bf16",
@@ -292,6 +310,7 @@ pub fn call_quantized_matmul_mv_mc(
     kernels: &Kernels,
     dtype: GgmlDType,
     src1_bf16: bool,
+    dst_bf16: bool,
     (b, m, n, k): (usize, usize, usize, usize),
     lhs: &Buffer,
     lhs_offset: usize,
@@ -302,6 +321,12 @@ pub fn call_quantized_matmul_mv_mc(
     let nc = quantized_matmul_mv_mc_columns(dtype).ok_or_else(|| {
         MetalKernelError::UnsupportedDTypeForOp("no mc variant", "qmatmul_mv_mc")
     })?;
+    if dst_bf16 && !(src1_bf16 && quantized_matmul_mv_bf16_dst_supported(dtype)) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "bf16 dst",
+            "qmatmul_mv_mc",
+        ));
+    }
     let ne00 = k as i64;
     let ne01 = n as i64;
     let ne02 = b as i64;
@@ -318,6 +343,9 @@ pub fn call_quantized_matmul_mv_mc(
     let r3: u32 = (ne13 / ne03) as u32;
 
     let (name, nth0, nth1, align) = match (dtype, src1_bf16) {
+        (GgmlDType::Q8_0, true) if dst_bf16 => ("kernel_mul_mv_q8_0_bf16_bf16_mc", 8, 8, 8),
+        (GgmlDType::Q4K, true) if dst_bf16 => ("kernel_mul_mv_q4_K_bf16_bf16_mc", 4, 8, 4),
+        (GgmlDType::Q6K, true) if dst_bf16 => ("kernel_mul_mv_q6_K_bf16_bf16_mc", 2, 32, 2),
         (GgmlDType::Q8_0, false) => ("kernel_mul_mv_q8_0_f32_mc", 8, 8, 8),
         (GgmlDType::Q8_0, true) => ("kernel_mul_mv_q8_0_bf16_mc", 8, 8, 8),
         (GgmlDType::Q4K, false) => ("kernel_mul_mv_q4_K_f32_mc", 4, 8, 4),

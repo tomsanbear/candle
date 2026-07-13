@@ -389,9 +389,13 @@ impl QMetalStorage {
                 std::sync::OnceLock::new();
             let geo = *Q4K_MV_GEO.get_or_init(|| {
                 match std::env::var("LMBRRR_Q4K_MV_VARIANT").as_deref() {
-                    Ok("nr2sg2") => Some((2, 2, false)),
+                    Ok("baseline") => None,
                     Ok("nr2sg1") => Some((1, 2, false)),
-                    _ => None,
+                    // Default since round-3: nr0=2 x nsg=2 (bit-identical,
+                    // +30% head kernel / +2.2% e2e on M3; llama.cpp's
+                    // shipped geometry). "baseline" restores the historical
+                    // 4-rows-per-simdgroup dispatch for A/B.
+                    _ => Some((2, 2, false)),
                 }
             });
             if let (Some(geo), GgmlDType::Q4K, true, true) =

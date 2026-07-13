@@ -131,6 +131,179 @@ kernel void NAME(                                                            \
 MARKOV_PARTIAL(markov_step_partial_q8, true)
 MARKOV_PARTIAL(markov_step_partial_bf16, false)
 
+// ---------------------------------------------------------------------------
+// Single-dispatch step: the partial+reduce pair fused into one kernel via a
+// packed 32-bit atomic max and a last-threadgroup epilogue. The 2026-07-13
+// cpb-ladder measured the two-dispatch chain at ~285us/step in-situ against
+// ~78us/step isolated execution — the boundary overhead IS the cost, so
+// halving the dispatch count halves the dominant term.
+//
+// Packing: compared scores are always exact bf16 values (the dtype path is
+// float(bfloat(...))), so 16 total-ordered score bits + 15 bits of
+// complemented index cover the whole comparison in 31 bits — a plain
+// atomic_uint, supported on every Metal GPU (MSL has no usable 64-bit
+// atomic: atomic_ulong offers only void max/min, no load/store). This caps
+// the shape at draft_vocab <= 32768 (the FR-Spec deployment); larger vocabs
+// take the two-dispatch shape.
+//
+// Determinism: per-row scores are bit-identical regardless of which
+// threadgroup computes them (same per-thread accumulation order), equal
+// scores compare equal in the packed domain, and the complemented index
+// makes the LOWEST index win ties — the winner is scheduling-independent
+// and the bitwise CPU-reference gate holds.
+//
+// Memory model: MSL exposes only relaxed atomics, so the last-TG read of
+// `best` after the `done` counter fills is not formally ordered by the MSL
+// spec (it is on Apple silicon's coherent atomic path, and the bench gate
+// soaks it bitwise). Blast radius by construction: draft tokens are exactly
+// verified by the target, so a hypothetical race costs one round's
+// acceptance, never committed output.
+//
+// Scratch protocol: `slots` holds one interleaved (packed-max, arrival
+// counter) u32 pair per step — slots[2k]/slots[2k+1] — zeroed ONCE at
+// allocation (packed 0 requires a negative-NaN score — unreachable); the
+// last threadgroup resets its step's pair after consuming it, so
+// back-to-back proposes need no host-side clears and the layout is
+// independent of the call's gamma.
+
+constexpr constant uint MARKOV_FUSED_MAX_VD = 1u << 15;
+
+template <bool Q8>
+void markov_step_fused_impl(
+        device const bfloat * w1,
+        device const uchar  * w2,
+        device const bfloat * base,
+        device const uint   * ids,
+        device uint         * chain,
+        device uint         * tokens,
+        device bfloat       * prev_embs,
+        device atomic_uint  * slots,       // [gamma] pairs: packed max, counter
+        constant uint & k,
+        constant uint & vd,
+        constant uint & r,
+        constant uint & use_remap,
+        threadgroup float * pe,
+        threadgroup float * red_val,
+        threadgroup uint  * red_idx,
+        threadgroup uint  * last_flag,
+        uint tgid,
+        uint tid,
+        uint ntg) {
+    const uint prev = chain[k];
+    if (tid < r) {
+        pe[tid] = float(w1[(ulong)prev * r + tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float bval = -INFINITY;
+    uint bidx = 0xFFFFFFFFu;
+    for (uint row = tgid * MARKOV_TPG + tid; row < vd; row += ntg * MARKOV_TPG) {
+        float acc = 0.0f;
+        if (Q8) {
+            device const uchar * rp = w2 + (ulong)row * (r / Q8_BLOCK) * Q8_BLOCK_BYTES;
+            for (uint b = 0; b < r / Q8_BLOCK; ++b) {
+                const float d = float(*(device const half *)rp);
+                device const char * qs = (device const char *)(rp + 2);
+                float bsum = 0.0f;
+                for (uint j = 0; j < Q8_BLOCK; ++j) {
+                    bsum += float(qs[j]) * pe[b * Q8_BLOCK + j];
+                }
+                acc += d * bsum;
+                rp += Q8_BLOCK_BYTES;
+            }
+        } else {
+            device const bfloat * wrow = (device const bfloat *)w2 + (ulong)row * r;
+            for (uint j = 0; j < r; ++j) {
+                acc += float(wrow[j]) * pe[j];
+            }
+        }
+        float v = float(bfloat(acc));
+        v = float(bfloat(v + float(base[(ulong)k * vd + row])));
+        if (v > bval) {
+            bval = v;
+            bidx = row;
+        }
+    }
+
+    red_val[tid] = bval;
+    red_idx[tid] = bidx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = MARKOV_TPG / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const bool take = red_val[tid + s] > red_val[tid]
+                || (red_val[tid + s] == red_val[tid] && red_idx[tid + s] < red_idx[tid]);
+            if (take) {
+                red_val[tid] = red_val[tid + s];
+                red_idx[tid] = red_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        // Scores are exact bf16 values, so their high 16 f32 bits carry the
+        // full comparison; the sign-flip mapping makes the u16 order match
+        // the float order, and the complemented 15-bit index makes lower
+        // indices win ties.
+        uint sb = as_type<uint>(red_val[0]) >> 16;
+        sb = (sb & 0x8000u) ? (~sb & 0xFFFFu) : (sb | 0x8000u);
+        const uint packed = (sb << 15) | ((MARKOV_FUSED_MAX_VD - 1u) - (red_idx[0] & (MARKOV_FUSED_MAX_VD - 1u)));
+        atomic_fetch_max_explicit(&slots[2 * k], packed, memory_order_relaxed);
+        const uint prior = atomic_fetch_add_explicit(&slots[2 * k + 1], 1u, memory_order_relaxed);
+        *last_flag = (prior == ntg - 1) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (*last_flag == 0u) {
+        return;
+    }
+
+    // Last-arriving threadgroup: pick the winner, feed the chain, stash the
+    // step's INPUT embedding row (already resident in pe), reset the slots.
+    if (tid == 0) {
+        const uint packed = atomic_load_explicit(&slots[2 * k], memory_order_relaxed);
+        const uint sub = (MARKOV_FUSED_MAX_VD - 1u) - (packed & (MARKOV_FUSED_MAX_VD - 1u));
+        const uint global_id = use_remap != 0 ? ids[sub] : sub;
+        tokens[k] = global_id;
+        chain[k + 1] = global_id;
+        atomic_store_explicit(&slots[2 * k], 0u, memory_order_relaxed);
+        atomic_store_explicit(&slots[2 * k + 1], 0u, memory_order_relaxed);
+    }
+    if (tid < r) {
+        prev_embs[(ulong)k * r + tid] = bfloat(pe[tid]);
+    }
+}
+
+#define MARKOV_FUSED(NAME, Q8)                                               \
+[[host_name(#NAME)]]                                                         \
+kernel void NAME(                                                            \
+        device const bfloat * w1        [[buffer(0)]],                       \
+        device const uchar  * w2        [[buffer(1)]],                       \
+        device const bfloat * base      [[buffer(2)]],                       \
+        device const uint   * ids       [[buffer(3)]],                       \
+        device uint         * chain     [[buffer(4)]],                       \
+        device uint         * tokens    [[buffer(5)]],                       \
+        device bfloat       * prev_embs [[buffer(6)]],                       \
+        device atomic_uint  * slots     [[buffer(7)]],                       \
+        constant uint & k               [[buffer(8)]],                       \
+        constant uint & vd              [[buffer(9)]],                       \
+        constant uint & r               [[buffer(10)]],                      \
+        constant uint & use_remap       [[buffer(11)]],                      \
+        uint tgid [[threadgroup_position_in_grid]],                          \
+        uint tid  [[thread_position_in_threadgroup]],                        \
+        uint ntg  [[threadgroups_per_grid]]) {                               \
+    threadgroup float pe[MARKOV_TPG];                                        \
+    threadgroup float red_val[MARKOV_TPG];                                   \
+    threadgroup uint  red_idx[MARKOV_TPG];                                   \
+    threadgroup uint  last_flag;                                             \
+    markov_step_fused_impl<Q8>(w1, w2, base, ids, chain, tokens, prev_embs,  \
+                               slots, k, vd, r, use_remap,                   \
+                               pe, red_val, red_idx, &last_flag,             \
+                               tgid, tid, ntg);                              \
+}
+
+MARKOV_FUSED(markov_step_fused_q8, true)
+MARKOV_FUSED(markov_step_fused_bf16, false)
+
 // Final reduce: pick the global winner (max value, lowest index), remap the
 // draft-vocab index to a global token id, feed the chain, and stash this
 // step's INPUT embedding row (w1[chain[k]]) for the confidence-head features.

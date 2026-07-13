@@ -377,7 +377,7 @@ fn run_barrier_probe(n: usize, k: usize, depth: usize, chains: usize) -> Result<
         dst.push(device.new_buffer(n * 4, options).unwrap());
     }
 
-    let mut measure = |interleave: bool| -> Result<f64> {
+    let measure = |interleave: bool| -> Result<f64> {
         let mut sum_dt = 0f64;
         let mut iters = 0usize;
         for idx in 0.. {
@@ -1038,115 +1038,171 @@ fn run_markov_chain() -> Result<()> {
     chain_init[0] = anchor;
     let chain_bytes: Vec<u8> = chain_init.iter().flat_map(|x| x.to_le_bytes()).collect();
     let chain_buf = buf(&chain_bytes);
+    // Single-dispatch scratch: [gamma] u32 packed-max + [gamma] u32
+    // counters, zeroed once; the kernels self-clean after each step.
+    let fused_scratch = buf(&vec![0u8; GAMMA * 8]);
 
-    for (label, q8, remap) in [
-        ("q8+remap", true, true),
-        ("q8", true, false),
-        ("bf16+remap", false, true),
-        ("bf16", false, false),
-    ] {
-        let command_queue = device.new_command_queue().unwrap();
-        let commands = Commands::new(command_queue, &residency_set).unwrap();
-        let encoder = commands.command_encoder().unwrap();
-        call_markov_chain(
-            &device,
-            &encoder,
-            &kernels,
-            MarkovChainArgs {
-                gamma: GAMMA,
-                draft_vocab: VD,
-                rank: R,
-                w2_q8: q8,
-                w1: (&w1_buf, 0),
-                w2: (if q8 { &w2q8_buf } else { &w2bf_buf }, 0),
-                base: (&base_buf, 0),
-                chain: &chain_buf,
-                partials: &partials,
-                ids: (&ids_buf, 0),
-                remap,
-                tokens: &tokens_buf,
-                prev_embs: &prev_embs_buf,
-            },
-        )?;
-        drop(encoder);
-        commands.wait_until_completed().unwrap();
+    let shapes: Vec<(&str, Option<&candle_metal_kernels::metal::Buffer>)> =
+        vec![("2-dispatch", None), ("1-dispatch", Some(&fused_scratch))];
 
-        let got = unsafe { std::slice::from_raw_parts(tokens_buf.contents() as *const u32, GAMMA) }
-            .to_vec();
-        let (expected, chain_inputs) = cpu_chain(q8, remap);
-        anyhow::ensure!(
-            got == expected,
-            "markov {label}: tokens {got:?} != cpu reference {expected:?}"
-        );
-        // prev_embs[k] must be w1[chain_input_k] bitwise.
-        let embs = unsafe {
-            std::slice::from_raw_parts(prev_embs_buf.contents() as *const u16, GAMMA * R)
-        };
-        for (k, &inp) in chain_inputs.iter().enumerate() {
-            for j in 0..R {
-                let want = w1[inp as usize * R + j].to_bits();
-                anyhow::ensure!(
-                    embs[k * R + j] == want,
-                    "markov {label}: prev_embs[{k},{j}] mismatch"
-                );
-            }
-        }
-        println!(
-            "markov-chain {label}: tokens + prev_embs match CPU reference bitwise ({GAMMA} steps)"
-        );
-    }
-
-    // Timing: full fused chain (2*gamma dispatches) per iteration.
-    const WARMUP_ITERS: usize = 3;
-    const MIN_DUR: f64 = 1.0;
-    for gamma in [1usize, 3, 6] {
-        let mut sum_dt = 0f64;
-        let mut iters = 0usize;
-        for idx in 0.. {
+    for (shape, scratch) in shapes.clone() {
+        for (label, q8, remap) in [
+            ("q8+remap", true, true),
+            ("q8", true, false),
+            ("bf16+remap", false, true),
+            ("bf16", false, false),
+        ] {
             let command_queue = device.new_command_queue().unwrap();
             let commands = Commands::new(command_queue, &residency_set).unwrap();
-            let inner = 64usize;
             let encoder = commands.command_encoder().unwrap();
-            let start_time = std::time::Instant::now();
-            for _ in 0..inner {
-                call_markov_chain(
-                    &device,
-                    &encoder,
-                    &kernels,
-                    MarkovChainArgs {
-                        gamma,
-                        draft_vocab: VD,
-                        rank: R,
-                        w2_q8: true,
-                        w1: (&w1_buf, 0),
-                        w2: (&w2q8_buf, 0),
-                        base: (&base_buf, 0),
-                        chain: &chain_buf,
-                        partials: &partials,
-                        ids: (&ids_buf, 0),
-                        remap: true,
-                        tokens: &tokens_buf,
-                        prev_embs: &prev_embs_buf,
-                    },
-                )?;
-            }
+            call_markov_chain(
+                &device,
+                &encoder,
+                &kernels,
+                MarkovChainArgs {
+                    gamma: GAMMA,
+                    draft_vocab: VD,
+                    rank: R,
+                    w2_q8: q8,
+                    w1: (&w1_buf, 0),
+                    w2: (if q8 { &w2q8_buf } else { &w2bf_buf }, 0),
+                    base: (&base_buf, 0),
+                    chain: &chain_buf,
+                    partials: &partials,
+                    ids: (&ids_buf, 0),
+                    remap,
+                    tokens: &tokens_buf,
+                    prev_embs: &prev_embs_buf,
+                    fused_scratch: scratch,
+                },
+            )?;
             drop(encoder);
             commands.wait_until_completed().unwrap();
-            let dt = start_time.elapsed().as_secs_f64();
-            if idx < WARMUP_ITERS {
-                continue;
+
+            let got =
+                unsafe { std::slice::from_raw_parts(tokens_buf.contents() as *const u32, GAMMA) }
+                    .to_vec();
+            let (expected, chain_inputs) = cpu_chain(q8, remap);
+            anyhow::ensure!(
+                got == expected,
+                "markov {shape} {label}: tokens {got:?} != cpu reference {expected:?}"
+            );
+            // prev_embs[k] must be w1[chain_input_k] bitwise.
+            let embs = unsafe {
+                std::slice::from_raw_parts(prev_embs_buf.contents() as *const u16, GAMMA * R)
+            };
+            for (k, &inp) in chain_inputs.iter().enumerate() {
+                for j in 0..R {
+                    let want = w1[inp as usize * R + j].to_bits();
+                    anyhow::ensure!(
+                        embs[k * R + j] == want,
+                        "markov {shape} {label}: prev_embs[{k},{j}] mismatch"
+                    );
+                }
             }
-            sum_dt += dt;
-            iters += inner;
-            if sum_dt > MIN_DUR {
-                break;
-            }
+            println!(
+                "markov-chain {shape} {label}: tokens + prev_embs match CPU reference bitwise ({GAMMA} steps)"
+            );
         }
-        let us = 1e6 * sum_dt / iters as f64;
-        println!(
-            "markov-chain q8+remap gamma={gamma}: {us:8.1} us/chain ({:.1} us/step) — legacy serial chain was ~1170 us/step on M3",
-            us / gamma as f64
-        );
+    }
+
+    // Scheduling-independence soak for the atomic single-dispatch shape: the
+    // last-TG epilogue's cross-location ordering is outside the MSL formal
+    // model, so hammer it — any race shows as a token mismatch.
+    {
+        let scratch = &fused_scratch;
+        let (expected, _) = cpu_chain(true, true);
+        for round in 0..200 {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            call_markov_chain(
+                &device,
+                &encoder,
+                &kernels,
+                MarkovChainArgs {
+                    gamma: GAMMA,
+                    draft_vocab: VD,
+                    rank: R,
+                    w2_q8: true,
+                    w1: (&w1_buf, 0),
+                    w2: (&w2q8_buf, 0),
+                    base: (&base_buf, 0),
+                    chain: &chain_buf,
+                    partials: &partials,
+                    ids: (&ids_buf, 0),
+                    remap: true,
+                    tokens: &tokens_buf,
+                    prev_embs: &prev_embs_buf,
+                    fused_scratch: Some(scratch),
+                },
+            )?;
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let got =
+                unsafe { std::slice::from_raw_parts(tokens_buf.contents() as *const u32, GAMMA) };
+            anyhow::ensure!(
+                got == expected.as_slice(),
+                "markov 1-dispatch soak round {round}: tokens {got:?} != {expected:?}"
+            );
+        }
+        println!("markov-chain 1-dispatch: 200-round soak bitwise-stable");
+    }
+
+    // Timing: full chain per iteration, both shapes.
+    const WARMUP_ITERS: usize = 3;
+    const MIN_DUR: f64 = 1.0;
+    for (shape, scratch) in shapes {
+        for gamma in [1usize, 3, 6] {
+            let mut sum_dt = 0f64;
+            let mut iters = 0usize;
+            for idx in 0.. {
+                let command_queue = device.new_command_queue().unwrap();
+                let commands = Commands::new(command_queue, &residency_set).unwrap();
+                let inner = 64usize;
+                let encoder = commands.command_encoder().unwrap();
+                let start_time = std::time::Instant::now();
+                for _ in 0..inner {
+                    call_markov_chain(
+                        &device,
+                        &encoder,
+                        &kernels,
+                        MarkovChainArgs {
+                            gamma,
+                            draft_vocab: VD,
+                            rank: R,
+                            w2_q8: true,
+                            w1: (&w1_buf, 0),
+                            w2: (&w2q8_buf, 0),
+                            base: (&base_buf, 0),
+                            chain: &chain_buf,
+                            partials: &partials,
+                            ids: (&ids_buf, 0),
+                            remap: true,
+                            tokens: &tokens_buf,
+                            prev_embs: &prev_embs_buf,
+                            fused_scratch: scratch,
+                        },
+                    )?;
+                }
+                drop(encoder);
+                commands.wait_until_completed().unwrap();
+                let dt = start_time.elapsed().as_secs_f64();
+                if idx < WARMUP_ITERS {
+                    continue;
+                }
+                sum_dt += dt;
+                iters += inner;
+                if sum_dt > MIN_DUR {
+                    break;
+                }
+            }
+            let us = 1e6 * sum_dt / iters as f64;
+            println!(
+                "markov-chain {shape} q8+remap gamma={gamma}: {us:8.1} us/chain ({:.1} us/step)",
+                us / gamma as f64
+            );
+        }
     }
     Ok(())
 }

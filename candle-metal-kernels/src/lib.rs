@@ -12,7 +12,7 @@ pub use kernels::{
     call_gated_delta_decode, call_markov_chain, call_mlx_gemm, call_mlx_gemv, call_skinny_gemm,
     cast::*, convolution::*, fill::*, indexing::*, quantized::*, random::*, reduce::*, sdpa::*,
     sort::*, ternary::*, unary, unary::*, GatedDeltaParams, GemmDType, GgmlDType,
-    MarkovChainArgs, MARKOV_NTG, MARKOV_TPG,
+    MarkovChainArgs, MARKOV_FUSED_MAX_VD, MARKOV_NTG, MARKOV_TPG,
 };
 use metal::{
     Buffer, CommandQueue, ComputeCommandEncoder, ComputePipeline, ConstantValues, Device, Function,

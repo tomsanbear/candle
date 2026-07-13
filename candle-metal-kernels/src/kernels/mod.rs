@@ -21,7 +21,7 @@ pub use affine::*;
 pub use binary::{call_binary_contiguous, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
-pub use dspark::{call_markov_chain, MarkovChainArgs, MARKOV_NTG, MARKOV_TPG};
+pub use dspark::{call_markov_chain, MarkovChainArgs, MARKOV_FUSED_MAX_VD, MARKOV_NTG, MARKOV_TPG};
 pub use fill::*;
 pub use gated_delta::{
     call_gated_delta_chunk, call_gated_delta_decode, call_gated_delta_v2,

@@ -8502,7 +8502,10 @@ typedef decltype(kernel_mul_mv_q8_0_mc_t<bfloat, bfloat>) mul_mv_q8_0_mc_bf16dst
 template [[host_name("kernel_mul_mv_q8_0_bf16_bf16_mc")]] kernel mul_mv_q8_0_mc_bf16dst_t kernel_mul_mv_q8_0_mc_t<bfloat, bfloat>;
 #endif
 
-#define NC_MV_Q4_K 4
+// 8 columns per pass covers the gamma-6 verify chunks (m <= 13) in at most
+// two weight reads instead of four; the 2026-07-13 micro gate measured the
+// per-column-group weight re-read as the m>4 slope (GB/s ~ 1/ceil(m/NC)).
+#define NC_MV_Q4_K 8
 
 template <typename YT, typename DT = float>
 kernel void kernel_mul_mv_q4_K_mc_t(

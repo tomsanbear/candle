@@ -548,7 +548,7 @@ pub fn call_quantized_matmul_mv_q4k_bf16_rowtile(
 pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
     match dtype {
         GgmlDType::Q8_0 => Some(8),
-        GgmlDType::Q4K => Some(4),
+        GgmlDType::Q4K => Some(8),
         GgmlDType::Q6K => Some(8),
         _ => None,
     }

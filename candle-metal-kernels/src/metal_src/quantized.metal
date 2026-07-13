@@ -4980,7 +4980,35 @@ kernel void kernel_mul_mv_q3_K_f32(
 // NSG-fold — the lm_head at 248094 rows launches 62k single-simdgroup TGs
 // against a measured 54.6% launch limiter. Per-row arithmetic is unchanged,
 // so results stay bit-identical across NSG.
-template <typename YT, typename DT = float, int NSG = 1>
+// NDST: rows per simdgroup. llama.cpp ships nr0=2 x nsg=2 (64-thread TGs)
+// and reaches 93% of DRAM roof on the 248094-row head where NDST=4/NSG=1
+// reaches 68% (M3 referee session, 2026-07-13) — fewer live accumulators
+// per thread and more resident simdgroups per core hide DRAM latency
+// better. Per-row arithmetic is NDST-independent: bit-identical outputs.
+
+// bf16 y-load: scalar bfloat loads don't vectorize (an f32-y arm of the
+// byte-identical kernel ran ~2x faster on the M4 head; an explicit scalar
+// shift-convert changed nothing, so the cost is load ISSUE RATE, not the
+// convert ALU). Each y group is 8 contiguous elements at 16B-aligned
+// offsets: load them as two ushort4 vectors and convert with a vector
+// shift (bf16->f32 IS the 16-bit left shift — bit-identical).
+template <typename T>
+inline void q4k_load_y8(device const T * p, thread float * dst) {
+    for (int i = 0; i < 8; ++i) {
+        dst[i] = float(p[i]);
+    }
+}
+template <>
+inline void q4k_load_y8(device const bfloat * p, thread float * dst) {
+    const ushort4 u0 = *(device const ushort4 *)(p + 0);
+    const ushort4 u1 = *(device const ushort4 *)(p + 4);
+    const float4 f0 = as_type<float4>(uint4(u0) << 16);
+    const float4 f1 = as_type<float4>(uint4(u1) << 16);
+    dst[0] = f0.x; dst[1] = f0.y; dst[2] = f0.z; dst[3] = f0.w;
+    dst[4] = f1.x; dst[5] = f1.y; dst[6] = f1.z; dst[7] = f1.w;
+}
+
+template <typename YT, typename DT = float, int NSG = 1, int NDST = N_DST>
 void kernel_mul_mv_q4_K_impl_t(
         device const  void * src0,
         device const    YT * src1,
@@ -5012,7 +5040,7 @@ void kernel_mul_mv_q4_K_impl_t(
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
-    const int first_row = (r0 * NSG + sgitg) * N_DST;
+    const int first_row = (r0 * NSG + sgitg) * NDST;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;
@@ -5025,7 +5053,7 @@ void kernel_mul_mv_q4_K_impl_t(
 
     float yl[16];
     float yh[16];
-    float sumf[N_DST]={0.f}, all_sum;
+    float sumf[NDST]={0.f}, all_sum;
 
     const int step = sizeof(block_q4_K) * nb / 2;
 
@@ -5037,18 +5065,22 @@ void kernel_mul_mv_q4_K_impl_t(
     for (int ib = ix; ib < nb; ib += 4) {
 
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        q4k_load_y8(y4 +   0, yl + 0);
+        q4k_load_y8(y4 +  32, yl + 8);
+        q4k_load_y8(y4 + 128, yh + 0);
+        q4k_load_y8(y4 + 160, yh + 8);
         for (int i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+            sumy[0] += yl[i+0];
+            sumy[1] += yl[i+8];
+            sumy[2] += yh[i+0];
+            sumy[3] += yh[i+8];
         }
 
         device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
         device const half     * dh = &x[ib].d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < NDST; row++) {
             // Tail guard: row reads below walk row*step into src0; rows past
             // ne01 would read out of bounds (uniform break, no divergence).
             if (first_row + row >= ne01) break;
@@ -5093,7 +5125,7 @@ void kernel_mul_mv_q4_K_impl_t(
         y4 += 4 * QK_K;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < NDST; ++row) {
         all_sum = simd_sum(sumf[row]);
         // ne01 need not be a multiple of the rows-per-threadgroup (e.g. the
         // 248094-row lm_head): the tail threadgroup must not write past dst.
@@ -5347,6 +5379,48 @@ kernel void NAME(                                                           \
 MV_Q4K_NSG(kernel_mul_mv_q4_K_bf16_bf16_nsg2, 2)
 MV_Q4K_NSG(kernel_mul_mv_q4_K_bf16_bf16_nsg4, 4)
 MV_Q4K_NSG(kernel_mul_mv_q4_K_bf16_bf16_nsg8, 8)
+
+// Full-geometry variant: NSG simdgroups x NDST rows each. YT selects the
+// activation dtype (the f32-y instantiation is the round-3 dtype
+// discriminator: same values as the bf16 arm, so outputs stay bitwise
+// comparable against the baseline).
+#define MV_Q4K_GEO(NAME, YT_T, NSG_N, NDST_N)                               \
+[[host_name(#NAME)]]                                                        \
+kernel void NAME(                                                           \
+        device const   void * src0,                                         \
+        device const   YT_T * src1,                                         \
+        device       bfloat * dst,                                          \
+        constant    int64_t & ne00,                                         \
+        constant    int64_t & ne01,                                         \
+        constant    int64_t & ne02,                                         \
+        constant   uint64_t & nb00,                                         \
+        constant   uint64_t & nb01,                                         \
+        constant   uint64_t & nb02,                                         \
+        constant    int64_t & ne10,                                         \
+        constant    int64_t & ne11,                                         \
+        constant    int64_t & ne12,                                         \
+        constant   uint64_t & nb10,                                         \
+        constant   uint64_t & nb11,                                         \
+        constant   uint64_t & nb12,                                         \
+        constant    int64_t & ne0,                                          \
+        constant    int64_t & ne1,                                          \
+        constant    uint    & r2,                                           \
+        constant    uint    & r3,                                           \
+        uint3 tgpig[[threadgroup_position_in_grid]],                        \
+        uint  tiisg[[thread_index_in_simdgroup]],                           \
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {                    \
+    kernel_mul_mv_q4_K_impl_t<YT_T, bfloat, NSG_N, NDST_N>(                 \
+        src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,       \
+        tgpig,tiisg,sgitg);                                                 \
+}
+
+// llama.cpp's shipped geometry (N_R0_Q4_K=2, N_SG_Q4_K=2).
+MV_Q4K_GEO(kernel_mul_mv_q4_K_bf16_bf16_nr2sg2, bfloat, 2, 2)
+// nr0=2 in the historical single-simdgroup layout (separates the NDST
+// effect from the TG-size effect).
+MV_Q4K_GEO(kernel_mul_mv_q4_K_bf16_bf16_nr2sg1, bfloat, 1, 2)
+// f32-activation arm of the baseline geometry (dtype discriminator).
+MV_Q4K_GEO(kernel_mul_mv_q4_K_f32y_bf16_base, float, 1, 4)
 
 // bf16 activations AND bf16 dst (see the q8_0 bf16_bf16 note).
 [[host_name("kernel_mul_mv_q4_K_bf16_bf16")]]

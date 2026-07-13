@@ -581,6 +581,71 @@ fn run_nsg_sweep(name: &str, n: usize, k: usize) -> Result<()> {
         let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
         println!("q4_K {name:>10} n={n:6} k={k:5} nsg={nsg}  {ms:8.3} ms  {gbs:6.1} GB/s");
     }
+
+    // Round-3 geometry arms: llama.cpp's nr0=2 x nsg=2 (64-thread TGs), the
+    // nr0=2 single-simdgroup control (separates NDST from TG size), and the
+    // f32-activation arm of the baseline geometry (dtype discriminator; the
+    // f32 y buffer carries the SAME values as the bf16 one, so outputs stay
+    // bitwise comparable).
+    let acts_f32: Vec<f32> = acts.iter().map(|v| v.to_f32()).collect();
+    let lhs_f32 = device
+        .new_buffer_with_data(
+            acts_f32.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts_f32.as_slice()),
+            options,
+        )
+        .unwrap();
+    let geo_arms: [(&str, (usize, usize, bool)); 3] = [
+        ("nr2sg2", (2, 2, false)),
+        ("nr2sg1", (1, 2, false)),
+        ("f32y  ", (1, 4, true)),
+    ];
+    for (label, geo) in geo_arms {
+        let y = if geo.2 { &lhs_f32 } else { &lhs };
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_nsg(
+            &device, &encoder, &kernels, 1, (1, m, n, k), &lhs, 0, &rhs, 0, &dst_ref,
+        )?;
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_geo(
+            &device, &encoder, &kernels, geo, (1, m, n, k), y, 0, &rhs, 0, &dst,
+        )?;
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let a = unsafe { std::slice::from_raw_parts(dst_ref.contents() as *const u16, m * n) };
+        let b = unsafe { std::slice::from_raw_parts(dst.contents() as *const u16, m * n) };
+        let diffs = (0..m * n).filter(|&i| a[i] != b[i]).count();
+        anyhow::ensure!(diffs == 0, "{label} diverges from baseline on {diffs} outputs");
+
+        let mut sum_dt = 0f64;
+        let mut iters = 0usize;
+        for idx in 0.. {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            let start_time = std::time::Instant::now();
+            for _ in 0..inner {
+                candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_geo(
+                    &device, &encoder, &kernels, geo, (1, m, n, k), y, 0, &rhs, 0, &dst,
+                )?;
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let dt = start_time.elapsed().as_secs_f64();
+            if idx < WARMUP_ITERS {
+                continue;
+            }
+            sum_dt += dt;
+            iters += inner;
+            if sum_dt > MIN_DUR {
+                break;
+            }
+        }
+        let ms = 1e3 * sum_dt / iters as f64;
+        let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
+        println!("q4_K {name:>10} n={n:6} k={k:5} {label} {ms:8.3} ms  {gbs:6.1} GB/s  (bitwise OK)");
+    }
     Ok(())
 }
 

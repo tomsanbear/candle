@@ -374,6 +374,90 @@ pub fn call_quantized_matmul_mv_q4k_bf16_nsg(
     Ok(())
 }
 
+/// Round-3 geometry variants: `nsg` simdgroups x `ndst` rows each, plus the
+/// f32-activation discriminator arm. Bit-identical per row to the baseline
+/// (per-row arithmetic is geometry-independent); only row->simdgroup
+/// assignment and threadgroup shape change. `f32_y` selects the f32-y
+/// instantiation of the BASELINE geometry (nsg/ndst ignored in that case).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16_geo(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (nsg, ndst, f32_y): (usize, usize, bool),
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let name = match (nsg, ndst, f32_y) {
+        (1, 4, true) => "kernel_mul_mv_q4_K_f32y_bf16_base",
+        (2, 2, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg2",
+        (1, 2, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg1",
+        _ => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "geo wants (2,2,false), (1,2,false) or (1,4,true)",
+                "qmatmul_mv_geo",
+            ))
+        }
+    };
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_geo{nsg}x{ndst} M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            ne12,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(n, ndst * nsg),
+        height: m,
+        depth: b,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 4,
+        height: 8,
+        depth: nsg,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// V5 experiment (thread-lifetime hypothesis): q4_K bf16/bf16 mv where each
 /// simdgroup processes `ntiles` consecutive 4-row groups sequentially —
 /// thread lifetime x ntiles, launch churn / ntiles, bit-identical per row.

@@ -387,16 +387,73 @@ pub fn call_mlx_gemv(
         (bm, bn, sm, sn, tm, 4usize)
     };
 
-    let dtype_str = match dtype {
-        GemmDType::F32 => "float32",
-        GemmDType::F16 => "float16",
-        GemmDType::BF16 => "bfloat16",
+    // Static kernel names for every tile combo the selection above can
+    // produce: dense GEMV is on the per-dispatch hot path (drafter dense
+    // layers, decay-gate projections) and a format! here costs a heap String
+    // + String cache key per dispatch. The format! fallback keeps any future
+    // tile combo working until its static is added.
+    macro_rules! gv_name {
+        ($prefix:literal, $dt:literal, $bm:literal, $bn:literal, $sm:literal, $sn:literal, $tm:literal, $tn:literal) => {
+            concat!(
+                $prefix, "_", $dt, "_bm", $bm, "_bn", $bn, "_sm", $sm, "_sn", $sn, "_tm", $tm,
+                "_tn", $tn, "_nc0_axpby0"
+            )
+        };
+    }
+    macro_rules! gv_names_for_dtype {
+        ($dt:literal) => {
+            if transpose_mat {
+                match (bn, sm, sn, tn) {
+                    (16, 4, 8, 4) => Some(gv_name!("gemv_t", $dt, 1, 16, 4, 8, 4, 4)),
+                    (16, 4, 8, 1) => Some(gv_name!("gemv_t", $dt, 1, 16, 4, 8, 4, 1)),
+                    (16, 8, 4, 4) => Some(gv_name!("gemv_t", $dt, 1, 16, 8, 4, 4, 4)),
+                    (16, 8, 4, 1) => Some(gv_name!("gemv_t", $dt, 1, 16, 8, 4, 4, 1)),
+                    (4, 4, 8, 4) => Some(gv_name!("gemv_t", $dt, 1, 4, 4, 8, 4, 4)),
+                    (4, 4, 8, 1) => Some(gv_name!("gemv_t", $dt, 1, 4, 4, 8, 4, 1)),
+                    (4, 8, 4, 4) => Some(gv_name!("gemv_t", $dt, 1, 4, 8, 4, 4, 4)),
+                    (4, 8, 4, 1) => Some(gv_name!("gemv_t", $dt, 1, 4, 8, 4, 4, 1)),
+                    (2, 4, 8, 4) => Some(gv_name!("gemv_t", $dt, 1, 2, 4, 8, 4, 4)),
+                    (2, 4, 8, 1) => Some(gv_name!("gemv_t", $dt, 1, 2, 4, 8, 4, 1)),
+                    (2, 8, 4, 4) => Some(gv_name!("gemv_t", $dt, 1, 2, 8, 4, 4, 4)),
+                    (2, 8, 4, 1) => Some(gv_name!("gemv_t", $dt, 1, 2, 8, 4, 4, 1)),
+                    _ => None,
+                }
+            } else {
+                match (bm, bn, sm, sn, tm) {
+                    (1, 1, 8, 4, 4) => Some(gv_name!("gemv", $dt, 1, 1, 8, 4, 4, 4)),
+                    (1, 1, 8, 4, 1) => Some(gv_name!("gemv", $dt, 1, 1, 8, 4, 1, 4)),
+                    (1, 8, 1, 32, 4) => Some(gv_name!("gemv", $dt, 1, 8, 1, 32, 4, 4)),
+                    (1, 8, 1, 32, 1) => Some(gv_name!("gemv", $dt, 1, 8, 1, 32, 1, 4)),
+                    (8, 1, 1, 32, 4) => Some(gv_name!("gemv", $dt, 8, 1, 1, 32, 4, 4)),
+                    (8, 1, 1, 32, 1) => Some(gv_name!("gemv", $dt, 8, 1, 1, 32, 1, 4)),
+                    (4, 1, 1, 32, 4) => Some(gv_name!("gemv", $dt, 4, 1, 1, 32, 4, 4)),
+                    (4, 1, 1, 32, 1) => Some(gv_name!("gemv", $dt, 4, 1, 1, 32, 1, 4)),
+                    _ => None,
+                }
+            }
+        };
+    }
+    let static_name: Option<&'static str> = match dtype {
+        GemmDType::F32 => gv_names_for_dtype!("float32"),
+        GemmDType::F16 => gv_names_for_dtype!("float16"),
+        GemmDType::BF16 => gv_names_for_dtype!("bfloat16"),
     };
-    let kernel_prefix = if transpose_mat { "gemv_t" } else { "gemv" };
-    let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0",
-        kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn
-    );
+    let name: crate::KernelName = match static_name {
+        Some(name) => name.into(),
+        None => {
+            let dtype_str = match dtype {
+                GemmDType::F32 => "float32",
+                GemmDType::F16 => "float16",
+                GemmDType::BF16 => "bfloat16",
+            };
+            let kernel_prefix = if transpose_mat { "gemv_t" } else { "gemv" };
+            format!(
+                "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0",
+                kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn
+            )
+            .into()
+        }
+    };
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
     let encoder = ep.encoder();

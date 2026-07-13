@@ -59,8 +59,35 @@ impl From<String> for KernelName {
     }
 }
 
-type Libraries = HashMap<Source, Library>;
-type Pipelines = HashMap<(KernelName, Option<ConstantValues>), ComputePipeline>;
+/// Multiply-xor hasher (the FxHash construction) for the kernel caches: the
+/// pipeline map is probed once per dispatch with a short kernel-name key, and
+/// SipHash's per-probe setup dominates that hit path. DoS resistance is
+/// irrelevant here — keys are compile-time kernel names, never external input.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.hash = (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(SEED);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+type Libraries = HashMap<Source, Library, FxBuildHasher>;
+type Pipelines = HashMap<(KernelName, Option<ConstantValues>), ComputePipeline, FxBuildHasher>;
 
 #[derive(Debug)]
 pub struct Kernels {
@@ -76,8 +103,8 @@ impl Default for Kernels {
 
 impl Kernels {
     pub fn new() -> Self {
-        let libraries = RwLock::new(Libraries::new());
-        let pipelines = RwLock::new(Pipelines::new());
+        let libraries = RwLock::new(Libraries::default());
+        let pipelines = RwLock::new(Pipelines::default());
         Self {
             libraries,
             pipelines,
@@ -116,7 +143,14 @@ impl Kernels {
         device: &Device,
         source: Source,
     ) -> Result<Library, MetalKernelError> {
+        // Fast path: cache hits (every call after the first per source) take
+        // only a shared read lock.
+        if let Some(lib) = self.libraries.read()?.get(&source) {
+            return Ok(lib.clone());
+        }
         let mut libraries = self.libraries.write()?;
+        // Re-probe under the write lock: another thread may have compiled
+        // this source between the read and write acquisitions.
         if let Some(lib) = libraries.get(&source) {
             Ok(lib.clone())
         } else {
@@ -155,8 +189,15 @@ impl Kernels {
         name: impl Into<KernelName>,
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipeline, MetalKernelError> {
-        let mut pipelines = self.pipelines.write()?;
         let key = (name.into(), constants);
+        // Fast path: cache hits (the per-dispatch steady state) take only a
+        // shared read lock.
+        if let Some(pipeline) = self.pipelines.read()?.get(&key) {
+            return Ok(pipeline.clone());
+        }
+        let mut pipelines = self.pipelines.write()?;
+        // Re-probe under the write lock: another thread may have built this
+        // pipeline between the read and write acquisitions.
         if let Some(pipeline) = pipelines.get(&key) {
             Ok(pipeline.clone())
         } else {

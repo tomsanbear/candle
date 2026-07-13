@@ -9,24 +9,26 @@ use crate::{get_tile_size, linear_split};
 ops!(badd, bsub, bmul, bdiv, bminimum, bmaximum, eq, ne, le, lt, ge, gt);
 
 #[allow(clippy::too_many_arguments)]
-pub fn call_binary_contiguous<S: ToString>(
+pub fn call_binary_contiguous(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
-    kernel_name: S,
+    kernel_name: impl Into<crate::KernelName>,
     dtype_size: usize,
     length: usize,
     left: BufferOffset,
     right: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let kernel_name = kernel_name.to_string();
+    // &'static str callers stay allocation-free end-to-end (KernelName::Ref
+    // clones are pointer copies); String callers keep working.
+    let kernel_name = kernel_name.into();
     let pipeline = kernels.load_pipeline(device, Source::Binary, kernel_name.clone())?;
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "binary {kernel_name} elems={length}");
+    debug_group!(encoder, "binary {} elems={length}", kernel_name.as_ref());
 
     set_params!(encoder, (length, &left, &right, Output::new(output)));
 
@@ -39,11 +41,11 @@ pub fn call_binary_contiguous<S: ToString>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn call_binary_strided<S: ToString>(
+pub fn call_binary_strided(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
-    kernel_name: S,
+    kernel_name: impl Into<crate::KernelName>,
     dtype_size: usize,
     shape: &[usize],
     left_input: BufferOffset,
@@ -52,7 +54,7 @@ pub fn call_binary_strided<S: ToString>(
     right_strides: &[usize],
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let kernel_name = kernel_name.to_string();
+    let kernel_name = kernel_name.into();
     let pipeline = kernels.load_pipeline(device, Source::Binary, kernel_name.clone())?;
 
     let num_dims: usize = shape.len();
@@ -64,7 +66,11 @@ pub fn call_binary_strided<S: ToString>(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
 
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "binary_strided {kernel_name} elems={length}");
+    debug_group!(
+        encoder,
+        "binary_strided {} elems={length}",
+        kernel_name.as_ref()
+    );
     set_params!(
         encoder,
         (

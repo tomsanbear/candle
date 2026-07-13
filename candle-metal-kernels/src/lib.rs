@@ -6,7 +6,7 @@ pub mod source;
 pub mod utils;
 
 pub use err::MetalKernelError;
-pub use kernel::Kernels;
+pub use kernel::{KernelName, Kernels};
 pub use kernels::{
     affine::*, call_binary_contiguous, call_binary_strided, call_gated_delta_chunk,
     call_gated_delta_decode, call_mlx_gemm, call_mlx_gemv, call_skinny_gemm, cast::*,

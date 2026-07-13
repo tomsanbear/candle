@@ -4,7 +4,6 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
-use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
     metal::{Buffer, Commands, Device, ResidencySet},
     BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
@@ -2001,9 +2000,73 @@ impl MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        fn kernel_name(op: &'static str, dtype: &DType, suffix: &str) -> String {
-            format!("{op}_{}{}", dtype.as_str(), suffix)
+        // Variant order shared by the static tables and the format! fallback.
+        const SUFFIXES: [&str; 9] = [
+            "",
+            "_scalar",
+            "_sc",
+            "_rss",
+            "_cs",
+            "_lss",
+            "_rstrided",
+            "_lstrided",
+            "_strided",
+        ];
+        macro_rules! variants_for {
+            ($op:literal, $dt:literal) => {
+                [
+                    concat!($op, "_", $dt),
+                    concat!($op, "_", $dt, "_scalar"),
+                    concat!($op, "_", $dt, "_sc"),
+                    concat!($op, "_", $dt, "_rss"),
+                    concat!($op, "_", $dt, "_cs"),
+                    concat!($op, "_", $dt, "_lss"),
+                    concat!($op, "_", $dt, "_rstrided"),
+                    concat!($op, "_", $dt, "_lstrided"),
+                    concat!($op, "_", $dt, "_strided"),
+                ]
+            };
         }
+        // Static kernel names for every (op, dtype) the metal binary source
+        // instantiates: the hot decode path (badd/bmul per layer per token)
+        // otherwise heap-allocates a name String per dispatch and hashes it
+        // as a String pipeline-cache key.
+        macro_rules! op_tables {
+            ($($opname:literal),+ $(,)?) => {
+                fn static_binary_names(
+                    op: &str,
+                    dtype: DType,
+                ) -> Option<&'static [&'static str; 9]> {
+                    let dt_idx = match dtype {
+                        DType::F32 => 0usize,
+                        DType::F16 => 1,
+                        DType::BF16 => 2,
+                        DType::U8 => 3,
+                        DType::U32 => 4,
+                        DType::I64 => 5,
+                        _ => return None,
+                    };
+                    match op {
+                        $($opname => {
+                            static NAMES: [[&str; 9]; 6] = [
+                                variants_for!($opname, "f32"),
+                                variants_for!($opname, "f16"),
+                                variants_for!($opname, "bf16"),
+                                variants_for!($opname, "u8"),
+                                variants_for!($opname, "u32"),
+                                variants_for!($opname, "i64"),
+                            ];
+                            Some(&NAMES[dt_idx])
+                        })+
+                        _ => None,
+                    }
+                }
+            };
+        }
+        op_tables!(
+            "badd", "bsub", "bmul", "bdiv", "bminimum", "bmaximum", "eq", "ne", "le", "lt", "ge",
+            "gt",
+        );
         let device = self.device();
         let shape = lhs_l.shape();
         let el_count = shape.elem_count();
@@ -2020,20 +2083,24 @@ impl MetalStorage {
         let lhs_contiguous = lhs_l.is_contiguous();
         let rhs_contiguous = rhs_l.is_contiguous();
 
-        let contiguous_kernel = kernel_name(op, &self.dtype, "");
-        let kernel = match (lhs_is_scalar, rhs_is_scalar, lhs_contiguous, rhs_contiguous) {
-            (true, true, _, _) => kernel_name(op, &self.dtype, "_scalar"),
-            (true, false, _, true) => kernel_name(op, &self.dtype, "_sc"),
-            (true, false, _, false) => kernel_name(op, &self.dtype, "_rss"),
-            (false, true, true, _) => kernel_name(op, &self.dtype, "_cs"),
-            (false, true, false, _) => kernel_name(op, &self.dtype, "_lss"),
-            (false, false, true, true) => contiguous_kernel.clone(),
-            (false, false, true, false) => kernel_name(op, &self.dtype, "_rstrided"),
-            (false, false, false, true) => kernel_name(op, &self.dtype, "_lstrided"),
-            (false, false, false, false) => kernel_name(op, &self.dtype, "_strided"),
+        let variant = match (lhs_is_scalar, rhs_is_scalar, lhs_contiguous, rhs_contiguous) {
+            (true, true, _, _) => 1,
+            (true, false, _, true) => 2,
+            (true, false, _, false) => 3,
+            (false, true, true, _) => 4,
+            (false, true, false, _) => 5,
+            (false, false, true, true) => 0,
+            (false, false, true, false) => 6,
+            (false, false, false, true) => 7,
+            (false, false, false, false) => 8,
         };
+        let kernel: candle_metal_kernels::KernelName =
+            match static_binary_names(op, self.dtype) {
+                Some(table) => table[variant].into(),
+                None => format!("{op}_{}{}", self.dtype.as_str(), SUFFIXES[variant]).into(),
+            };
 
-        let buffer = if kernel == contiguous_kernel {
+        let buffer = if variant == 0 {
             let buffer = device
                 .new_buffer_builder()
                 .with_size_for(el_count, dtype)

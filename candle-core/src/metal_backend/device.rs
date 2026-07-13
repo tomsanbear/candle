@@ -251,6 +251,14 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Commit the current command buffer without waiting. Required before
+    /// blocking on a shared-event value whose signal may still sit in the
+    /// un-committed buffer (nothing else would ever submit it).
+    pub fn flush(&self) -> Result<()> {
+        self.commands.flush().map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn wait_until_completed(&self) -> Result<()> {
         self.commands
             .wait_until_completed()

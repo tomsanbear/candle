@@ -32,6 +32,50 @@ struct markov_partial {
 constexpr constant uint Q8_BLOCK = 32;
 constexpr constant uint Q8_BLOCK_BYTES = 34;
 
+// Per-row score on the legacy dtype path (f32 accumulate -> bf16 round, add
+// base in f32 -> bf16 round; the caller compares the f32 upcast). Quant
+// bytes load as packed_char4 — the 34-byte q8_0 blocks are 2-aligned at
+// best, and scalar byte loads left the in-situ kernel latency-bound at
+// ~16 GB/s effective (2026-07-13 chain-eval: 573us/step vs 78us isolated).
+// Additions keep strict sequential order so the same-order CPU reference
+// reproduces scores bitwise.
+template <bool Q8>
+inline float markov_row_score(
+        device const uchar * w2,
+        threadgroup const float * pe,
+        uint row,
+        uint r) {
+    float acc = 0.0f;
+    if (Q8) {
+        device const uchar * rp = w2 + (ulong)row * (r / Q8_BLOCK) * Q8_BLOCK_BYTES;
+        for (uint b = 0; b < r / Q8_BLOCK; ++b) {
+            const float d = float(*(device const half *)rp);
+            device const packed_char4 * qs = (device const packed_char4 *)(rp + 2);
+            threadgroup const float * p = pe + b * Q8_BLOCK;
+            float bsum = 0.0f;
+            for (uint j = 0; j < Q8_BLOCK / 4; ++j) {
+                const packed_char4 q = qs[j];
+                bsum += float(q.x) * p[4 * j];
+                bsum += float(q.y) * p[4 * j + 1];
+                bsum += float(q.z) * p[4 * j + 2];
+                bsum += float(q.w) * p[4 * j + 3];
+            }
+            acc += d * bsum;
+            rp += Q8_BLOCK_BYTES;
+        }
+    } else {
+        device const bfloat * wrow = (device const bfloat *)w2 + (ulong)row * r;
+        for (uint j = 0; j < r / 4; ++j) {
+            const bfloat4 wv = ((device const bfloat4 *)wrow)[j];
+            acc += float(wv.x) * pe[4 * j];
+            acc += float(wv.y) * pe[4 * j + 1];
+            acc += float(wv.z) * pe[4 * j + 2];
+            acc += float(wv.w) * pe[4 * j + 3];
+        }
+    }
+    return acc;
+}
+
 template <bool Q8>
 void markov_step_partial_impl(
         device const bfloat * w1,          // [vocab_full, r] bf16
@@ -57,28 +101,9 @@ void markov_step_partial_impl(
     float best = -INFINITY;
     uint best_idx = 0xFFFFFFFFu;
     for (uint row = tgid * MARKOV_TPG + tid; row < vd; row += ntg * MARKOV_TPG) {
-        float acc = 0.0f;
-        if (Q8) {
-            device const uchar * rp = w2 + (ulong)row * (r / Q8_BLOCK) * Q8_BLOCK_BYTES;
-            for (uint b = 0; b < r / Q8_BLOCK; ++b) {
-                const float d = float(*(device const half *)rp);
-                device const char * qs = (device const char *)(rp + 2);
-                float bsum = 0.0f;
-                for (uint j = 0; j < Q8_BLOCK; ++j) {
-                    bsum += float(qs[j]) * pe[b * Q8_BLOCK + j];
-                }
-                acc += d * bsum;
-                rp += Q8_BLOCK_BYTES;
-            }
-        } else {
-            device const bfloat * wrow = (device const bfloat *)w2 + (ulong)row * r;
-            for (uint j = 0; j < r; ++j) {
-                acc += float(wrow[j]) * pe[j];
-            }
-        }
         // Mirror the legacy dtype path: gemv stores bf16, the add runs at
         // f32 and stores bf16, argmax compares the f32 upcast.
-        float v = float(bfloat(acc));
+        float v = float(bfloat(markov_row_score<Q8>(w2, pe, row, r)));
         v = float(bfloat(v + float(base[(ulong)k * vd + row])));
         if (v > best) {
             best = v;
@@ -198,26 +223,7 @@ void markov_step_fused_impl(
     float bval = -INFINITY;
     uint bidx = 0xFFFFFFFFu;
     for (uint row = tgid * MARKOV_TPG + tid; row < vd; row += ntg * MARKOV_TPG) {
-        float acc = 0.0f;
-        if (Q8) {
-            device const uchar * rp = w2 + (ulong)row * (r / Q8_BLOCK) * Q8_BLOCK_BYTES;
-            for (uint b = 0; b < r / Q8_BLOCK; ++b) {
-                const float d = float(*(device const half *)rp);
-                device const char * qs = (device const char *)(rp + 2);
-                float bsum = 0.0f;
-                for (uint j = 0; j < Q8_BLOCK; ++j) {
-                    bsum += float(qs[j]) * pe[b * Q8_BLOCK + j];
-                }
-                acc += d * bsum;
-                rp += Q8_BLOCK_BYTES;
-            }
-        } else {
-            device const bfloat * wrow = (device const bfloat *)w2 + (ulong)row * r;
-            for (uint j = 0; j < r; ++j) {
-                acc += float(wrow[j]) * pe[j];
-            }
-        }
-        float v = float(bfloat(acc));
+        float v = float(bfloat(markov_row_score<Q8>(w2, pe, row, r)));
         v = float(bfloat(v + float(base[(ulong)k * vd + row])));
         if (v > bval) {
             bval = v;

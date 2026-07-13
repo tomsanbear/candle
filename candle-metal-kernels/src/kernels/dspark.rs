@@ -13,6 +13,10 @@ pub const MARKOV_TPG: usize = 256;
 /// Threadgroups for the partial pass; the reduce pass consumes this many
 /// partials in one threadgroup.
 pub const MARKOV_NTG: usize = 64;
+/// Threadgroups for the single-dispatch step: one row per thread at the
+/// 32768-row cap (the lone in-situ dispatch is latency-bound, so parallelism
+/// beats per-thread reuse; the atomic reduction has no partials-array bound).
+pub const MARKOV_FUSED_NTG: usize = 128;
 
 pub struct MarkovChainArgs<'a> {
     /// Steps to draft (gamma).
@@ -110,6 +114,11 @@ pub fn call_markov_chain(
             "markov_step_fused_bf16"
         };
         let fused = kernels.load_pipeline(device, Source::Dspark, name)?;
+        let tg_fused = MTLSize {
+            width: MARKOV_FUSED_NTG,
+            height: 1,
+            depth: 1,
+        };
         for k in 0..args.gamma as u32 {
             encoder.set_compute_pipeline_state(&fused);
             #[cfg(feature = "debug-labels")]
@@ -131,7 +140,7 @@ pub fn call_markov_chain(
                     use_remap
                 )
             );
-            encoder.dispatch_thread_groups(tg_grid, tpg);
+            encoder.dispatch_thread_groups(tg_fused, tpg);
         }
         return Ok(());
     }

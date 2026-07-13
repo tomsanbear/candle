@@ -295,6 +295,41 @@ pub fn call_rms_norm_add(
     Ok(())
 }
 
+/// Fused SwiGLU: `out[rows, inter] = silu(gate) * up`, where `gate_up` packs
+/// `[gate | up]` per row (`[rows, 2*inter]`). See swiglu in reduce.metal.
+#[allow(clippy::too_many_arguments)]
+pub fn call_swiglu(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    rows: usize,
+    inter: usize,
+    gate_up: &Buffer,
+    gate_up_offset: usize,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "swiglu {kernel_name} rows={rows} inter={inter}");
+
+    let total = rows * inter;
+    set_params!(
+        encoder,
+        (
+            (gate_up, gate_up_offset),
+            Output::new(out),
+            inter as u32,
+            total as u32
+        )
+    );
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, total);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_layer_norm(
     device: &Device,

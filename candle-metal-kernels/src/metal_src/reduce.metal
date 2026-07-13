@@ -1600,6 +1600,42 @@ METAL_FUNC void rms_norm_add(
     }
 }
 
+// Fused SwiGLU: out = silu(gate) * up, where `gate_up` packs [gate | up]
+// per row ([rows, 2*inter]) and out is [rows, inter]. Collapses the
+// silu(gate) unary dispatch + the gate*up bmul dispatch into one. Elementwise
+// (one thread per output element), no reduction. Reads the packed projection
+// output directly — no narrow/copy of the two halves.
+template<typename T>
+METAL_FUNC void swiglu(
+    device const T *gate_up,
+    device T *out,
+    constant uint &inter,
+    constant uint &total,
+    uint gid
+) {
+    if (gid >= total) {
+        return;
+    }
+    const uint row = gid / inter;
+    const uint col = gid - row * inter;
+    const ulong gbase = (ulong)row * 2u * (ulong)inter;
+    const float g = static_cast<float>(gate_up[gbase + col]);
+    const float u = static_cast<float>(gate_up[gbase + inter + col]);
+    const float act = g / (1.0f + metal::precise::exp(-g));
+    out[gid] = static_cast<T>(act * u);
+}
+
+#define SWIGLU(NAME, T)                                         \
+kernel void NAME(                                               \
+    device const T *gate_up,                                    \
+    device T *out,                                              \
+    constant uint &inter,                                       \
+    constant uint &total,                                       \
+    uint gid [[ thread_position_in_grid ]]                      \
+) {                                                             \
+    swiglu<T>(gate_up, out, inter, total, gid);                \
+}
+
 #define RMS_NORM_ADD(NAME, T)                                   \
 kernel void NAME(                                               \
     device const T *a,                                          \
@@ -1624,6 +1660,8 @@ impl_rms_norm(rmsnorm_f32, float)
 impl_rms_norm(rmsnorm_f16, half)
 RMS_NORM_ADD(rmsnorm_add_f32, float)
 RMS_NORM_ADD(rmsnorm_add_f16, half)
+SWIGLU(swiglu_f32, float)
+SWIGLU(swiglu_f16, half)
 impl_layer_norm(layernorm_f32, float)
 impl_layer_norm(layernorm_f16, half)
 ROPE(rope_f32, rope_i_f32, rope_thd_f32, float)
@@ -1687,6 +1725,7 @@ impl_softmax(softmax_bf16, bfloat)
 
 impl_rms_norm(rmsnorm_bf16, bfloat)
 RMS_NORM_ADD(rmsnorm_add_bf16, bfloat)
+SWIGLU(swiglu_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 ROPE_PARTIAL(rope_partial_bf16, bfloat)

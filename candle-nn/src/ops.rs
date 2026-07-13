@@ -41,9 +41,13 @@ pub fn silu(xs: &Tensor) -> Result<Tensor> {
     xs.silu()
 }
 
+/// SwiGLU over a packed `[.., 2*inter]` gate/up tensor: `silu(gate) * up`,
+/// gate = first half, up = second half of the last dim. Fused into a single
+/// kernel (one thread per output element) instead of chunk + silu + mul;
+/// output differs from the split form only by keeping the silu in the f32
+/// domain before the multiply (the split form rounds to storage dtype).
 pub fn swiglu(xs: &Tensor) -> Result<Tensor> {
-    let xs = xs.chunk(2, D::Minus1)?;
-    &xs[0].silu()? * &xs[1]
+    xs.apply_op1_no_bwd(&SwiGlu)
 }
 
 struct Sigmoid;
@@ -437,6 +441,109 @@ impl candle::CustomOp1 for SoftmaxLastDim {
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
+
+/// Fused SwiGLU over a packed `[.., 2*inter]` gate/up projection: returns
+/// `silu(gate) * up` with shape `[.., inter]`, gate = first half, up =
+/// second half of the last dim. One kernel instead of narrow + silu + mul.
+#[derive(Debug, Clone)]
+struct SwiGlu;
+
+impl candle::CustomOp1 for SwiGlu {
+    fn name(&self) -> &'static str {
+        "swiglu"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        fn inner<T: candle::WithDType + num_traits::Float>(
+            src: &[T],
+            layout: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("swiglu input must be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let dims = layout.shape().dims();
+            let two_inter = dims[dims.len() - 1];
+            if two_inter % 2 != 0 {
+                candle::bail!("swiglu last dim {two_inter} must be even");
+            }
+            let inter = two_inter / 2;
+            let rows: usize = dims[..dims.len() - 1].iter().product();
+            let mut out = vec![T::zero(); rows * inter];
+            for r in 0..rows {
+                let gbase = r * two_inter;
+                let obase = r * inter;
+                for c in 0..inter {
+                    let g = src[gbase + c].to_f32().unwrap();
+                    let u = src[gbase + inter + c].to_f32().unwrap();
+                    let act = g / (1.0 + (-g).exp());
+                    out[obase + c] = T::from(act * u).unwrap();
+                }
+            }
+            let mut oshape = dims[..dims.len() - 1].to_vec();
+            oshape.push(inter);
+            Ok((candle::WithDType::to_cpu_storage_owned(out), oshape.into()))
+        }
+        use CpuStorage::{BF16, F16, F32, F64};
+        match storage {
+            BF16(s) => inner(s, layout),
+            F16(s) => inner(s, layout),
+            F32(s) => inner(s, layout),
+            F64(s) => inner(s, layout),
+            _ => candle::bail!("unsupported dtype for swiglu"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        storage: &candle::MetalStorage,
+        layout: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        let device = storage.device();
+        if !layout.is_contiguous() {
+            candle::bail!("swiglu input must be contiguous");
+        }
+        let dims = layout.shape().dims();
+        let two_inter = dims[dims.len() - 1];
+        if two_inter % 2 != 0 {
+            candle::bail!("swiglu last dim {two_inter} must be even");
+        }
+        let inter = two_inter / 2;
+        let rows: usize = dims[..dims.len() - 1].iter().product();
+        let name = match storage.dtype() {
+            DType::F32 => "swiglu_f32",
+            DType::F16 => "swiglu_f16",
+            DType::BF16 => "swiglu_bf16",
+            dt => candle::bail!("swiglu is not implemented for {dt:?}"),
+        };
+        let encoder = device.command_encoder()?;
+        encoder.set_label("swiglu");
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(rows * inter, storage.dtype())
+            .with_label("swiglu")
+            .build()?;
+        candle_metal_kernels::call_swiglu(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            name,
+            rows,
+            inter,
+            storage.buffer(),
+            layout.start_offset() * storage.dtype().size_in_bytes(),
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let mut oshape = dims[..dims.len() - 1].to_vec();
+        oshape.push(inter);
+        let out = candle::MetalStorage::new(output, device.clone(), rows * inter, storage.dtype());
+        Ok((out, oshape.into()))
+    }
+}
+
 
 #[derive(Debug, Clone)]
 struct RmsNorm {

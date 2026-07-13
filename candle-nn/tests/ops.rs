@@ -294,6 +294,26 @@ fn rope(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn swiglu(device: &Device) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let (rows, inter) = (7, 48);
+    let mut rng = StdRng::seed_from_u64(299792458);
+    let src: Vec<f32> = (0..rows * 2 * inter)
+        .map(|_| rng.random::<f32>() * 4.0 - 2.0)
+        .collect();
+    let xs = Tensor::from_vec(src, (rows, 2 * inter), device)?;
+    let fused = candle_nn::ops::swiglu(&xs)?;
+    // Reference: silu(first half) * second half.
+    let gate = xs.narrow(candle::D::Minus1, 0, inter)?;
+    let up = xs.narrow(candle::D::Minus1, inter, inter)?;
+    let reference = (gate.silu()? * up)?;
+    assert_eq!(fused.dims(), &[rows, inter]);
+    let sum_diff = (fused - reference)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    // f32 kernel keeps silu in f32 like the reference -> exact on f32.
+    assert!(sum_diff < 1e-4, "swiglu diff {sum_diff}");
+    Ok(())
+}
+
 fn rope_partial(device: &Device) -> Result<()> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -418,6 +438,7 @@ test_device!(
     rope_partial_gpu,
     rope_partial_metal
 );
+test_device!(swiglu, swiglu_cpu, swiglu_gpu, swiglu_metal);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);

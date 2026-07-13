@@ -294,6 +294,50 @@ fn rope(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn rope_partial(device: &Device) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    // rotary_dim < head_dim: the partial kernel must be bit-identical to
+    // rope on the narrowed lanes + passthrough of the rest.
+    let (b_size, num_head, seq_len, head_dim, rotary_dim) = (2, 5, 10, 16, 8);
+    let el_count = b_size * num_head * seq_len * head_dim;
+    let mut rng = StdRng::seed_from_u64(299792458);
+    let src: Vec<f32> = (0..el_count).map(|_| rng.random::<f32>()).collect();
+    let cos: Vec<f32> = (0..seq_len * rotary_dim / 2)
+        .map(|_| rng.random::<f32>())
+        .collect();
+    let sin: Vec<f32> = (0..seq_len * rotary_dim / 2)
+        .map(|_| rng.random::<f32>())
+        .collect();
+    let src = Tensor::from_vec(src, (b_size, num_head, seq_len, head_dim), device)?;
+    let cos = Tensor::from_vec(cos, (seq_len, rotary_dim / 2), device)?;
+    let sin = Tensor::from_vec(sin, (seq_len, rotary_dim / 2), device)?;
+    let partial = candle_nn::rotary_emb::rope_partial(&src, &cos, &sin)?;
+    let composed = {
+        let rot = src.narrow(candle::D::Minus1, 0, rotary_dim)?.contiguous()?;
+        let rot = candle_nn::rotary_emb::rope(&rot, &cos, &sin)?;
+        let pass = src.narrow(candle::D::Minus1, rotary_dim, head_dim - rotary_dim)?;
+        Tensor::cat(&[&rot, &pass], candle::D::Minus1)?
+    };
+    let sum_diff = (partial - composed)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    assert_eq!(sum_diff, 0.);
+
+    // rd == d degenerates to plain rope.
+    let cos_full: Vec<f32> = (0..seq_len * head_dim / 2)
+        .map(|_| rng.random::<f32>())
+        .collect();
+    let sin_full: Vec<f32> = (0..seq_len * head_dim / 2)
+        .map(|_| rng.random::<f32>())
+        .collect();
+    let cos_full = Tensor::from_vec(cos_full, (seq_len, head_dim / 2), device)?;
+    let sin_full = Tensor::from_vec(sin_full, (seq_len, head_dim / 2), device)?;
+    let partial = candle_nn::rotary_emb::rope_partial(&src, &cos_full, &sin_full)?;
+    let full = candle_nn::rotary_emb::rope(&src, &cos_full, &sin_full)?;
+    let sum_diff = (partial - full)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    assert_eq!(sum_diff, 0.);
+    Ok(())
+}
+
 fn rope_thd(device: &Device) -> Result<()> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -368,6 +412,12 @@ fn sigmoid(device: &Device) -> Result<()> {
 test_device!(ropei, ropei_cpu, ropei_gpu, ropei_metal);
 test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
+test_device!(
+    rope_partial,
+    rope_partial_cpu,
+    rope_partial_gpu,
+    rope_partial_metal
+);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);

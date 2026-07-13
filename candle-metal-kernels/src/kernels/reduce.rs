@@ -425,3 +425,53 @@ pub fn call_rope(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Partial-rotary rope: rotates the first `rd` lanes of each `d`-wide head
+/// row, copies lanes [rd, d) through. Bit-identical to
+/// narrow(0, rd) + rope + cat with the passthrough lanes, in one dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rope_partial(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    bh: usize,
+    td: usize,
+    d: usize,
+    rd: usize,
+    stride_b: usize,
+    src: &Buffer,
+    src_offset: usize,
+    cos: &Buffer,
+    cos_offset: usize,
+    sin: &Buffer,
+    sin_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "rope_partial {kernel_name} bh={bh} td={td} d={d} rd={rd}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            bh,
+            td,
+            d,
+            rd,
+            stride_b,
+            (src, src_offset),
+            (cos, cos_offset),
+            (sin, sin_offset),
+            Output::new(output)
+        )
+    );
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}

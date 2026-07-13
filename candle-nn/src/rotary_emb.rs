@@ -580,6 +580,187 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
 }
 
+/// Partial-rotary variant of [`RotaryEmb`]: the rotary dim `rd = 2 *
+/// cos_width` may be smaller than the head dim; lanes [rd, d) pass through
+/// untouched. One kernel instead of narrow/contiguous/rope/cat, with
+/// bit-identical output to that composition.
+#[derive(Debug, Clone)]
+struct RotaryEmbPartial;
+
+impl candle::CustomOp3 for RotaryEmbPartial {
+    fn name(&self) -> &'static str {
+        "rotary-emb-partial"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        fn inner<T: candle::WithDType + num_traits::Float>(
+            src: &[T],
+            l_src: &Layout,
+            cos: &[T],
+            l_cos: &Layout,
+            sin: &[T],
+            l_sin: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match l_src.contiguous_offsets() {
+                None => candle::bail!("input src has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let cos = match l_cos.contiguous_offsets() {
+                None => candle::bail!("input cos has to be contiguous"),
+                Some((o1, o2)) => &cos[o1..o2],
+            };
+            let sin = match l_sin.contiguous_offsets() {
+                None => candle::bail!("input sin has to be contiguous"),
+                Some((o1, o2)) => &sin[o1..o2],
+            };
+            let (b, h, t, d) = l_src.shape().dims4()?;
+            let rd = 2 * l_cos.dims()[l_cos.dims().len() - 1];
+            let el_count = b * h * t * d;
+            let mut dst = vec![T::zero(); el_count];
+            src.chunks(t * d)
+                .zip(dst.chunks_mut(t * d))
+                .for_each(|(src, dst)| {
+                    for i_t in 0..t {
+                        for i_d in 0..rd / 2 {
+                            let i1 = i_t * d + i_d;
+                            let i2 = i1 + rd / 2;
+                            let i_cs = i_t * (rd / 2) + i_d;
+                            dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                            dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
+                        }
+                        for i_d in rd..d {
+                            dst[i_t * d + i_d] = src[i_t * d + i_d];
+                        }
+                    }
+                });
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, (b, h, t, d).into()))
+        }
+
+        use candle::backend::BackendStorage;
+        use CpuStorage::{BF16, F16, F32, F64};
+        match (s1, s2, s3) {
+            (BF16(s1), BF16(s2), BF16(s3)) => inner(s1, l1, s2, l2, s3, l3),
+            (F16(s1), F16(s2), F16(s3)) => inner(s1, l1, s2, l2, s3, l3),
+            (F32(s1), F32(s2), F32(s3)) => inner(s1, l1, s2, l2, s3, l3),
+            (F64(s1), F64(s2), F64(s3)) => inner(s1, l1, s2, l2, s3, l3),
+            _ => candle::bail!(
+                "unsupported dtype for rope_partial {:?} {:?} {:?}",
+                s1.dtype(),
+                s2.dtype(),
+                s3.dtype()
+            ),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        src: &candle::MetalStorage,
+        l_src: &Layout,
+        cos: &candle::MetalStorage,
+        l_cos: &Layout,
+        sin: &candle::MetalStorage,
+        l_sin: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        let device = src.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("rope_partial");
+        let kernels = device.kernels();
+        if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
+            candle::bail!(
+                "dtype mismatch in rope_partial {:?} {:?} {:?}",
+                src.dtype(),
+                cos.dtype(),
+                sin.dtype()
+            )
+        }
+        let name = match src.dtype() {
+            candle::DType::F32 => "rope_partial_f32",
+            candle::DType::F16 => "rope_partial_f16",
+            candle::DType::BF16 => "rope_partial_bf16",
+            dtype => candle::bail!("rope_partial is not implemented for {dtype:?}"),
+        };
+        let (b, h, t, d) = l_src.shape().dims4()?;
+        let rd = 2 * l_cos.dims()[l_cos.dims().len() - 1];
+        let el = b * h * t * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(el, src.dtype())
+            .with_label("rope_partial")
+            .build()?;
+        candle_metal_kernels::call_rope_partial(
+            device.metal_device(),
+            &encoder,
+            kernels,
+            name,
+            b * h,
+            t * d,
+            d,
+            rd,
+            0,
+            src.buffer(),
+            l_src.start_offset() * src.dtype().size_in_bytes(),
+            cos.buffer(),
+            l_cos.start_offset() * cos.dtype().size_in_bytes(),
+            sin.buffer(),
+            l_sin.start_offset() * sin.dtype().size_in_bytes(),
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
+        Ok((out, l_src.shape().clone()))
+    }
+}
+
+/// Applies rotary embeddings to the first `2 * cos_width` lanes of each head
+/// row of a contiguous [b, h, t, d] tensor, passing the remaining lanes
+/// through. `cos`/`sin` must be 2-D [t, rd/2] tables. Output is bit-identical
+/// to `cat([rope(xs.narrow(-1, 0, rd)), xs.narrow(-1, rd, d - rd)], -1)`.
+pub fn rope_partial(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let (_b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
+    let (cos_seq_len, cos_n_embd) = match cos.dims() {
+        &[t, r] => (t, r),
+        _ => candle::bail!("cos has to be 2D in rope_partial, got {:?}", cos.shape()),
+    };
+    let (sin_seq_len, sin_n_embd) = match sin.dims() {
+        &[t, r] => (t, r),
+        _ => candle::bail!("sin has to be 2D in rope_partial, got {:?}", sin.shape()),
+    };
+    let rd = 2 * cos_n_embd;
+    if sin_n_embd != cos_n_embd
+        || rd > n_embd
+        || seq_len > cos_seq_len
+        || seq_len > sin_seq_len
+    {
+        candle::bail!(
+            "inconsistent dims in rope_partial {:?} {:?} {:?}",
+            xs.shape(),
+            cos.shape(),
+            sin.shape()
+        )
+    }
+    if !xs.is_contiguous() {
+        candle::bail!("xs has to be contiguous in rope_partial")
+    }
+    if !cos.is_contiguous() {
+        candle::bail!("cos has to be contiguous in rope_partial")
+    }
+    if !sin.is_contiguous() {
+        candle::bail!("sin has to be contiguous in rope_partial")
+    }
+    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbPartial)
+}
+
 fn rotate_half(xs: &Tensor) -> Result<Tensor> {
     let last_dim = xs.dim(D::Minus1)?;
     let xs1 = xs.narrow(D::Minus1, 0, last_dim / 2)?;

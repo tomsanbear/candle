@@ -1414,6 +1414,53 @@ METAL_FUNC void rope(
     dst[i2] = src[i1] * s + src[i2] * c;
 }
 
+// Partial-rotary rope: rotates only the first `rd` lanes of each head row
+// (pair (i_d, i_d + rd/2), cos/sin indexed within the rd block) and copies
+// lanes [rd, d) through untouched — one kernel instead of the
+// narrow/contiguous/rope/cat dance callers with rotary_dim < head_dim
+// otherwise pay. The rotated lanes compute the exact expression the plain
+// rope kernel applies to a narrowed [.., rd] tensor, so outputs are
+// bit-identical to that composition. Grid: bh * td / 2 threads; the d/2 - rd/2
+// per-position threads left over from rotation each copy one passthrough pair.
+template<typename T>
+METAL_FUNC void rope_partial(
+    constant size_t &bh,
+    constant size_t &td,
+    constant size_t &d,
+    constant size_t &rd,
+    constant size_t &stride_b,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint idx
+) {
+    if (2 * idx >= bh * td) {
+        return;
+    }
+    size_t i_bh = idx / (td / 2);
+    size_t i_td = idx - (td / 2) * i_bh;
+    size_t i_t = i_td / (d / 2);
+    size_t i_d = i_td - (d / 2) * i_t;
+    if (i_d < rd / 2) {
+        size_t i1 = i_bh * td + i_t * d + i_d;
+        size_t i2 = i1 + rd / 2;
+        size_t i_cs = i_t * (rd / 2) + i_d;
+        if (stride_b > 0) {
+            size_t b_idx = (2 * idx) / stride_b;
+            i_cs += b_idx * ((td / d) * (rd / 2));
+        }
+        T c = cos[i_cs];
+        T s = sin[i_cs];
+        dst[i1] = src[i1] * c - src[i2] * s;
+        dst[i2] = src[i1] * s + src[i2] * c;
+    } else {
+        size_t j = i_bh * td + i_t * d + rd + 2 * (i_d - rd / 2);
+        dst[j] = src[j];
+        dst[j + 1] = src[j + 1];
+    }
+}
+
 template<typename T>
 METAL_FUNC void rope_thd(
     constant size_t &b,
@@ -1445,6 +1492,22 @@ METAL_FUNC void rope_thd(
     dst[i1] = src[i1] * c - src[i2] * s;
     dst[i2] = src[i1] * s + src[i2] * c;
 }
+
+#define ROPE_PARTIAL(FN_NAME_PARTIAL, TYPENAME) \
+kernel void FN_NAME_PARTIAL( \
+    constant size_t &bh, \
+    constant size_t &td, \
+    constant size_t &d, \
+    constant size_t &rd, \
+    constant size_t &stride_b, \
+    device const TYPENAME *src,  \
+    device const TYPENAME *cos,  \
+    device const TYPENAME *sin,  \
+    device TYPENAME *dst, \
+    uint idx [[ thread_position_in_grid ]] \
+) { \
+    rope_partial<TYPENAME>(bh, td, d, rd, stride_b, src, cos, sin, dst, idx); \
+}\
 
 #define ROPE(FN_NAME, FN_NAME_I, FN_NAME_THD, TYPENAME) \
 kernel void FN_NAME_I( \
@@ -1493,6 +1556,8 @@ impl_layer_norm(layernorm_f32, float)
 impl_layer_norm(layernorm_f16, half)
 ROPE(rope_f32, rope_i_f32, rope_thd_f32, float)
 ROPE(rope_f16, rope_i_f16, rope_thd_f16, half)
+ROPE_PARTIAL(rope_partial_f32, float)
+ROPE_PARTIAL(rope_partial_f16, half)
 
 impl_reduce(Sum, fast_sum_f32, float)
 impl_reduce(Sum, fast_sum_u32, uint)
@@ -1551,4 +1616,5 @@ impl_softmax(softmax_bf16, bfloat)
 impl_rms_norm(rmsnorm_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
+ROPE_PARTIAL(rope_partial_bf16, bfloat)
 #endif

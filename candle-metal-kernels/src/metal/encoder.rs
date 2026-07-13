@@ -6,6 +6,7 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLSize,
 };
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::c_void,
     ptr,
@@ -17,7 +18,8 @@ use std::{
 pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
 
 /// Barrier tracking state for one encoder session.
-/// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
+/// Owned by ComputeCommandEncoder via Arc<RefCell<>> so clones share state;
+/// see the `state` field's synchronization invariant.
 pub struct EncoderState {
     /// Buffer ptrs written since last barrier (RAW/WAW detection).
     pub prev_outputs: HashSet<usize>,
@@ -53,10 +55,16 @@ pub struct ComputeCommandEncoder {
     pub(crate) command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     /// Per-encoder-session fence. Updated at end_encoding.
     pub(crate) fence: Arc<Fence>,
-    /// Hazard tracking state. Arc shared between the canonical encoder in EntryState
-    /// and the clone held by CommandsGuard. Uncontended in practice (CommandsGuard
-    /// holds the outer Commands mutex for the entire kernel dispatch).
-    pub(crate) state: Arc<Mutex<EncoderState>>,
+    /// Hazard tracking state, touched 4+ times per dispatch (per input/output
+    /// buffer bind and at auto_barrier). RefCell, not Mutex: every access is
+    /// already serialized by the outer `Commands` state mutex — dispatch-time
+    /// access borrows through `CommandsGuard`, and `end_encoding` runs under
+    /// the commit/blit paths that hold the same lock. A standalone
+    /// `ComputeCommandEncoder` is `!Send`/`!Sync` (objc2 `Retained`), so the
+    /// only cross-thread movement is inside `Commands`' unsafe Send/Sync,
+    /// whose mutex is exactly the guarantee this relies on. RefCell keeps a
+    /// reentrancy check where a raw cell would be UB.
+    pub(crate) state: Arc<RefCell<EncoderState>>,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -75,7 +83,7 @@ impl ComputeCommandEncoder {
             raw,
             command_buffer,
             fence,
-            state: Arc::new(Mutex::new(EncoderState::new())),
+            state: Arc::new(RefCell::new(EncoderState::new())),
         }
     }
 
@@ -102,7 +110,7 @@ impl ComputeCommandEncoder {
     }
 
     fn auto_barrier(&self) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.borrow_mut();
         if s.needs_barrier {
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
             s.needs_barrier = false;
@@ -119,7 +127,7 @@ impl ComputeCommandEncoder {
     pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.borrow_mut();
             if s.prev_outputs.contains(&ptr) {
                 s.needs_barrier = true;
             }
@@ -135,7 +143,7 @@ impl ComputeCommandEncoder {
     pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.borrow_mut();
             if s.prev_outputs.contains(&ptr) || s.prev_inputs.contains(&ptr) {
                 s.needs_barrier = true;
             }

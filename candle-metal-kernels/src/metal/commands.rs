@@ -342,7 +342,7 @@ impl Commands {
         use objc2_metal::MTLComputeCommandEncoder as _;
 
         let all_outputs = {
-            let s = encoder.state.lock().unwrap();
+            let s = encoder.state.borrow();
             s.all_outputs.clone()
         };
 

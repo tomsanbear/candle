@@ -244,6 +244,25 @@ impl Commands {
         })
     }
 
+    /// Encode a progress signal after all work encoded so far. Ends the
+    /// active compute encoder through the normal fence path (required:
+    /// HazardTrackingModeUntracked relies on end_encoding registering
+    /// outputs), then encodes the signal at command-buffer level. The
+    /// signal fires when the GPU completes everything encoded before it —
+    /// including work in EARLIER command buffers of this queue (FIFO).
+    pub fn signal_event(
+        &self,
+        event: &crate::metal::SharedEvent,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        let mut state = self.state.lock()?;
+        if let Some(enc) = state.current_encoder.take() {
+            self.end_encoding(enc);
+        }
+        state.current.encode_signal_event(event, value);
+        Ok(())
+    }
+
     pub fn wait_until_completed(&self) -> Result<(), MetalKernelError> {
         self.flush_and_wait()
     }

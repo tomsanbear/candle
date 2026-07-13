@@ -48,6 +48,20 @@ impl CommandBuffer {
             .unwrap()
     }
 
+    /// Encode a shared-event signal: fires (setting the event's value) only
+    /// after every previously encoded command in this buffer completes.
+    /// Must be encoded outside an active encoder.
+    pub fn encode_signal_event(
+        &self,
+        event: &crate::metal::SharedEvent,
+        value: u64,
+    ) {
+        use objc2::runtime::ProtocolObject;
+        let ev: &ProtocolObject<dyn objc2_metal::MTLEvent> =
+            ProtocolObject::from_ref(event.raw());
+        self.raw.encodeSignalEvent_value(ev, value);
+    }
+
     pub fn commit(&self) {
         self.raw.commit()
     }

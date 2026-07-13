@@ -231,6 +231,26 @@ impl MetalDevice {
         Ok(command_encoder)
     }
 
+    pub fn new_shared_event(&self) -> Result<candle_metal_kernels::metal::SharedEvent> {
+        candle_metal_kernels::metal::SharedEvent::new(self.device())
+            .map_err(|e| MetalError::from(e).into())
+    }
+
+    /// Encode a progress signal after all work submitted so far (ends the
+    /// active encoder through the fence path). The host observes it via
+    /// SharedEvent::signaled_value()/wait_until() and may then read any
+    /// StorageModeShared bytes written by that work without synchronize().
+    pub fn signal_event(
+        &self,
+        event: &candle_metal_kernels::metal::SharedEvent,
+        value: u64,
+    ) -> Result<()> {
+        self.commands
+            .signal_event(event, value)
+            .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn wait_until_completed(&self) -> Result<()> {
         self.commands
             .wait_until_completed()

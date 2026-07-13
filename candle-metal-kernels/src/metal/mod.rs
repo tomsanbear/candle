@@ -7,6 +7,7 @@ pub mod encoder;
 pub mod fence;
 pub mod library;
 pub mod residency_set;
+pub mod shared_event;
 
 pub use buffer::*;
 pub use command_buffer::*;
@@ -17,3 +18,4 @@ pub use encoder::*;
 pub use fence::*;
 pub use library::*;
 pub use residency_set::*;
+pub use shared_event::*;

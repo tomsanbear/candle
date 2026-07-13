@@ -133,6 +133,7 @@ impl Kernels {
             Source::GatedDeltaChunk => GATED_DELTA_CHUNK,
             Source::GatedDeltaV2 => GATED_DELTA_V2,
             Source::SkinnyGemm => SKINNY_GEMM,
+            Source::Dspark => DSPARK,
         }
     }
 

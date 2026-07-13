@@ -926,6 +926,231 @@ fn run_qmv_capture(dtype: GgmlDType, name: &str, n: usize, k: usize, m: usize) -
     Ok(())
 }
 
+
+/// Fused DSpark Markov chain: bitwise token verification against a CPU
+/// reference that mirrors the kernel's arithmetic exactly (same per-row
+/// sequential f32 accumulation, same bf16 rounding points, same
+/// first-index-on-tie argmax), then chain latency per gamma. The legacy
+/// serial-dispatch chain measured ~1.17 ms/step on M3; this prints the
+/// fused replacement's cost.
+fn run_markov_chain() -> Result<()> {
+    use candle_metal_kernels::{call_markov_chain, MarkovChainArgs, MARKOV_NTG};
+    use half::f16;
+
+    const VOCAB_FULL: usize = 248094;
+    const VD: usize = 32768;
+    const R: usize = 256;
+    const GAMMA: usize = 6;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+
+    // Deterministic synthetic tensors (no RNG: index-derived, non-degenerate).
+    let w1: Vec<bf16> = (0..VOCAB_FULL * R)
+        .map(|i| bf16::from_f32((((i * 37 + 11) % 197) as f32 - 98.0) / 391.0))
+        .collect();
+    let base: Vec<bf16> = (0..GAMMA * VD)
+        .map(|i| bf16::from_f32((((i * 53 + 29) % 401) as f32 - 200.0) / 87.0))
+        .collect();
+    // q8_0 rows: 8 blocks of (f16 d | 32 x i8) per row.
+    let blocks_per_row = R / 32;
+    let mut w2_q8 = vec![0u8; VD * blocks_per_row * 34];
+    for row in 0..VD {
+        for b in 0..blocks_per_row {
+            let off = (row * blocks_per_row + b) * 34;
+            let d = f16::from_f32(0.011 + ((row * 7 + b) % 13) as f32 * 0.0035);
+            w2_q8[off..off + 2].copy_from_slice(&d.to_le_bytes());
+            for j in 0..32 {
+                let q = ((row * 31 + b * 17 + j * 5 + 3) % 251) as i32 - 125;
+                w2_q8[off + 2 + j] = (q as i8) as u8;
+            }
+        }
+    }
+    let w2_bf16: Vec<bf16> = (0..VD * R)
+        .map(|i| bf16::from_f32((((i * 71 + 5) % 311) as f32 - 155.0) / 623.0))
+        .collect();
+    // Draft->global map: spread, in-range, deterministic.
+    let ids: Vec<u32> = (0..VD).map(|i| ((i * 7 + 3) % VOCAB_FULL) as u32).collect();
+    let anchor: u32 = 42_137;
+
+    // CPU reference mirroring the kernel arithmetic exactly.
+    let cpu_chain = |q8: bool, remap: bool| -> (Vec<u32>, Vec<u32>) {
+        let mut prev = anchor as usize;
+        let mut tokens = Vec::with_capacity(GAMMA);
+        let mut chain_inputs = Vec::with_capacity(GAMMA);
+        for k in 0..GAMMA {
+            chain_inputs.push(prev as u32);
+            let pe: Vec<f32> = (0..R).map(|j| f32::from(w1[prev * R + j])).collect();
+            let mut best = f32::NEG_INFINITY;
+            let mut best_idx = usize::MAX;
+            for row in 0..VD {
+                let acc = if q8 {
+                    let mut acc = 0f32;
+                    for b in 0..blocks_per_row {
+                        let off = (row * blocks_per_row + b) * 34;
+                        let d = f32::from(f16::from_le_bytes([w2_q8[off], w2_q8[off + 1]]));
+                        let mut bsum = 0f32;
+                        for j in 0..32 {
+                            bsum += (w2_q8[off + 2 + j] as i8) as f32 * pe[b * 32 + j];
+                        }
+                        acc += d * bsum;
+                    }
+                    acc
+                } else {
+                    let mut acc = 0f32;
+                    for j in 0..R {
+                        acc += f32::from(w2_bf16[row * R + j]) * pe[j];
+                    }
+                    acc
+                };
+                let v = f32::from(bf16::from_f32(acc));
+                let v = f32::from(bf16::from_f32(v + f32::from(base[k * VD + row])));
+                if v > best {
+                    best = v;
+                    best_idx = row;
+                }
+            }
+            let global = if remap { ids[best_idx] as usize } else { best_idx };
+            tokens.push(global as u32);
+            prev = global;
+        }
+        (tokens, chain_inputs)
+    };
+
+    let buf = |bytes: &[u8]| -> Buffer {
+        device
+            .new_buffer_with_data(bytes.as_ptr() as *const core::ffi::c_void, bytes.len(), options)
+            .unwrap()
+    };
+    let as_bytes = |v: &[bf16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let w1_buf = buf(&as_bytes(&w1));
+    let base_buf = buf(&as_bytes(&base));
+    let w2q8_buf = buf(&w2_q8);
+    let w2bf_buf = buf(&as_bytes(&w2_bf16));
+    let ids_bytes: Vec<u8> = ids.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ids_buf = buf(&ids_bytes);
+    let partials = device.new_buffer(MARKOV_NTG * 8, options).unwrap();
+    let tokens_buf = device.new_buffer(GAMMA * 4, options).unwrap();
+    let prev_embs_buf = device.new_buffer(GAMMA * R * 2, options).unwrap();
+    let mut chain_init = vec![0u32; GAMMA + 1];
+    chain_init[0] = anchor;
+    let chain_bytes: Vec<u8> = chain_init.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let chain_buf = buf(&chain_bytes);
+
+    for (label, q8, remap) in [
+        ("q8+remap", true, true),
+        ("q8", true, false),
+        ("bf16+remap", false, true),
+        ("bf16", false, false),
+    ] {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        call_markov_chain(
+            &device,
+            &encoder,
+            &kernels,
+            MarkovChainArgs {
+                gamma: GAMMA,
+                draft_vocab: VD,
+                rank: R,
+                w2_q8: q8,
+                w1: (&w1_buf, 0),
+                w2: (if q8 { &w2q8_buf } else { &w2bf_buf }, 0),
+                base: (&base_buf, 0),
+                chain: &chain_buf,
+                partials: &partials,
+                ids: (&ids_buf, 0),
+                remap,
+                tokens: &tokens_buf,
+                prev_embs: &prev_embs_buf,
+            },
+        )?;
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+
+        let got = unsafe { std::slice::from_raw_parts(tokens_buf.contents() as *const u32, GAMMA) }
+            .to_vec();
+        let (expected, chain_inputs) = cpu_chain(q8, remap);
+        anyhow::ensure!(
+            got == expected,
+            "markov {label}: tokens {got:?} != cpu reference {expected:?}"
+        );
+        // prev_embs[k] must be w1[chain_input_k] bitwise.
+        let embs = unsafe {
+            std::slice::from_raw_parts(prev_embs_buf.contents() as *const u16, GAMMA * R)
+        };
+        for (k, &inp) in chain_inputs.iter().enumerate() {
+            for j in 0..R {
+                let want = w1[inp as usize * R + j].to_bits();
+                anyhow::ensure!(
+                    embs[k * R + j] == want,
+                    "markov {label}: prev_embs[{k},{j}] mismatch"
+                );
+            }
+        }
+        println!(
+            "markov-chain {label}: tokens + prev_embs match CPU reference bitwise ({GAMMA} steps)"
+        );
+    }
+
+    // Timing: full fused chain (2*gamma dispatches) per iteration.
+    const WARMUP_ITERS: usize = 3;
+    const MIN_DUR: f64 = 1.0;
+    for gamma in [1usize, 3, 6] {
+        let mut sum_dt = 0f64;
+        let mut iters = 0usize;
+        for idx in 0.. {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let inner = 64usize;
+            let encoder = commands.command_encoder().unwrap();
+            let start_time = std::time::Instant::now();
+            for _ in 0..inner {
+                call_markov_chain(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    MarkovChainArgs {
+                        gamma,
+                        draft_vocab: VD,
+                        rank: R,
+                        w2_q8: true,
+                        w1: (&w1_buf, 0),
+                        w2: (&w2q8_buf, 0),
+                        base: (&base_buf, 0),
+                        chain: &chain_buf,
+                        partials: &partials,
+                        ids: (&ids_buf, 0),
+                        remap: true,
+                        tokens: &tokens_buf,
+                        prev_embs: &prev_embs_buf,
+                    },
+                )?;
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let dt = start_time.elapsed().as_secs_f64();
+            if idx < WARMUP_ITERS {
+                continue;
+            }
+            sum_dt += dt;
+            iters += inner;
+            if sum_dt > MIN_DUR {
+                break;
+            }
+        }
+        let us = 1e6 * sum_dt / iters as f64;
+        println!(
+            "markov-chain q8+remap gamma={gamma}: {us:8.1} us/chain ({:.1} us/step) — legacy serial chain was ~1170 us/step on M3",
+            us / gamma as f64
+        );
+    }
+    Ok(())
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
@@ -940,6 +1165,10 @@ enum Task {
     /// V1 (q4k-mv-rewrite-round2): simdgroups-per-TG sweep on q4_K bf16 mv —
     /// bitwise correctness vs nsg=1 + GB/s per nsg on the deployed shapes.
     NsgSweep,
+    /// Fused DSpark Markov-chain kernels: BITWISE token verification against
+    /// a same-accumulation-order CPU reference (q8_0 + bf16 w2 variants,
+    /// with/without draft-vocab remap) and chain timing per gamma.
+    MarkovChain,
 }
 
 #[derive(Parser, Debug)]
@@ -993,6 +1222,9 @@ fn main() -> Result<()> {
                     run_barrier_probe(n, k, 64, chains)?;
                 }
             }
+        }
+        Task::MarkovChain => {
+            run_markov_chain()?;
         }
         Task::NsgSweep => {
             // The deployed decode shapes: huge-n head (launch-limited),

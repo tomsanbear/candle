@@ -380,21 +380,53 @@ impl QMetalStorage {
             )
             .map_err(MetalError::from)?;
         } else if single_dispatch {
-            candle_metal_kernels::call_quantized_matmul_mv_t(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                self.dtype.into(),
-                src1_bf16,
-                dst_bf16,
-                (1, m, n, k),
-                storage.buffer(),
-                layout.start_offset() * storage.dtype().size_in_bytes(),
-                &self.buffer,
-                0,
-                &dst,
-            )
-            .map_err(MetalError::from)?;
+            // Round-3 geometry override for the q4_K bf16/bf16 decode path:
+            // LMBRRR_Q4K_MV_VARIANT = nr2sg2 | nr2sg1 selects the 2-rows-per-
+            // simdgroup kernels (bit-identical per row; +30% on the lm_head
+            // on M3, mechanism: halved accumulator state -> more resident
+            // simdgroups hide DRAM latency). Unset = historical dispatch.
+            static Q4K_MV_GEO: std::sync::OnceLock<Option<(usize, usize, bool)>> =
+                std::sync::OnceLock::new();
+            let geo = *Q4K_MV_GEO.get_or_init(|| {
+                match std::env::var("LMBRRR_Q4K_MV_VARIANT").as_deref() {
+                    Ok("nr2sg2") => Some((2, 2, false)),
+                    Ok("nr2sg1") => Some((1, 2, false)),
+                    _ => None,
+                }
+            });
+            if let (Some(geo), GgmlDType::Q4K, true, true) =
+                (geo, self.dtype, src1_bf16, dst_bf16)
+            {
+                candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_geo(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    geo,
+                    (1, m, n, k),
+                    storage.buffer(),
+                    layout.start_offset() * storage.dtype().size_in_bytes(),
+                    &self.buffer,
+                    0,
+                    &dst,
+                )
+                .map_err(MetalError::from)?;
+            } else {
+                candle_metal_kernels::call_quantized_matmul_mv_t(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    self.dtype.into(),
+                    src1_bf16,
+                    dst_bf16,
+                    (1, m, n, k),
+                    storage.buffer(),
+                    layout.start_offset() * storage.dtype().size_in_bytes(),
+                    &self.buffer,
+                    0,
+                    &dst,
+                )
+                .map_err(MetalError::from)?;
+            }
         } else {
             for batch_id in 0..m {
                 candle_metal_kernels::call_quantized_matmul_mv_t(

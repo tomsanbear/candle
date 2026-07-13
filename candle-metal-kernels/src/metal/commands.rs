@@ -15,7 +15,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+// Palindrome-rotated CPB sweep on the decode workload (2026-07-12, quiet
+// machine): 100 is +3-4% steady tok/s over 50; 12/25 are a wash; >=150
+// declines monotonically (encode-ahead starvation). Fewer buffer boundaries
+// mean fewer all-fence encoder-start waits, up to that knee.
+const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 100;
 
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
     command_queue.commandBuffer().map(CommandBuffer::new).ok_or(
@@ -119,6 +123,13 @@ pub struct Commands {
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
+    /// `CANDLE_METAL_EAGER_ENQUEUE=1`: enqueue() each command buffer at
+    /// creation so it claims its queue slot before commit — the driver can
+    /// begin scheduling across the buffer boundary earlier. Safe with the
+    /// commit flow here: `current` is always committed before anything later
+    /// in the queue is waited on (commit_swap/ensure_completed handle the
+    /// Enqueued status explicitly).
+    eager_enqueue: bool,
     device: Device,
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
@@ -139,6 +150,7 @@ impl Commands {
                 .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER),
             _ => DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
         };
+        let eager_enqueue = crate::utils::get_env_bool("CANDLE_METAL_EAGER_ENQUEUE", false);
 
         if let Some(raw) = residency_set.raw() {
             command_queue.addResidencySet(raw);
@@ -146,12 +158,16 @@ impl Commands {
 
         let device = Device::new(command_queue.device());
         let cb = create_command_buffer(&command_queue)?;
+        if eager_enqueue {
+            cb.enqueue();
+        }
 
         Ok(Self {
             state: Mutex::new(EntryState::new(cb)),
             compute_count: AtomicUsize::new(0),
             command_queue,
             compute_per_buffer,
+            eager_enqueue,
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -307,6 +323,9 @@ impl Commands {
             _ => {}
         }
         let new_cb = create_command_buffer(&self.command_queue)?;
+        if self.eager_enqueue {
+            new_cb.enqueue();
+        }
         let old_cb = std::mem::replace(&mut state.current, new_cb);
         state.in_flight.push(old_cb);
         self.compute_count.store(reset_to, Ordering::Release);

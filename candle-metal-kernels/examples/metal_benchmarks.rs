@@ -499,8 +499,59 @@ fn run_nsg_sweep(name: &str, n: usize, k: usize) -> Result<()> {
     }
     println!("q4_K {name}: nsg 2/4/8 bitwise-identical to nsg=1 over {} outputs", m * n);
 
-    // Timing per nsg, run_qmv protocol.
+    // Correctness for the row-tile (V5 lifetime) variants: bitwise vs nsg=1.
+    for nt in [2usize, 4, 8, 16, 32] {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_nsg(
+            &device, &encoder, &kernels, 1, (1, m, n, k), &lhs, 0, &rhs, 0, &dst_ref,
+        )?;
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_rowtile(
+            &device, &encoder, &kernels, nt, (1, m, n, k), &lhs, 0, &rhs, 0, &dst,
+        )?;
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let a = unsafe { std::slice::from_raw_parts(dst_ref.contents() as *const u16, m * n) };
+        let b = unsafe { std::slice::from_raw_parts(dst.contents() as *const u16, m * n) };
+        let diffs = (0..m * n).filter(|&i| a[i] != b[i]).count();
+        anyhow::ensure!(diffs == 0, "rt{nt} diverges from baseline on {diffs} outputs");
+    }
+    println!("q4_K {name}: rt 2/4/8/16/32 bitwise-identical to baseline over {} outputs", m * n);
+
+    // Timing: row-tile variants (V5).
     let inner = (50_000_000 / weight_bytes).clamp(4, 512);
+    for nt in [2usize, 4, 8, 16, 32] {
+        let mut sum_dt = 0f64;
+        let mut iters = 0usize;
+        for idx in 0.. {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            let start_time = std::time::Instant::now();
+            for _ in 0..inner {
+                candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_rowtile(
+                    &device, &encoder, &kernels, nt, (1, m, n, k), &lhs, 0, &rhs, 0, &dst,
+                )?;
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let dt = start_time.elapsed().as_secs_f64();
+            if idx < WARMUP_ITERS {
+                continue;
+            }
+            sum_dt += dt;
+            iters += inner;
+            if sum_dt > MIN_DUR {
+                break;
+            }
+        }
+        let ms = 1e3 * sum_dt / iters as f64;
+        let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
+        println!("q4_K {name:>10} n={n:6} k={k:5} rt={nt:2}   {ms:8.3} ms  {gbs:6.1} GB/s");
+    }
+
+    // Timing per nsg, run_qmv protocol.
     for nsg in [1usize, 2, 4, 8] {
         let mut sum_dt = 0f64;
         let mut iters = 0usize;

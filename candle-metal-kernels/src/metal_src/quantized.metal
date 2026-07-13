@@ -5152,6 +5152,165 @@ kernel void kernel_mul_mv_q4_K_bf16(
     kernel_mul_mv_q4_K_impl_t<bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
+// V5 experiment (thread-lifetime / Little's-law hypothesis): row-tile loop.
+// Each simdgroup processes NTILES consecutive N_DST-row groups SEQUENTIALLY
+// in one thread lifetime: same per-row arithmetic (bit-identical), same
+// register footprint (accumulators reset per tile, y-staging hoisted and
+// reused across all tiles), but thread lifetime x NTILES and threadgroup
+// launch churn / NTILES. Rationale: residency = launch_rate x lifetime; the
+// baseline's one-block-pass threads (~130 ALU ops at k=1024) die too fast
+// for a capped launch rate to fill the machine (~10-15% occupancy across
+// q4_K AND q8_0, both ~600 Gops issued — while long-lived dense-mv threads
+// reach the bandwidth wall). Grid width = ceil(ne01 / (N_DST * NTILES)).
+template <typename YT, typename DT, int NTILES>
+void kernel_mul_mv_q4_K_rowtile_impl_t(
+        device const  void * src0,
+        device const    YT * src1,
+        device          DT * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3     tgpig,
+                   uint      tiisg) {
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const int ix = tiisg/8;
+    const int it = tiisg%8;
+    const int iq = it/4;
+    const int ir = it%4;
+
+    const int nb = ne00/QK_K;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const YT * y = (device const YT *) src1 + r1*ne10 + im*ne00*ne1;
+
+    const int step = sizeof(block_q4_K) * nb / 2;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    // Stage this thread's y slice ONCE; reused across every row tile. At
+    // k=1024 (nb=4) each thread owns exactly one ib, so the ib loop and the
+    // y staging both hoist fully out of the tile loop; for larger k the y
+    // slices are re-staged per ib inside the loop exactly like the baseline.
+    for (int t = 0; t < NTILES; ++t) {
+        const int first_row = (r0 * NTILES + t) * N_DST;
+        if (first_row >= ne01) break;
+        device const block_q4_K * x = (device const block_q4_K *) src0 + first_row*nb + offset0;
+
+        float yl[16];
+        float yh[16];
+        float sumf[N_DST]={0.f}, all_sum;
+        device const YT * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (int i = 0; i < 8; ++i) {
+                yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+                yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+                yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+                yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+            }
+
+            device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+            device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     * dh = &x[ib].d;
+
+            for (int row = 0; row < N_DST; row++) {
+                if (first_row + row >= ne01) break;
+
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+                device const uint16_t * q2 = q1 + 32;
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                for (int i = 0; i < 8; i += 2) {
+                    acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
+                    acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
+                    acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
+                    acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
+                    acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
+                    acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
+                    acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
+                    acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
+                }
+
+                float dall = dh[0];
+                float dmin = dh[1];
+                sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                     (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                     (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                     (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+                q1 += step;
+                sc += step;
+                dh += step;
+            }
+            y4 += 4 * QK_K;
+        }
+
+        for (int row = 0; row < N_DST; ++row) {
+            all_sum = simd_sum(sumf[row]);
+            if (tiisg == 0 && first_row + row < ne01) {
+                dst[r1*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(all_sum);
+            }
+        }
+    }
+}
+
+#define MV_Q4K_ROWTILE(NAME, NT)                                            \
+[[host_name(#NAME)]]                                                        \
+kernel void NAME(                                                           \
+        device const   void * src0,                                         \
+        device const bfloat * src1,                                         \
+        device       bfloat * dst,                                          \
+        constant    int64_t & ne00,                                         \
+        constant    int64_t & ne01,                                         \
+        constant    int64_t & ne02,                                         \
+        constant   uint64_t & nb00,                                         \
+        constant   uint64_t & nb01,                                         \
+        constant   uint64_t & nb02,                                         \
+        constant    int64_t & ne10,                                         \
+        constant    int64_t & ne11,                                         \
+        constant    int64_t & ne12,                                         \
+        constant   uint64_t & nb10,                                         \
+        constant   uint64_t & nb11,                                         \
+        constant   uint64_t & nb12,                                         \
+        constant    int64_t & ne0,                                          \
+        constant    int64_t & ne1,                                          \
+        constant    uint    & r2,                                           \
+        constant    uint    & r3,                                           \
+        uint3 tgpig[[threadgroup_position_in_grid]],                        \
+        uint  tiisg[[thread_index_in_simdgroup]]) {                         \
+    kernel_mul_mv_q4_K_rowtile_impl_t<bfloat, bfloat, NT>(                  \
+        src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,tgpig,tiisg);  \
+}
+
+MV_Q4K_ROWTILE(kernel_mul_mv_q4_K_bf16_bf16_rt2, 2)
+MV_Q4K_ROWTILE(kernel_mul_mv_q4_K_bf16_bf16_rt4, 4)
+MV_Q4K_ROWTILE(kernel_mul_mv_q4_K_bf16_bf16_rt8, 8)
+MV_Q4K_ROWTILE(kernel_mul_mv_q4_K_bf16_bf16_rt16, 16)
+MV_Q4K_ROWTILE(kernel_mul_mv_q4_K_bf16_bf16_rt32, 32)
+
 // V1 experiment (q4k-mv-rewrite-round2): NSG simdgroups per threadgroup.
 // Dispatch geometry: TG = (4, 8, NSG) = 32*NSG threads; grid width =
 // ceil(ne01 / (N_DST * NSG)). Bit-identical to NSG=1 per row.

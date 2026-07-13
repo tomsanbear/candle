@@ -374,6 +374,90 @@ pub fn call_quantized_matmul_mv_q4k_bf16_nsg(
     Ok(())
 }
 
+/// V5 experiment (thread-lifetime hypothesis): q4_K bf16/bf16 mv where each
+/// simdgroup processes `ntiles` consecutive 4-row groups sequentially —
+/// thread lifetime x ntiles, launch churn / ntiles, bit-identical per row.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16_rowtile(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ntiles: usize,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let name = match ntiles {
+        2 => "kernel_mul_mv_q4_K_bf16_bf16_rt2",
+        4 => "kernel_mul_mv_q4_K_bf16_bf16_rt4",
+        8 => "kernel_mul_mv_q4_K_bf16_bf16_rt8",
+        16 => "kernel_mul_mv_q4_K_bf16_bf16_rt16",
+        32 => "kernel_mul_mv_q4_K_bf16_bf16_rt32",
+        _ => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "ntiles must be 2/4/8/16/32",
+                "qmatmul_mv_rowtile",
+            ))
+        }
+    };
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_rt{ntiles} M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            ne12,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(n, 4 * ntiles),
+        height: m,
+        depth: b,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 4,
+        height: 8,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Column count handled per threadgroup by the multi-column mv kernels, or
 /// None when the dtype has no `_mc` variant. Must match the NC_MV_* defines in
 /// quantized.metal.

@@ -21,7 +21,7 @@ using namespace metal;
 // affect committed output (verification is exact), and the parity gate
 // counts any divergence.
 
-constant uint MARKOV_TPG = 256;
+constexpr constant uint MARKOV_TPG = 256;
 
 struct markov_partial {
     float val;
@@ -29,8 +29,8 @@ struct markov_partial {
 };
 
 // ggml block_q8_0: f16 scale + 32 int8 quants, 34 bytes packed.
-constant uint Q8_BLOCK = 32;
-constant uint Q8_BLOCK_BYTES = 34;
+constexpr constant uint Q8_BLOCK = 32;
+constexpr constant uint Q8_BLOCK_BYTES = 34;
 
 template <bool Q8>
 void markov_step_partial_impl(
@@ -42,16 +42,15 @@ void markov_step_partial_impl(
         constant uint & k,
         constant uint & vd,
         constant uint & r,
+        threadgroup float * pe,            // [MARKOV_TPG]
+        threadgroup float * red_val,       // [MARKOV_TPG]
+        threadgroup uint  * red_idx,       // [MARKOV_TPG]
         uint tgid,
         uint tid,
         uint ntg) {
-    threadgroup float pe[MARKOV_TPG];
-    threadgroup float red_val[MARKOV_TPG];
-    threadgroup uint  red_idx[MARKOV_TPG];
-
     const uint prev = chain[k];
     if (tid < r) {
-        pe[tid] = float(w1[prev * r + tid]);
+        pe[tid] = float(w1[(ulong)prev * r + tid]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -121,8 +120,12 @@ kernel void NAME(                                                            \
         uint tgid [[threadgroup_position_in_grid]],                          \
         uint tid  [[thread_position_in_threadgroup]],                        \
         uint ntg  [[threadgroups_per_grid]]) {                               \
+    threadgroup float pe[MARKOV_TPG];                                        \
+    threadgroup float red_val[MARKOV_TPG];                                   \
+    threadgroup uint  red_idx[MARKOV_TPG];                                   \
     markov_step_partial_impl<Q8>(w1, w2, base, chain, partials,              \
-                                 k, vd, r, tgid, tid, ntg);                  \
+                                 k, vd, r, pe, red_val, red_idx,             \
+                                 tgid, tid, ntg);                            \
 }
 
 MARKOV_PARTIAL(markov_step_partial_q8, true)
@@ -181,6 +184,6 @@ kernel void markov_step_reduce(
     // This step's feature embedding is the INPUT id's row.
     const uint prev = chain[k];
     if (tid < r) {
-        prev_embs[(ulong)k * r + tid] = w1[prev * r + tid];
+        prev_embs[(ulong)k * r + tid] = w1[(ulong)prev * r + tid];
     }
 }

@@ -237,6 +237,64 @@ pub fn call_rms_norm(
     Ok(())
 }
 
+/// Fused residual-add + RMSNorm: `sum_out = a + b`, `norm_out =
+/// rms_norm(a+b) * weight`, over the last `dim` elements of each of
+/// `rows` rows. One threadgroup per row. See rms_norm_add in reduce.metal.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_add(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    a: &Buffer,
+    a_offset: usize,
+    b: &Buffer,
+    b_offset: usize,
+    weight: &Buffer,
+    weight_offset: usize,
+    sum_out: &Buffer,
+    norm_out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rms_norm_add {kernel_name} rows={rows} dim={dim}");
+
+    set_params!(
+        encoder,
+        (
+            (a, a_offset),
+            (b, b_offset),
+            (weight, weight_offset),
+            Output::new(sum_out),
+            Output::new(norm_out),
+            dim as u32,
+            eps
+        )
+    );
+
+    let thread_group_count = MTLSize {
+        width: rows,
+        height: 1,
+        depth: 1,
+    };
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (dim / 2).next_power_of_two().max(1),
+    );
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_layer_norm(
     device: &Device,

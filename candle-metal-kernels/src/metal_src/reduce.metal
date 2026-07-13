@@ -1550,8 +1550,80 @@ kernel void FN_NAME_THD( \
     rope_thd<TYPENAME>(b, t, h, d, stride_b, src, cos, sin, dst, idx); \
 }\
 
+// Fused residual-add + RMSNorm (ggml kernel_rms_norm_fuse analogue): reads
+// a and b, computes s = a + b ONCE, writes s to `sum_out` (the new residual
+// for the next block) and rms_norm(s)*weight to `norm_out`. Collapses a
+// `badd` dispatch + a `rmsnorm` dispatch (and the barrier between them) into
+// one. One threadgroup per row; two-level simd+threadgroup reduction. The
+// residual output is bit-identical to a bf16 badd (bf16(f32(a)+f32(b))); the
+// norm consumes the f32 s directly, so norm_out differs from add-then-norm
+// only by the bf16 rounding of the intermediate (sub-noise, margin-gated).
+template<typename T>
+METAL_FUNC void rms_norm_add(
+    device const T *a,
+    device const T *b,
+    device const T *weight,
+    device T *sum_out,
+    device T *norm_out,
+    constant uint &dim,
+    constant float &eps,
+    threadgroup float *scratch,
+    uint row,
+    uint tid,
+    uint tpg,
+    uint simd_lane,
+    uint simd_group
+) {
+    const ulong base = (ulong)row * dim;
+    float local_ss = 0.0f;
+    for (uint i = tid; i < dim; i += tpg) {
+        float s = static_cast<float>(a[base + i]) + static_cast<float>(b[base + i]);
+        sum_out[base + i] = static_cast<T>(s);
+        local_ss = fma(s, s, local_ss);
+    }
+    float ss = simd_sum(local_ss);
+    if (simd_lane == 0) {
+        scratch[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n_simd = (tpg + 31) / 32;
+    float total = 0.0f;
+    for (uint g = 0; g < n_simd; ++g) {
+        total += scratch[g];
+    }
+    const float inv = rsqrt(total / float(dim) + eps);
+    for (uint i = tid; i < dim; i += tpg) {
+        // Recompute s (a,b are cache-resident) rather than re-read sum_out
+        // from device — cheaper and keeps norm_out in the f32 s domain.
+        float s = static_cast<float>(a[base + i]) + static_cast<float>(b[base + i]);
+        norm_out[base + i] = static_cast<T>(s * inv * static_cast<float>(weight[i]));
+    }
+}
+
+#define RMS_NORM_ADD(NAME, T)                                   \
+kernel void NAME(                                               \
+    device const T *a,                                          \
+    device const T *b,                                          \
+    device const T *weight,                                     \
+    device T *sum_out,                                          \
+    device T *norm_out,                                         \
+    constant uint &dim,                                         \
+    constant float &eps,                                        \
+    uint row [[ threadgroup_position_in_grid ]],                \
+    uint tid [[ thread_position_in_threadgroup ]],              \
+    uint tpg [[ threads_per_threadgroup ]],                     \
+    uint simd_lane [[ thread_index_in_simdgroup ]],             \
+    uint simd_group [[ simdgroup_index_in_threadgroup ]]        \
+) {                                                             \
+    threadgroup float scratch[32];                             \
+    rms_norm_add<T>(a, b, weight, sum_out, norm_out, dim, eps,  \
+        scratch, row, tid, tpg, simd_lane, simd_group);        \
+}
+
 impl_rms_norm(rmsnorm_f32, float)
 impl_rms_norm(rmsnorm_f16, half)
+RMS_NORM_ADD(rmsnorm_add_f32, float)
+RMS_NORM_ADD(rmsnorm_add_f16, half)
 impl_layer_norm(layernorm_f32, float)
 impl_layer_norm(layernorm_f16, half)
 ROPE(rope_f32, rope_i_f32, rope_thd_f32, float)
@@ -1614,6 +1686,7 @@ impl_arg_reduce(Max, fast_argmax_bf16, bfloat)
 impl_softmax(softmax_bf16, bfloat)
 
 impl_rms_norm(rmsnorm_bf16, bfloat)
+RMS_NORM_ADD(rmsnorm_add_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 ROPE_PARTIAL(rope_partial_bf16, bfloat)

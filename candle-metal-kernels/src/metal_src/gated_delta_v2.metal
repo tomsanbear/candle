@@ -27,7 +27,10 @@ using namespace metal;
 // and the host-side closed-form rollback is unchanged.
 //
 // Layouts (contiguous):
-//   proj      bf16 [l, conv_dim + value_dim + 2*heads]  (qkv | z | b | a per position)
+//   proj      bf16 [l, conv_dim + value_dim]  (qkv | z per position — the raw
+//             in_proj_qkvz GEMV output, no host-side cat)
+//   ba        bf16 [l, 2*heads]  (b | a per position — the fused in_proj_ba
+//             dense GEMV output)
 //   conv_*    bf16 [conv_dim, ksz]  rolling window, oldest first
 //   state_*   f32  [heads, dv, dk]  (v2 layout — transposed vs v1)
 //   qn/kn     f32  [heads, l, dk]   (kn doubles as cap_k)
@@ -67,26 +70,27 @@ static inline float tg_sum_128(float x,
 // ---------------------------------------------------------------------------
 kernel void gated_delta_v2_prep_bf16(
     device const bfloat *proj      [[buffer(0)]],
-    device const bfloat *conv_in   [[buffer(1)]],
-    device const bfloat *conv_w    [[buffer(2)]],
-    device const float  *dt_bias   [[buffer(3)]],
-    device const float  *a_log_exp [[buffer(4)]],
-    device bfloat       *conv_out  [[buffer(5)]],
-    device float        *kn        [[buffer(6)]],  // = cap_k
-    device float        *qn        [[buffer(7)]],
-    device float        *vc        [[buffer(8)]],
-    device float        *g_step    [[buffer(9)]],
-    device float        *beta_s    [[buffer(10)]],
-    device float        *cap_gcs   [[buffer(11)]],
-    constant uint  &heads      [[buffer(12)]],
-    constant uint  &dk         [[buffer(13)]],
-    constant uint  &dv         [[buffer(14)]],
-    constant uint  &conv_dim   [[buffer(15)]],
-    constant uint  &key_dim    [[buffer(16)]],
-    constant uint  &value_dim  [[buffer(17)]],
-    constant uint  &ksz        [[buffer(18)]],
-    constant uint  &seq_len    [[buffer(19)]],
-    constant float &l2_eps     [[buffer(20)]],
+    device const bfloat *ba        [[buffer(1)]],
+    device const bfloat *conv_in   [[buffer(2)]],
+    device const bfloat *conv_w    [[buffer(3)]],
+    device const float  *dt_bias   [[buffer(4)]],
+    device const float  *a_log_exp [[buffer(5)]],
+    device bfloat       *conv_out  [[buffer(6)]],
+    device float        *kn        [[buffer(7)]],  // = cap_k
+    device float        *qn        [[buffer(8)]],
+    device float        *vc        [[buffer(9)]],
+    device float        *g_step    [[buffer(10)]],
+    device float        *beta_s    [[buffer(11)]],
+    device float        *cap_gcs   [[buffer(12)]],
+    constant uint  &heads      [[buffer(13)]],
+    constant uint  &dk         [[buffer(14)]],
+    constant uint  &dv         [[buffer(15)]],
+    constant uint  &conv_dim   [[buffer(16)]],
+    constant uint  &key_dim    [[buffer(17)]],
+    constant uint  &value_dim  [[buffer(18)]],
+    constant uint  &ksz        [[buffer(19)]],
+    constant uint  &seq_len    [[buffer(20)]],
+    constant float &l2_eps     [[buffer(21)]],
     uint bh         [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -94,8 +98,9 @@ kernel void gated_delta_v2_prep_bf16(
     const uint bi = bh / heads;
     const uint h = bh % heads;
     const uint l = seq_len;
-    const uint row_stride = conv_dim + value_dim + 2 * heads;
+    const uint row_stride = conv_dim + value_dim;
     device const bfloat *proj_b = proj + (ulong)bi * l * row_stride;
+    device const bfloat *ba_b = ba + (ulong)bi * l * 2 * heads;
     device const bfloat *conv_in_b = conv_in + (ulong)bi * conv_dim * ksz;
     device bfloat *conv_out_b = conv_out + (ulong)bi * conv_dim * ksz;
     const ulong hb = (ulong)(bi * heads + h);
@@ -147,10 +152,8 @@ kernel void gated_delta_v2_prep_bf16(
     if (tid == 0) {
         float run = 0.0f;
         for (uint pos = 0; pos < l; pos++) {
-            const float b_in =
-                float(proj_b[pos * row_stride + conv_dim + value_dim + h]);
-            const float a_in =
-                float(proj_b[pos * row_stride + conv_dim + value_dim + heads + h]);
+            const float b_in = float(ba_b[pos * 2 * heads + h]);
+            const float a_in = float(ba_b[pos * 2 * heads + heads + h]);
             const float g = -a_log_exp[h]
                 * metal::precise::log(1.0f + metal::precise::exp(a_in + dt_bias[h]));
             g_step[hb * l + pos] = g;
@@ -265,22 +268,23 @@ kernel void gated_delta_v2_core(
 // ---------------------------------------------------------------------------
 kernel void gated_delta_v2_decode_bf16(
     device const bfloat *proj      [[buffer(0)]],
-    device const bfloat *conv_in   [[buffer(1)]],
-    device const float  *state_in  [[buffer(2)]],
-    device const bfloat *conv_w    [[buffer(3)]],
-    device const float  *dt_bias   [[buffer(4)]],
-    device const float  *a_log_exp [[buffer(5)]],
-    device bfloat       *conv_out  [[buffer(6)]],
-    device float        *state_out [[buffer(7)]],
-    device float        *o_pre     [[buffer(8)]],
-    constant uint  &heads      [[buffer(9)]],
-    constant uint  &dk         [[buffer(10)]],
-    constant uint  &dv         [[buffer(11)]],
-    constant uint  &conv_dim   [[buffer(12)]],
-    constant uint  &key_dim    [[buffer(13)]],
-    constant uint  &value_dim  [[buffer(14)]],
-    constant uint  &ksz        [[buffer(15)]],
-    constant float &l2_eps     [[buffer(16)]],
+    device const bfloat *ba        [[buffer(1)]],
+    device const bfloat *conv_in   [[buffer(2)]],
+    device const float  *state_in  [[buffer(3)]],
+    device const bfloat *conv_w    [[buffer(4)]],
+    device const float  *dt_bias   [[buffer(5)]],
+    device const float  *a_log_exp [[buffer(6)]],
+    device bfloat       *conv_out  [[buffer(7)]],
+    device float        *state_out [[buffer(8)]],
+    device float        *o_pre     [[buffer(9)]],
+    constant uint  &heads      [[buffer(10)]],
+    constant uint  &dk         [[buffer(11)]],
+    constant uint  &dv         [[buffer(12)]],
+    constant uint  &conv_dim   [[buffer(13)]],
+    constant uint  &key_dim    [[buffer(14)]],
+    constant uint  &value_dim  [[buffer(15)]],
+    constant uint  &ksz        [[buffer(16)]],
+    constant float &l2_eps     [[buffer(17)]],
     uint2 tg        [[threadgroup_position_in_grid]],
     uint2 tp        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]]) {
@@ -291,7 +295,8 @@ kernel void gated_delta_v2_decode_bf16(
     const uint lane = tp.x;
     const uint n_per_lane = dk / 32; // 4 at dk=128
 
-    device const bfloat *proj_b = proj + (ulong)bi * (conv_dim + value_dim + 2 * heads);
+    device const bfloat *proj_b = proj + (ulong)bi * (conv_dim + value_dim);
+    device const bfloat *ba_b = ba + (ulong)bi * 2 * heads;
     device const bfloat *conv_in_b = conv_in + (ulong)bi * conv_dim * ksz;
     device bfloat *conv_out_b = conv_out + (ulong)bi * conv_dim * ksz;
 
@@ -324,8 +329,8 @@ kernel void gated_delta_v2_decode_bf16(
     const float v_c = accv / (1.0f + metal::precise::exp(-accv));
 
     // Gate scalars (redundant per lane; identical inputs).
-    const float b_in = float(proj_b[conv_dim + value_dim + h]);
-    const float a_in = float(proj_b[conv_dim + value_dim + heads + h]);
+    const float b_in = float(ba_b[h]);
+    const float a_in = float(ba_b[heads + h]);
     const float g = -a_log_exp[h]
         * metal::precise::log(1.0f + metal::precise::exp(a_in + dt_bias[h]));
     const float decay = metal::precise::exp(g);
@@ -408,34 +413,35 @@ kernel void gated_delta_v2_decode_bf16(
 // ---------------------------------------------------------------------------
 kernel void gated_delta_v2_prep_tree_bf16(
     device const bfloat *proj      [[buffer(0)]],
-    device const bfloat *conv_in   [[buffer(1)]],
-    device const bfloat *conv_w    [[buffer(2)]],
-    device const float  *dt_bias   [[buffer(3)]],
-    device const float  *a_log_exp [[buffer(4)]],
-    device bfloat       *conv_out  [[buffer(5)]],
-    device float        *kn        [[buffer(6)]],
-    device float        *qn        [[buffer(7)]],
-    device float        *vc        [[buffer(8)]],
-    device float        *g_step    [[buffer(9)]],
-    device float        *beta_s    [[buffer(10)]],
-    device float        *cap_gcs   [[buffer(11)]],
-    constant uint  &heads        [[buffer(12)]],
-    constant uint  &dk           [[buffer(13)]],
-    constant uint  &dv           [[buffer(14)]],
-    constant uint  &conv_dim     [[buffer(15)]],
-    constant uint  &key_dim      [[buffer(16)]],
-    constant uint  &value_dim    [[buffer(17)]],
-    constant uint  &ksz          [[buffer(18)]],
-    constant uint  &seg1         [[buffer(19)]],
-    constant uint  &alt_len      [[buffer(20)]],
-    constant uint  &branch_after [[buffer(21)]],
-    constant float &l2_eps       [[buffer(22)]],
+    device const bfloat *ba        [[buffer(1)]],
+    device const bfloat *conv_in   [[buffer(2)]],
+    device const bfloat *conv_w    [[buffer(3)]],
+    device const float  *dt_bias   [[buffer(4)]],
+    device const float  *a_log_exp [[buffer(5)]],
+    device bfloat       *conv_out  [[buffer(6)]],
+    device float        *kn        [[buffer(7)]],
+    device float        *qn        [[buffer(8)]],
+    device float        *vc        [[buffer(9)]],
+    device float        *g_step    [[buffer(10)]],
+    device float        *beta_s    [[buffer(11)]],
+    device float        *cap_gcs   [[buffer(12)]],
+    constant uint  &heads        [[buffer(13)]],
+    constant uint  &dk           [[buffer(14)]],
+    constant uint  &dv           [[buffer(15)]],
+    constant uint  &conv_dim     [[buffer(16)]],
+    constant uint  &key_dim      [[buffer(17)]],
+    constant uint  &value_dim    [[buffer(18)]],
+    constant uint  &ksz          [[buffer(19)]],
+    constant uint  &seg1         [[buffer(20)]],
+    constant uint  &alt_len      [[buffer(21)]],
+    constant uint  &branch_after [[buffer(22)]],
+    constant float &l2_eps       [[buffer(23)]],
     uint h          [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint l_total = seg1 + alt_len;
-    const uint row_stride = conv_dim + value_dim + 2 * heads;
+    const uint row_stride = conv_dim + value_dim;
     const ulong hb = (ulong)h;
 
     threadgroup float q_raw[GD2_MAX_L * 128];
@@ -508,10 +514,8 @@ kernel void gated_delta_v2_prep_tree_bf16(
         float run = 0.0f;
         for (uint pos = 0; pos < l_total; pos++) {
             if (pos == seg1) run = 0.0f;
-            const float b_in =
-                float(proj[pos * row_stride + conv_dim + value_dim + h]);
-            const float a_in =
-                float(proj[pos * row_stride + conv_dim + value_dim + heads + h]);
+            const float b_in = float(ba[pos * 2 * heads + h]);
+            const float a_in = float(ba[pos * 2 * heads + heads + h]);
             const float g = -a_log_exp[h]
                 * metal::precise::log(1.0f + metal::precise::exp(a_in + dt_bias[h]));
             g_step[hb * l_total + pos] = g;
@@ -680,7 +684,7 @@ kernel void gated_delta_v2_epilogue_bf16(
     const uint bi = bh / heads;
     const uint h = bh % heads;
     const uint l = seq_len;
-    const uint row_stride = conv_dim + value_dim + 2 * heads;
+    const uint row_stride = conv_dim + value_dim;
     device const float *o_pre_b = o_pre + (ulong)bi * l * value_dim;
     device const bfloat *proj_b = proj + (ulong)bi * l * row_stride;
     device bfloat *out_b = out + (ulong)bi * l * value_dim;

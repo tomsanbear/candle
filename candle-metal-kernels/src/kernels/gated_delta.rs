@@ -210,6 +210,7 @@ pub fn call_gated_delta_v2(
     seq_len: usize,
     batch: usize,
     proj: &Buffer,
+    ba: &Buffer,
     conv_in: &Buffer,
     state_in: &Buffer,
     conv_w: &Buffer,
@@ -244,6 +245,7 @@ pub fn call_gated_delta_v2(
         encoder,
         (
             proj,
+            ba,
             conv_in,
             conv_w,
             dt_bias,
@@ -358,6 +360,7 @@ pub fn call_gated_delta_v2_decode(
     params: GatedDeltaParams,
     batch: usize,
     proj: &Buffer,
+    ba: &Buffer,
     conv_in: &Buffer,
     state_in: &Buffer,
     conv_w: &Buffer,
@@ -391,6 +394,7 @@ pub fn call_gated_delta_v2_decode(
         encoder,
         (
             proj,
+            ba,
             conv_in,
             state_in,
             conv_w,
@@ -472,6 +476,7 @@ pub fn call_gated_delta_v2_tree(
     alt_len: usize,
     branch_after: usize,
     proj: &Buffer,
+    ba: &Buffer,
     conv_in: &Buffer,
     state_in: &Buffer,
     conv_w: &Buffer,
@@ -516,6 +521,7 @@ pub fn call_gated_delta_v2_tree(
         encoder,
         (
             proj,
+            ba,
             conv_in,
             conv_w,
             dt_bias,

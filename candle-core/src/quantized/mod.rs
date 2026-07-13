@@ -674,6 +674,13 @@ impl QTensor {
         self.storage.dtype()
     }
 
+    /// Raw quantized storage — lets callers hand ggml block buffers directly
+    /// to fused kernels (e.g. the Metal Markov-chain path) without a
+    /// dequantize round-trip.
+    pub fn storage(&self) -> &QStorage {
+        &self.storage
+    }
+
     pub fn device(&self) -> Device {
         self.storage.device()
     }

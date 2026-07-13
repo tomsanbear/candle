@@ -4974,7 +4974,13 @@ kernel void kernel_mul_mv_q3_K_f32(
 
 // DT: dst element type (see the q8_0 impl note — bf16 dst is bit-identical
 // to F32 dst + cast_f32_bf16).
-template <typename YT, typename DT = float>
+// NSG: simdgroups per threadgroup (V1 experiment, q4k-mv-rewrite-round2).
+// NSG=1 reproduces the historical single-simdgroup geometry exactly
+// (first_row = (r0*1 + 0) * N_DST). Larger NSG cuts the threadgroup count
+// NSG-fold — the lm_head at 248094 rows launches 62k single-simdgroup TGs
+// against a measured 54.6% launch limiter. Per-row arithmetic is unchanged,
+// so results stay bit-identical across NSG.
+template <typename YT, typename DT = float, int NSG = 1>
 void kernel_mul_mv_q4_K_impl_t(
         device const  void * src0,
         device const    YT * src1,
@@ -5006,8 +5012,7 @@ void kernel_mul_mv_q4_K_impl_t(
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
-    //const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
-    const int first_row = r0 * N_DST;
+    const int first_row = (r0 * NSG + sgitg) * N_DST;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;
@@ -5146,6 +5151,43 @@ kernel void kernel_mul_mv_q4_K_bf16(
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q4_K_impl_t<bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
+
+// V1 experiment (q4k-mv-rewrite-round2): NSG simdgroups per threadgroup.
+// Dispatch geometry: TG = (4, 8, NSG) = 32*NSG threads; grid width =
+// ceil(ne01 / (N_DST * NSG)). Bit-identical to NSG=1 per row.
+#define MV_Q4K_NSG(NAME, NSG_N)                                             \
+[[host_name(#NAME)]]                                                        \
+kernel void NAME(                                                           \
+        device const   void * src0,                                         \
+        device const bfloat * src1,                                         \
+        device       bfloat * dst,                                          \
+        constant    int64_t & ne00,                                         \
+        constant    int64_t & ne01,                                         \
+        constant    int64_t & ne02,                                         \
+        constant   uint64_t & nb00,                                         \
+        constant   uint64_t & nb01,                                         \
+        constant   uint64_t & nb02,                                         \
+        constant    int64_t & ne10,                                         \
+        constant    int64_t & ne11,                                         \
+        constant    int64_t & ne12,                                         \
+        constant   uint64_t & nb10,                                         \
+        constant   uint64_t & nb11,                                         \
+        constant   uint64_t & nb12,                                         \
+        constant    int64_t & ne0,                                          \
+        constant    int64_t & ne1,                                          \
+        constant    uint    & r2,                                           \
+        constant    uint    & r3,                                           \
+        uint3 tgpig[[threadgroup_position_in_grid]],                        \
+        uint  tiisg[[thread_index_in_simdgroup]],                           \
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {                    \
+    kernel_mul_mv_q4_K_impl_t<bfloat, bfloat, NSG_N>(                       \
+        src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,       \
+        tgpig,tiisg,sgitg);                                                 \
+}
+
+MV_Q4K_NSG(kernel_mul_mv_q4_K_bf16_bf16_nsg2, 2)
+MV_Q4K_NSG(kernel_mul_mv_q4_K_bf16_bf16_nsg4, 4)
+MV_Q4K_NSG(kernel_mul_mv_q4_K_bf16_bf16_nsg8, 8)
 
 // bf16 activations AND bf16 dst (see the q8_0 bf16_bf16 note).
 [[host_name("kernel_mul_mv_q4_K_bf16_bf16")]]

@@ -288,6 +288,92 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+/// V1 experiment (q4k-mv-rewrite-round2): q4_K bf16-in/bf16-out mv with `nsg`
+/// simdgroups per threadgroup. Same per-row arithmetic as the nsg=1 kernel
+/// (bit-identical results); the threadgroup count shrinks nsg-fold, which
+/// targets the measured launch limiter on huge-n shapes (lm_head: 62k
+/// single-simdgroup TGs at nsg=1).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16_nsg(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    nsg: usize,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let name = match nsg {
+        1 => "kernel_mul_mv_q4_K_bf16_bf16",
+        2 => "kernel_mul_mv_q4_K_bf16_bf16_nsg2",
+        4 => "kernel_mul_mv_q4_K_bf16_bf16_nsg4",
+        8 => "kernel_mul_mv_q4_K_bf16_bf16_nsg8",
+        _ => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "nsg must be 1/2/4/8",
+                "qmatmul_mv_nsg",
+            ))
+        }
+    };
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_nsg{nsg} M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            ne12,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    // N_DST = 4 rows per simdgroup; nsg simdgroups per TG.
+    let thread_groups_count = MTLSize {
+        width: divide(n, 4 * nsg),
+        height: m,
+        depth: b,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 4,
+        height: 8,
+        depth: nsg,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Column count handled per threadgroup by the multi-column mv kernels, or
 /// None when the dtype has no `_mc` variant. Must match the NC_MV_* defines in
 /// quantized.metal.

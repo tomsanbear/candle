@@ -439,6 +439,100 @@ fn run_barrier_probe(n: usize, k: usize, depth: usize, chains: usize) -> Result<
     Ok(())
 }
 
+/// V1 (q4k-mv-rewrite-round2): simdgroups-per-threadgroup sweep on the q4_K
+/// bf16/bf16 mv kernel. Per-row arithmetic is identical across nsg, so the
+/// bf16 outputs must match BITWISE vs nsg=1; then the run_qmv timing protocol
+/// per nsg. Targets the launch limiter: nsg=1 launches n/4 single-simdgroup
+/// TGs (62k on the lm_head).
+fn run_nsg_sweep(name: &str, n: usize, k: usize) -> Result<()> {
+    const WARMUP_ITERS: usize = 3;
+    const MIN_DUR: f64 = 1.5;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+    let m = 1usize;
+
+    let (weights, weight_bytes) = q_weight_bytes(GgmlDType::Q4K, n, k);
+    let rhs = device
+        .new_buffer_with_data(
+            weights.as_ptr() as *const core::ffi::c_void,
+            weights.len(),
+            options,
+        )
+        .unwrap();
+    let acts: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 97.0))
+        .collect();
+    let lhs = device
+        .new_buffer_with_data(
+            acts.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts.as_slice()),
+            options,
+        )
+        .unwrap();
+    let dst_ref = device
+        .new_buffer(m * n * core::mem::size_of::<bf16>(), options)
+        .unwrap();
+    let dst = device
+        .new_buffer(m * n * core::mem::size_of::<bf16>(), options)
+        .unwrap();
+
+    // Correctness: each nsg vs nsg=1, bitwise on the bf16 outputs.
+    for nsg in [2usize, 4, 8] {
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_nsg(
+            &device, &encoder, &kernels, 1, (1, m, n, k), &lhs, 0, &rhs, 0, &dst_ref,
+        )?;
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_nsg(
+            &device, &encoder, &kernels, nsg, (1, m, n, k), &lhs, 0, &rhs, 0, &dst,
+        )?;
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let a = unsafe { std::slice::from_raw_parts(dst_ref.contents() as *const u16, m * n) };
+        let b = unsafe { std::slice::from_raw_parts(dst.contents() as *const u16, m * n) };
+        let diffs = (0..m * n).filter(|&i| a[i] != b[i]).count();
+        anyhow::ensure!(diffs == 0, "nsg={nsg} diverges from nsg=1 on {diffs} outputs");
+    }
+    println!("q4_K {name}: nsg 2/4/8 bitwise-identical to nsg=1 over {} outputs", m * n);
+
+    // Timing per nsg, run_qmv protocol.
+    let inner = (50_000_000 / weight_bytes).clamp(4, 512);
+    for nsg in [1usize, 2, 4, 8] {
+        let mut sum_dt = 0f64;
+        let mut iters = 0usize;
+        for idx in 0.. {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            let start_time = std::time::Instant::now();
+            for _ in 0..inner {
+                candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_nsg(
+                    &device, &encoder, &kernels, nsg, (1, m, n, k), &lhs, 0, &rhs, 0, &dst,
+                )?;
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            let dt = start_time.elapsed().as_secs_f64();
+            if idx < WARMUP_ITERS {
+                continue;
+            }
+            sum_dt += dt;
+            iters += inner;
+            if sum_dt > MIN_DUR {
+                break;
+            }
+        }
+        let ms = 1e3 * sum_dt / iters as f64;
+        let gbs = (weight_bytes * iters) as f64 / (1e9 * sum_dt);
+        println!("q4_K {name:>10} n={n:6} k={k:5} nsg={nsg}  {ms:8.3} ms  {gbs:6.1} GB/s");
+    }
+    Ok(())
+}
+
 /// Splits AoS q4_K bytes into the SoA planes the `_soa` kernel reads:
 /// [n*nb 16B headers | n*nb 128B quant blocks].
 fn q4k_soa_bytes(aos: &[u8], n: usize, k: usize) -> Vec<u8> {
@@ -727,6 +821,9 @@ enum Task {
     QmvSoa,
     /// Do independent chains overlap past global auto-barriers? (scoped-barrier gate)
     BarrierProbe,
+    /// V1 (q4k-mv-rewrite-round2): simdgroups-per-TG sweep on q4_K bf16 mv —
+    /// bitwise correctness vs nsg=1 + GB/s per nsg on the deployed shapes.
+    NsgSweep,
 }
 
 #[derive(Parser, Debug)]
@@ -779,6 +876,20 @@ fn main() -> Result<()> {
                 for chains in [2usize, 4] {
                     run_barrier_probe(n, k, 64, chains)?;
                 }
+            }
+        }
+        Task::NsgSweep => {
+            // The deployed decode shapes: huge-n head (launch-limited),
+            // mid-n body projections, and the small-n reductions where the
+            // machine is occupancy-starved at m=1.
+            for (name, n, k) in [
+                ("lm_head", 248094usize, 1024usize),
+                ("dn_qkvz", 8192, 1024),
+                ("mlp_gate_up", 7168, 1024),
+                ("out_proj", 1024, 2048),
+                ("mlp_down", 1024, 3584),
+            ] {
+                run_nsg_sweep(name, n, k)?;
             }
         }
         Task::Qmm => {

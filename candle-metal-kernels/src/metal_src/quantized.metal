@@ -5422,6 +5422,197 @@ MV_Q4K_GEO(kernel_mul_mv_q4_K_bf16_bf16_nr2sg1, bfloat, 1, 2)
 // f32-activation arm of the baseline geometry (dtype discriminator).
 MV_Q4K_GEO(kernel_mul_mv_q4_K_f32y_bf16_base, float, 1, 4)
 
+// ---------------------------------------------------------------------------
+// Fused head GEMV -> argmax (greedy decode: never materialize the 248k-row
+// logits). Per-row arithmetic is byte-for-byte the nr2sg2 path above (per-row
+// values are geometry-independent — the rowtile variants rely on the same
+// property), each simdgroup covering NDST rows across ARGMAX_NTILES row
+// tiles. Instead of storing logits, the winner comparison happens on the
+// float upcast of the bf16-ROUNDED sum — exactly the values candle's
+// fast_argmax sees on the stored-bf16-logits path — with candle's tie rule
+// (max value, LOWEST index; reduce.metal indexed::operator>). Any change to
+// kernel_mul_mv_q4_K_impl_t's accumulation MUST be mirrored here; the bench
+// task's bitwise gate against the production kernel enforces it.
+
+struct mv_argmax_partial {
+    float val;
+    uint  idx;
+};
+
+constant constexpr int ARGMAX_NSG = 2;
+constant constexpr int ARGMAX_NDST = 2;
+constant constexpr int ARGMAX_NTILES = 8;
+
+[[host_name("kernel_mul_mv_q4_K_bf16_argmax_partial")]]
+kernel void kernel_mul_mv_q4_K_bf16_argmax_partial(
+        device const   void * src0,
+        device const bfloat * src1,
+        device mv_argmax_partial * partials,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const int ix = tiisg/8;
+    const int it = tiisg%8;
+    const int iq = it/4;
+    const int ir = it%4;
+
+    const int nb = ne00/QK_K;
+    const int r0 = tgpig.x;
+    const int step = sizeof(block_q4_K) * nb / 2;
+
+    device const bfloat * y = (device const bfloat *) src1;
+
+    float best = -INFINITY;
+    uint best_idx = 0xFFFFFFFFu;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int t = 0; t < ARGMAX_NTILES; ++t) {
+        const int first_row = ((r0 * ARGMAX_NTILES + t) * ARGMAX_NSG + (int)sgitg) * ARGMAX_NDST;
+        if (first_row >= ne01) break;
+        device const block_q4_K * x = (device const block_q4_K *) src0 + first_row*nb;
+
+        float yl[16];
+        float yh[16];
+        float sumf[ARGMAX_NDST]={0.f};
+        device const bfloat * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            q4k_load_y8(y4 +   0, yl + 0);
+            q4k_load_y8(y4 +  32, yl + 8);
+            q4k_load_y8(y4 + 128, yh + 0);
+            q4k_load_y8(y4 + 160, yh + 8);
+            for (int i = 0; i < 8; ++i) {
+                sumy[0] += yl[i+0];
+                sumy[1] += yl[i+8];
+                sumy[2] += yh[i+0];
+                sumy[3] += yh[i+8];
+            }
+
+            device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+            device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     * dh = &x[ib].d;
+
+            for (int row = 0; row < ARGMAX_NDST; row++) {
+                if (first_row + row >= ne01) break;
+
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+                device const uint16_t * q2 = q1 + 32;
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                for (int i = 0; i < 8; i += 2) {
+                    acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
+                    acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
+                    acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
+                    acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
+                    acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
+                    acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
+                    acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
+                    acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
+                }
+
+                float dall = dh[0];
+                float dmin = dh[1];
+                sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                     (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                     (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                     (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+                q1 += step;
+                sc += step;
+                dh += step;
+            }
+
+            y4 += 4 * QK_K;
+        }
+
+        for (int row = 0; row < ARGMAX_NDST; ++row) {
+            const float all_sum = simd_sum(sumf[row]);
+            if (tiisg == 0 && first_row + row < ne01) {
+                // The stored-logits path writes bf16; compare what argmax
+                // would compare (the bf16 upcast is order-isomorphic).
+                const float v = float(bfloat(all_sum));
+                const uint idx = (uint)(first_row + row);
+                if (v > best || (v == best && idx < best_idx)) {
+                    best = v;
+                    best_idx = idx;
+                }
+            }
+        }
+    }
+
+    // Cross-simdgroup winner, then one partial per threadgroup.
+    threadgroup mv_argmax_partial sg_best[ARGMAX_NSG];
+    if (tiisg == 0) {
+        sg_best[sgitg].val = best;
+        sg_best[sgitg].idx = best_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        mv_argmax_partial win = sg_best[0];
+        for (int s = 1; s < ARGMAX_NSG; ++s) {
+            const mv_argmax_partial p = sg_best[s];
+            if (p.val > win.val || (p.val == win.val && p.idx < win.idx)) {
+                win = p;
+            }
+        }
+        partials[r0] = win;
+    }
+}
+
+// Final reduce: [ntg] partials -> the winning row index (u32).
+[[host_name("kernel_mv_argmax_reduce")]]
+kernel void kernel_mv_argmax_reduce(
+        device const mv_argmax_partial * partials,
+        device uint * out,
+        constant uint & ntg,
+        uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float red_val[256];
+    threadgroup uint  red_idx[256];
+
+    float best = -INFINITY;
+    uint best_idx = 0xFFFFFFFFu;
+    for (uint i = tid; i < ntg; i += 256) {
+        const mv_argmax_partial p = partials[i];
+        if (p.val > best || (p.val == best && p.idx < best_idx)) {
+            best = p.val;
+            best_idx = p.idx;
+        }
+    }
+    red_val[tid] = best;
+    red_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            const bool take = red_val[tid + s] > red_val[tid]
+                || (red_val[tid + s] == red_val[tid] && red_idx[tid + s] < red_idx[tid]);
+            if (take) {
+                red_val[tid] = red_val[tid + s];
+                red_idx[tid] = red_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[0] = red_idx[0];
+    }
+}
+
 // bf16 activations AND bf16 dst (see the q8_0 bf16_bf16 note).
 [[host_name("kernel_mul_mv_q4_K_bf16_bf16")]]
 kernel void kernel_mul_mv_q4_K_bf16_bf16(

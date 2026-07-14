@@ -151,6 +151,162 @@ fn q_weight_bytes(dtype: GgmlDType, n: usize, k: usize) -> (Vec<u8>, usize) {
     (bytes, total)
 }
 
+/// Fused head GEMV->argmax gate: the fused kernel's winning index must match
+/// argmax over the production nr2sg2 kernel's bf16 logits (host scan with
+/// candle's lowest-index tie rule) on varied activations AND on manufactured
+/// exact ties (the current argmax row duplicated above and below itself).
+/// Timing runs at pipeline depth 1 — the regime the greedy chain pays.
+fn run_argmax_head() -> Result<()> {
+    const N: usize = 248094;
+    const K: usize = 1024;
+    const ROW_BYTES: usize = (K / 256) * 144;
+
+    let device = Device::system_default().unwrap();
+    let kernels = candle_metal_kernels::Kernels::new();
+    let residency_set = std::sync::Arc::new(ResidencySet::new(&device));
+    let options = RESOURCE_OPTIONS;
+
+    let (mut weights, _) = q_weight_bytes(GgmlDType::Q4K, N, K);
+    let ntg = N.div_ceil(candle_metal_kernels::MV_ARGMAX_ROWS_PER_TG);
+    let partials = device.new_buffer(ntg * 8, options).unwrap();
+    let out_idx = device.new_buffer(4, options).unwrap();
+    let dst_ref = device
+        .new_buffer(N * core::mem::size_of::<bf16>(), options)
+        .unwrap();
+
+    let host_argmax = |logits: &[u16]| -> u32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut best_idx = 0u32;
+        for (i, &bits) in logits.iter().enumerate() {
+            let v = f32::from(bf16::from_bits(bits));
+            if v > best {
+                best = v;
+                best_idx = i as u32;
+            }
+        }
+        best_idx
+    };
+
+    let run_both = |weights_bytes: &[u8], acts: &[bf16]| -> Result<(u32, u32)> {
+        let rhs = device
+            .new_buffer_with_data(
+                weights_bytes.as_ptr() as *const core::ffi::c_void,
+                weights_bytes.len(),
+                options,
+            )
+            .unwrap();
+        let lhs = device
+            .new_buffer_with_data(
+                acts.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(acts),
+                options,
+            )
+            .unwrap();
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_geo(
+            &device, &encoder, &kernels, (2, 2, false), (1, 1, N, K), &lhs, 0, &rhs, 0, &dst_ref,
+        )?;
+        candle_metal_kernels::call_quantized_matmul_mv_q4k_argmax(
+            &device, &encoder, &kernels, (N, K), (&lhs, 0), (&rhs, 0), &partials, &out_idx,
+        )?;
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let logits = unsafe { std::slice::from_raw_parts(dst_ref.contents() as *const u16, N) };
+        let fused = unsafe { *(out_idx.contents() as *const u32) };
+        Ok((host_argmax(logits), fused))
+    };
+
+    // Varied activations: the fused index must match the reference argmax.
+    let mut last_winner = 0u32;
+    for case in 0..24 {
+        let acts: Vec<bf16> = (0..K)
+            .map(|i| bf16::from_f32((((i * 31 + case * 137 + 7) % 211) as f32 - 105.0) / 53.0))
+            .collect();
+        let (reference, fused) = run_both(&weights, &acts)?;
+        anyhow::ensure!(
+            reference == fused,
+            "argmax-head case {case}: fused {fused} != reference {reference}"
+        );
+        last_winner = reference;
+    }
+    println!("argmax-head: fused == reference argmax on 24 varied activations (last winner {last_winner})");
+
+    // Manufactured ties: duplicate the winning row ABOVE itself (winner must
+    // stay put) and BELOW itself (the lower copy must win).
+    let acts: Vec<bf16> = (0..K)
+        .map(|i| bf16::from_f32((((i * 31 + 23 * 137 + 7) % 211) as f32 - 105.0) / 53.0))
+        .collect();
+    let (winner, _) = run_both(&weights, &acts)?;
+    let w = winner as usize;
+    let row = weights[w * ROW_BYTES..(w + 1) * ROW_BYTES].to_vec();
+    let hi = (w + 12345) % N;
+    let hi = if hi > w { hi } else { N - 1 };
+    weights[hi * ROW_BYTES..(hi + 1) * ROW_BYTES].copy_from_slice(&row);
+    let (reference, fused) = run_both(&weights, &acts)?;
+    anyhow::ensure!(
+        reference == winner && fused == winner,
+        "argmax-head tie-above: expected {winner}, reference {reference}, fused {fused}"
+    );
+    let lo = w / 2;
+    weights[lo * ROW_BYTES..(lo + 1) * ROW_BYTES].copy_from_slice(&row);
+    let (reference, fused) = run_both(&weights, &acts)?;
+    anyhow::ensure!(
+        reference == lo as u32 && fused == lo as u32,
+        "argmax-head tie-below: expected {lo}, reference {reference}, fused {fused}"
+    );
+    println!("argmax-head: manufactured exact ties resolve to the lowest index on both paths");
+
+    // Depth-1 timing: one command buffer per iteration, fused pair vs the
+    // stored-logits kernel alone (the argmax stage it replaces is a separate
+    // candle dispatch on top of the baseline number).
+    let rhs = device
+        .new_buffer_with_data(
+            weights.as_ptr() as *const core::ffi::c_void,
+            weights.len(),
+            options,
+        )
+        .unwrap();
+    let lhs = device
+        .new_buffer_with_data(
+            acts.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(acts.as_slice()),
+            options,
+        )
+        .unwrap();
+    for (label, fused_arm) in [("mv-only (logits, no argmax)", false), ("fused mv->argmax", true)] {
+        const ITERS: usize = 200;
+        let mut total = 0f64;
+        for it in 0..ITERS + 20 {
+            let command_queue = device.new_command_queue().unwrap();
+            let commands = Commands::new(command_queue, &residency_set).unwrap();
+            let encoder = commands.command_encoder().unwrap();
+            let start = std::time::Instant::now();
+            if fused_arm {
+                candle_metal_kernels::call_quantized_matmul_mv_q4k_argmax(
+                    &device, &encoder, &kernels, (N, K), (&lhs, 0), (&rhs, 0), &partials, &out_idx,
+                )?;
+            } else {
+                candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_geo(
+                    &device, &encoder, &kernels, (2, 2, false), (1, 1, N, K), &lhs, 0, &rhs, 0,
+                    &dst_ref,
+                )?;
+            }
+            drop(encoder);
+            commands.wait_until_completed().unwrap();
+            if it >= 20 {
+                total += start.elapsed().as_secs_f64();
+            }
+        }
+        println!(
+            "argmax-head {label}: {:8.1} us/call at pipeline depth 1",
+            1e6 * total / ITERS as f64
+        );
+    }
+    Ok(())
+}
+
 /// Quantized matvec / multi-column benchmark on the bf16-activation kernels
 /// (the deployed lmbrrr path). One dispatch per timed iteration, wall time
 /// from encode to wait_until_completed; reports effective weight GB/s.
@@ -1225,6 +1381,10 @@ enum Task {
     /// a same-accumulation-order CPU reference (q8_0 + bf16 w2 variants,
     /// with/without draft-vocab remap) and chain timing per gamma.
     MarkovChain,
+    /// Fused head GEMV->argmax: index equality vs the production nr2sg2
+    /// kernel + host argmax (candle tie rule) incl. manufactured exact ties,
+    /// and depth-1 timing.
+    ArgmaxHead,
 }
 
 #[derive(Parser, Debug)]
@@ -1281,6 +1441,9 @@ fn main() -> Result<()> {
         }
         Task::MarkovChain => {
             run_markov_chain()?;
+        }
+        Task::ArgmaxHead => {
+            run_argmax_head()?;
         }
         Task::NsgSweep => {
             // The deployed decode shapes: huge-n head (launch-limited),

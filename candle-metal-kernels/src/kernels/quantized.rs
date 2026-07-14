@@ -458,6 +458,73 @@ pub fn call_quantized_matmul_mv_q4k_bf16_geo(
     Ok(())
 }
 
+/// Rows per threadgroup in the fused argmax head kernel
+/// (ARGMAX_NTILES * ARGMAX_NSG * ARGMAX_NDST in quantized.metal). The
+/// partials buffer needs `ceil(n / this)` 8-byte entries.
+pub const MV_ARGMAX_ROWS_PER_TG: usize = 32;
+
+/// Fused greedy head: q4_K GEMV whose per-row arithmetic is byte-for-byte
+/// the nr2sg2 production kernel, reduced straight to the argmax row index
+/// (bf16-rounded comparison, candle's lowest-index tie rule) without ever
+/// materializing the logits. m=1 only; `out` receives one u32.
+pub fn call_quantized_matmul_mv_q4k_argmax(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (n, k): (usize, usize),
+    lhs: (&Buffer, usize),
+    rhs: (&Buffer, usize),
+    partials: &Buffer,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let partial = kernels.load_pipeline(
+        device,
+        Source::Quantized,
+        "kernel_mul_mv_q4_K_bf16_argmax_partial",
+    )?;
+    let reduce = kernels.load_pipeline(device, Source::Quantized, "kernel_mv_argmax_reduce")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ntg = divide(n, MV_ARGMAX_ROWS_PER_TG);
+
+    encoder.set_compute_pipeline_state(&partial);
+    debug_group!(encoder, "qmv_argmax_partial N={n} K={k}");
+    set_params!(encoder, (rhs, lhs, Output::new(partials), ne00, ne01));
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: ntg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 4,
+            height: 8,
+            depth: 2,
+        },
+    );
+
+    encoder.set_compute_pipeline_state(&reduce);
+    debug_group!(encoder, "qmv_argmax_reduce ntg={ntg}");
+    let ntg_u32 = ntg as u32;
+    set_params!(encoder, (partials, Output::new(out), ntg_u32));
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// V5 experiment (thread-lifetime hypothesis): q4_K bf16/bf16 mv where each
 /// simdgroup processes `ntiles` consecutive 4-row groups sequentially —
 /// thread lifetime x ntiles, launch churn / ntiles, bit-identical per row.

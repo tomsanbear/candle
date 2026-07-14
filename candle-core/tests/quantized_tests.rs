@@ -1590,3 +1590,56 @@ test_device!(
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
 );
+
+/// Accuracy statistics for the wide q4_K route: mean/max relative error and
+/// signed bias against the dequantized-weights F32 reference. A systematic
+/// bias (not just reordered-sum jitter) here poisons downstream
+/// argmax-agreement (speculative acceptance) even when max-error gates pass.
+#[cfg(feature = "metal")]
+#[test]
+fn test_matmul_mv_wide_accuracy() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let (k, n) = (1024, 512);
+    let rhs = (0..(k * n))
+        .map(|v| ((v * 7919) % 97) as f32 / 97.0 - 0.5)
+        .collect::<Vec<_>>();
+    let rhs_mtl = Tensor::from_slice(&rhs, (n, k), &device)?;
+    let qtensor = quantized::QTensor::quantize(&rhs_mtl, GgmlDType::Q4K)?;
+    // F32 reference through the SAME quantized values.
+    let w_deq = qtensor.dequantize(&device)?;
+    let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+    for m in [2usize, 3, 4] {
+        let lhs = (0..(m * k))
+            .map(|v| ((v * 104729) % 89) as f32 / 89.0 - 0.5)
+            .collect::<Vec<_>>();
+        let lhs_mtl = Tensor::from_slice(&lhs, (1, m, k), &device)?;
+        let expected = lhs_mtl
+            .reshape((m, k))?
+            .matmul(&w_deq.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let got = matmul
+            .forward(&lhs_mtl.to_dtype(candle_core::DType::BF16)?)?
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut sum_rel = 0f64;
+        let mut sum_signed = 0f64;
+        let mut max_rel = 0f64;
+        for (e, g) in expected.iter().zip(got.iter()) {
+            let rel = ((e - g).abs() / e.abs().max(1.0)) as f64;
+            sum_rel += rel;
+            sum_signed += ((g - e) / e.abs().max(1.0)) as f64;
+            max_rel = max_rel.max(rel);
+        }
+        let count = expected.len() as f64;
+        let mean_rel = sum_rel / count;
+        let bias = sum_signed / count;
+        eprintln!("m={m}: mean_rel={mean_rel:.2e} max_rel={max_rel:.2e} signed_bias={bias:.2e}");
+        // BF16 activations bound the honest error at ~2^-8; a mean an order
+        // above that or a bias comparable to the mean indicates a kernel bug.
+        assert!(mean_rel < 4e-3, "mean rel error {mean_rel:.2e} too big at m={m}");
+        assert!(bias.abs() < 1e-3, "systematic bias {bias:.2e} at m={m}");
+    }
+    Ok(())
+}

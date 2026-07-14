@@ -627,3 +627,62 @@ pub fn call_gated_delta_v2_tree(
     );
     Ok(())
 }
+
+/// Rollback state reconstruction, one dispatch per layer (see
+/// gated_delta_v2_reconstruct_* in gated_delta_v2.metal): replaces the f32
+/// broadcast/exp/GEMM chain a partial accept otherwise runs on the host op
+/// graph. `(fmat, gmat)` are (kc, delta) for the v1 state layout and
+/// (delta, kc) for the v2 transposed layout; `c_total` is the capture's
+/// full chunk length so the tensors are passed untrimmed.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gated_delta_v2_reconstruct(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (heads_batch, da, db, prefix, c_total): (usize, usize, usize, usize, usize),
+    out_bf16: bool,
+    s0: &Buffer,
+    fmat: &Buffer,
+    gmat: &Buffer,
+    gcs: &Buffer,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    debug_assert!(prefix >= 1 && prefix <= c_total);
+    let name = if out_bf16 {
+        "gated_delta_v2_reconstruct_bf16"
+    } else {
+        "gated_delta_v2_reconstruct_f32"
+    };
+    let pipeline = kernels.load_pipeline(device, Source::GatedDeltaV2, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_v2_reconstruct hb={heads_batch} prefix={prefix}");
+    set_params!(
+        encoder,
+        (
+            s0,
+            fmat,
+            gmat,
+            gcs,
+            Output::new(out),
+            da as u32,
+            db as u32,
+            prefix as u32,
+            c_total as u32
+        )
+    );
+    encoder.dispatch_threads(
+        MTLSize {
+            width: da * db,
+            height: heads_batch,
+            depth: 1,
+        },
+        MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}

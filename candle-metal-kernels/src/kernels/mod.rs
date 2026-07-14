@@ -27,7 +27,8 @@ pub use dspark::{call_markov_chain, MarkovChainArgs, MARKOV_FUSED_MAX_VD, MARKOV
 pub use fill::*;
 pub use gated_delta::{
     call_gated_delta_chunk, call_gated_delta_decode, call_gated_delta_v2,
-    call_gated_delta_v2_decode, call_gated_delta_v2_tree, GatedDeltaParams, GatedDeltaV2Stages,
+    call_gated_delta_v2_decode, call_gated_delta_v2_reconstruct, call_gated_delta_v2_tree,
+    GatedDeltaParams, GatedDeltaV2Stages,
 };
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};

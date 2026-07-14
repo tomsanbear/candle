@@ -663,6 +663,51 @@ kernel void gated_delta_v2_core_tree(
 }
 
 // ---------------------------------------------------------------------------
+// rollback state reconstruction: one dispatch replaces the per-layer f32
+// broadcast/exp/GEMM chain (measured ~20% of a spec round at m=4):
+//   out[h, a, b] = exp(gcs[h, j]) * s0[h, a, b]
+//                + sum_{i <= j} F[h, i, a] * exp(gcs[h, j] - gcs[h, i]) * G[h, i, b]
+// with j = prefix - 1; (F, G) = (kc, delta) for the v1 layout (a = k_dim,
+// b = v_dim) and (delta, kc) for the v2 transposed layout — the formula is
+// symmetric, so the host just swaps the factor pointers. F/G/gcs index with
+// the capture's FULL chunk stride (c_total), so callers pass untrimmed
+// tensors and only rows i < prefix are read. Grid: (da*db, heads*batch).
+// ---------------------------------------------------------------------------
+#define GDN_RECONSTRUCT(NAME, OUT_T)                                          \
+kernel void NAME(                                                             \
+    device const float *s0   [[buffer(0)]],                                   \
+    device const float *fmat [[buffer(1)]],                                   \
+    device const float *gmat [[buffer(2)]],                                   \
+    device const float *gcs  [[buffer(3)]],                                   \
+    device OUT_T       *out  [[buffer(4)]],                                   \
+    constant uint &da       [[buffer(5)]],                                    \
+    constant uint &db       [[buffer(6)]],                                    \
+    constant uint &prefix   [[buffer(7)]],                                    \
+    constant uint &c_total  [[buffer(8)]],                                    \
+    uint2 tid [[thread_position_in_grid]]) {                                  \
+    const uint ab = tid.x;                                                    \
+    const uint hb = tid.y;                                                    \
+    if (ab >= da * db) {                                                      \
+        return;                                                               \
+    }                                                                         \
+    const uint a = ab / db;                                                   \
+    const uint b = ab % db;                                                   \
+    device const float *g_row = gcs + (ulong)hb * c_total;                    \
+    const float gj = g_row[prefix - 1];                                       \
+    float acc = metal::precise::exp(gj) * s0[((ulong)hb * da + a) * db + b];  \
+    for (uint i = 0; i < prefix; i++) {                                       \
+        const float rel = metal::precise::exp(gj - g_row[i]);                 \
+        const float f = fmat[((ulong)hb * c_total + i) * da + a];             \
+        const float g = gmat[((ulong)hb * c_total + i) * db + b];             \
+        acc = fma(f * rel, g, acc);                                           \
+    }                                                                         \
+    out[((ulong)hb * da + a) * db + b] = OUT_T(acc);                          \
+}
+
+GDN_RECONSTRUCT(gated_delta_v2_reconstruct_f32, float)
+GDN_RECONSTRUCT(gated_delta_v2_reconstruct_bf16, bfloat)
+
+// ---------------------------------------------------------------------------
 // epilogue: grid (heads * batch) TGs x dv threads. Group RMSNorm over the
 // head's output row + silu(z) gating, per position.
 // ---------------------------------------------------------------------------

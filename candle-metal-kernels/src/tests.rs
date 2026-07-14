@@ -73,7 +73,7 @@ fn run<T: Clone>(v: &[T], name: unary::contiguous::Kernel) -> Vec<T> {
     read_to_vec(&output, v.len())
 }
 
-fn run_binary<T: Clone, S: ToString>(x: &[T], y: &[T], name: S) -> Vec<T> {
+fn run_binary<T: Clone>(x: &[T], y: &[T], name: &'static str) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
     let commands = commands(&device);
@@ -2450,4 +2450,149 @@ fn commands_concurrent_acquisition() {
     }
 
     commands.wait_until_completed().unwrap();
+}
+
+/// attn_prep contract: byte-identical to the unfused rmsnorm_bf16 +
+/// rope_partial_bf16 chain (and raw copy for v), including direct
+/// KV-cache-slot placement.
+#[test]
+fn attn_prep_matches_unfused_chain() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+
+    let (heads, kv_heads, t_len, d, rd) = (3usize, 2usize, 4usize, 256usize, 64usize);
+    let (cap, write_pos, pos_base) = (16usize, 5usize, 7usize);
+    let eps = 1e-6f32;
+    let q_out = heads * 2 * d;
+    let kv_out = kv_heads * d;
+    let row = q_out + 2 * kv_out;
+    let max_pos = pos_base + t_len;
+
+    let mut r = rand::rng();
+    let mut rand_vec = |n: usize| -> Vec<bf16> {
+        (0..n)
+            .map(|_| bf16::from_f32(r.random_range(-2.0..2.0)))
+            .collect()
+    };
+    let qkv: Vec<bf16> = rand_vec(t_len * row);
+    let q_alpha: Vec<bf16> = rand_vec(d);
+    let k_alpha: Vec<bf16> = rand_vec(d);
+    let cos: Vec<bf16> = rand_vec(max_pos * rd / 2);
+    let sin: Vec<bf16> = rand_vec(max_pos * rd / 2);
+
+    let qkv_buf = new_buffer(&device, &qkv);
+    let q_alpha_buf = new_buffer(&device, &q_alpha);
+    let k_alpha_buf = new_buffer(&device, &k_alpha);
+    let cos_buf = new_buffer(&device, &cos);
+    let sin_buf = new_buffer(&device, &sin);
+
+    let q_dst = new_buffer(&device, &vec![bf16::from_f32(0.0); heads * t_len * d]);
+    let cache_k = new_buffer(&device, &vec![bf16::from_f32(0.0); kv_heads * cap * d]);
+    let cache_v = new_buffer(&device, &vec![bf16::from_f32(0.0); kv_heads * cap * d]);
+
+    {
+        let encoder = commands.command_encoder().unwrap();
+        call_attn_q_prep(
+            &device, &encoder, &kernels, "attn_q_prep_bf16",
+            heads, t_len, d, rd, row, 2 * d, 0, pos_base, eps,
+            &qkv_buf, 0, &q_alpha_buf, &cos_buf, &sin_buf, &q_dst,
+        )
+        .unwrap();
+        call_attn_kv_prep(
+            &device, &encoder, &kernels, "attn_kv_prep_bf16",
+            kv_heads, t_len, d, rd, row, q_out, q_out + kv_out,
+            cap, write_pos, pos_base, eps,
+            &qkv_buf, 0, &k_alpha_buf, &cos_buf, &sin_buf, &cache_k, &cache_v,
+        )
+        .unwrap();
+        drop(encoder);
+    }
+    commands.wait_until_completed().unwrap();
+
+    // Reference: extract rows in (h, t) order, run the production kernels.
+    let reference = |base: usize, head_stride: usize, n_heads: usize, alpha: &Buffer| -> Vec<bf16> {
+        let mut rows: Vec<bf16> = Vec::with_capacity(n_heads * t_len * d);
+        for h in 0..n_heads {
+            for t in 0..t_len {
+                let start = t * row + base + h * head_stride;
+                rows.extend_from_slice(&qkv[start..start + d]);
+            }
+        }
+        let in_buf = new_buffer(&device, &rows);
+        let norm_buf = new_buffer(&device, &vec![bf16::from_f32(0.0); rows.len()]);
+        let rope_buf = new_buffer(&device, &vec![bf16::from_f32(0.0); rows.len()]);
+        let encoder = commands.command_encoder().unwrap();
+        call_rms_norm(
+            &device, &encoder, &kernels, "rmsnorm_bf16",
+            rows.len(), d, eps, &in_buf, 0, alpha, 0, &norm_buf,
+        )
+        .unwrap();
+        call_rope_partial(
+            &device, &encoder, &kernels, "rope_partial_bf16",
+            n_heads, t_len * d, d, rd, 0,
+            &norm_buf, 0,
+            &cos_buf, pos_base * (rd / 2) * std::mem::size_of::<bf16>(),
+            &sin_buf, pos_base * (rd / 2) * std::mem::size_of::<bf16>(),
+            &rope_buf,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        read_to_vec(&rope_buf, rows.len())
+    };
+
+    let q_ref = reference(0, 2 * d, heads, &q_alpha_buf);
+    let q_got: Vec<bf16> = read_to_vec(&q_dst, heads * t_len * d);
+    // Diagnostic localization: histogram diffs by lane class before asserting.
+    let mut rot = 0usize;
+    let mut pass = 0usize;
+    let mut samples = Vec::new();
+    for (i, (g, r)) in q_got.iter().zip(q_ref.iter()).enumerate() {
+        if g.to_bits() != r.to_bits() {
+            let lane = i % d;
+            if lane < rd { rot += 1 } else { pass += 1 }
+            if samples.len() < 8 {
+                samples.push((i / d, lane, g.to_bits(), r.to_bits()));
+            }
+        }
+    }
+    assert!(
+        rot == 0 && pass == 0,
+        "fused q diverges: {rot} diffs in rotated lanes, {pass} in passthrough lanes (of {} rows x {d}); first: {samples:?}",
+        heads * t_len
+    );
+
+    let k_ref = reference(q_out, d, kv_heads, &k_alpha_buf);
+    let k_got: Vec<bf16> = read_to_vec(&cache_k, kv_heads * cap * d);
+    let v_got: Vec<bf16> = read_to_vec(&cache_v, kv_heads * cap * d);
+    for h in 0..kv_heads {
+        for t in 0..t_len {
+            let slot = (h * cap + write_pos + t) * d;
+            let refrow = &k_ref[(h * t_len + t) * d..(h * t_len + t + 1) * d];
+            assert_eq!(
+                k_got[slot..slot + d].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                refrow.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "fused k cache slot diverges (h={h} t={t})"
+            );
+            let vsrc = t * row + q_out + kv_out + h * d;
+            assert_eq!(
+                v_got[slot..slot + d].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                qkv[vsrc..vsrc + d].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "fused v cache slot diverges (h={h} t={t})"
+            );
+        }
+        // Rows outside the written window must be untouched.
+        for slot_row in 0..cap {
+            if (write_pos..write_pos + t_len).contains(&slot_row) {
+                continue;
+            }
+            let slot = (h * cap + slot_row) * d;
+            assert!(
+                k_got[slot..slot + d].iter().all(|v| v.to_bits() == 0)
+                    && v_got[slot..slot + d].iter().all(|v| v.to_bits() == 0),
+                "cache row {slot_row} outside the append window was written (h={h})"
+            );
+        }
+    }
 }

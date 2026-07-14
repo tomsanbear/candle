@@ -1,7 +1,7 @@
 use crate::source::{
-    AFFINE, BINARY, CAST, CONV, DSPARK, FILL, GATED_DELTA, GATED_DELTA_CHUNK, GATED_DELTA_V2,
-    GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, SDPA, SKINNY_GEMM, SORT,
-    TERNARY, UNARY,
+    AFFINE, ATTN_PREP, BINARY, CAST, CONV, DSPARK, FILL, GATED_DELTA, GATED_DELTA_CHUNK,
+    GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, SDPA,
+    SKINNY_GEMM, SORT, TERNARY, UNARY,
 };
 use crate::utils::get_env_bool;
 use crate::{
@@ -134,6 +134,7 @@ impl Kernels {
             Source::GatedDeltaV2 => GATED_DELTA_V2,
             Source::SkinnyGemm => SKINNY_GEMM,
             Source::Dspark => DSPARK,
+            Source::AttnPrep => ATTN_PREP,
         }
     }
 

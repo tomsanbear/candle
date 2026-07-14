@@ -1,4 +1,5 @@
 pub mod affine;
+pub mod attn_prep;
 pub mod binary;
 pub mod cast;
 pub mod convolution;
@@ -18,6 +19,7 @@ pub mod ternary;
 pub mod unary;
 
 pub use affine::*;
+pub use attn_prep::{call_attn_kv_prep, call_attn_q_prep, ATTN_PREP_BLOCK, ATTN_PREP_MAX_D};
 pub use binary::{call_binary_contiguous, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;

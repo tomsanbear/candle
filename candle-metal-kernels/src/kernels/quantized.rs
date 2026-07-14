@@ -474,13 +474,18 @@ pub fn call_quantized_matmul_mv_q4k_bf16_geo(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let name = match (nsg, ndst, f32_y) {
-        (1, 4, true) => "kernel_mul_mv_q4_K_f32y_bf16_base",
-        (2, 2, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg2",
-        (1, 2, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg1",
+    // nsg == 0 encodes the batch-fastest nr2sg2 variant (swizzled tgpig;
+    // grid transposed below so the m rows co-schedule on the same weights).
+    let batch_fast = nsg == 0;
+    let (nsg, ndst) = if batch_fast { (2, 2) } else { (nsg, ndst) };
+    let name = match (batch_fast, nsg, ndst, f32_y) {
+        (true, _, _, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg2_bfast",
+        (false, 1, 4, true) => "kernel_mul_mv_q4_K_f32y_bf16_base",
+        (false, 2, 2, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg2",
+        (false, 1, 2, false) => "kernel_mul_mv_q4_K_bf16_bf16_nr2sg1",
         _ => {
             return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "geo wants (2,2,false), (1,2,false) or (1,4,true)",
+                "geo wants (2,2,false), (1,2,false), (1,4,true) or (0,_,false)",
                 "qmatmul_mv_geo",
             ))
         }
@@ -526,10 +531,18 @@ pub fn call_quantized_matmul_mv_q4k_bf16_geo(
             r3
         )
     );
-    let thread_groups_count = MTLSize {
-        width: divide(n, ndst * nsg),
-        height: m,
-        depth: b,
+    let thread_groups_count = if batch_fast {
+        MTLSize {
+            width: m,
+            height: divide(n, ndst * nsg),
+            depth: b,
+        }
+    } else {
+        MTLSize {
+            width: divide(n, ndst * nsg),
+            height: m,
+            depth: b,
+        }
     };
     let threads_per_threadgroup = MTLSize {
         width: 4,

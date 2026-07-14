@@ -342,12 +342,14 @@ impl QMetalStorage {
             match std::env::var("LMBRRR_Q4K_SMALL_M").as_deref() {
                 Ok("mc") => 1,
                 Ok("mv") => 2,
+                Ok("mvbf") => 3,
                 _ => 0,
             }
         });
         let mc_supported = src_minus2 == m
             && (2..=12).contains(&m)
             && small_m_route != 2
+            && !(small_m_route == 3 && (2..=12).contains(&m))
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some();
         // BF16 activations go straight into the quantized-block kernels where
         // a variant exists, skipping the F32 cast round-trip.
@@ -444,6 +446,7 @@ impl QMetalStorage {
             if let (Some(geo), GgmlDType::Q4K, true, true) =
                 (geo, self.dtype, src1_bf16, dst_bf16)
             {
+                let geo = if small_m_route == 3 && m > 1 { (0, 0, false) } else { geo };
                 candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_geo(
                     device.device(),
                     &encoder,

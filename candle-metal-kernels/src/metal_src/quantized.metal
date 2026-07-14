@@ -5422,6 +5422,45 @@ MV_Q4K_GEO(kernel_mul_mv_q4_K_bf16_bf16_nr2sg1, bfloat, 1, 2)
 // f32-activation arm of the baseline geometry (dtype discriminator).
 MV_Q4K_GEO(kernel_mul_mv_q4_K_f32y_bf16_base, float, 1, 4)
 
+// Batch-fastest grid order for small-m: identical per-row arithmetic to
+// nr2sg2, but tgpig is swizzled so the m activation rows are ADJACENT in
+// threadgroup dispatch order. Concurrent rows then stream the same weight
+// lines together and the second read hits cache instead of DRAM — the
+// mechanism behind MLX's near-free m=2 (their qmv_fast grid puts batch on
+// the fastest axis; our row-fastest grid measured 1.93x at m=2 from the two
+// weight passes being ~143MB apart in time on the lm_head).
+#define MV_Q4K_GEO_BATCHFAST(NAME, YT_T, NSG_N, NDST_N)                     \
+[[host_name(#NAME)]]                                                        \
+kernel void NAME(                                                           \
+        device const   void * src0,                                        \
+        device const   YT_T * src1,                                        \
+        device       bfloat * dst,                                         \
+        constant    int64_t & ne00,                                        \
+        constant    int64_t & ne01,                                        \
+        constant    int64_t & ne02,                                        \
+        constant   uint64_t & nb00,                                        \
+        constant   uint64_t & nb01,                                        \
+        constant   uint64_t & nb02,                                        \
+        constant    int64_t & ne10,                                        \
+        constant    int64_t & ne11,                                        \
+        constant    int64_t & ne12,                                        \
+        constant   uint64_t & nb10,                                        \
+        constant   uint64_t & nb11,                                        \
+        constant   uint64_t & nb12,                                        \
+        constant    int64_t & ne0,                                         \
+        constant    int64_t & ne1,                                         \
+        constant    uint    & r2,                                          \
+        constant    uint    & r3,                                          \
+        uint3 tgpig[[threadgroup_position_in_grid]],                       \
+        uint  tiisg[[thread_index_in_simdgroup]],                          \
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {                   \
+    kernel_mul_mv_q4_K_impl_t<YT_T, bfloat, NSG_N, NDST_N>(                 \
+        src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,       \
+        uint3(tgpig.y, tgpig.x, tgpig.z),tiisg,sgitg);                      \
+}
+
+MV_Q4K_GEO_BATCHFAST(kernel_mul_mv_q4_K_bf16_bf16_nr2sg2_bfast, bfloat, 2, 2)
+
 // ---------------------------------------------------------------------------
 // Wide q4_K matvec: VECS activation rows streamed against one weight decode
 // (MLX qmv_wide's amortization applied to the q4_K block layout). The mc

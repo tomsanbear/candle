@@ -6,9 +6,9 @@
 // Why: per-dispatch counters show the shipped mv kernel spends 61% of its
 // 3.26B ALU instructions on integer mask/shift dequantization — the
 // documented issue-width limiter at ~92% of DRAM roof. MSL 4.1's
-// packed_numeric_type<uint4b_format, 8>::unpack converts 8 packed 4-bit
-// values in one construct; if it lowers to a real widening op, the integer
-// stream collapses.
+// packed_numeric_type<uint4b_format, 16> unpack converts a thread's whole
+// 8-byte plane slice in one construct; if it lowers to a real widening op,
+// the integer stream collapses.
 //
 // Geometry and per-thread slice mirror kernel_mul_mv_q4_K_impl_t (nr2sg2:
 // NDST = 2 rows/simdgroup, NSG = 2) so A/B differences are inner-loop-only.
@@ -28,6 +28,18 @@ using namespace metal;
 
 #define QK_K 256
 #define K_SCALE_SIZE 12
+
+// 16 nibbles per 64-bit word — a thread's full 8-byte plane slice in ONE
+// unpack (Table 2.19 caps uint4b_format at N=16). The constructor takes
+// storage_type (packed_vec<uchar, 8>), NOT a scalar — passing an integer
+// directly scalar-converts to uchar and broadcasts one byte (Table 2.18).
+// Lane order is little-endian nibbles: lane 2b = byte b low nibble,
+// lane 2b+1 = byte b high nibble.
+using pnu4x16_t = packed_numeric_type<uint4b_format, 16>;
+
+inline vec<float, 16> unpack_q4x16(ulong w) {
+    return unpack<float>(pnu4x16_t(as_type<pnu4x16_t::storage_type>(w)));
+}
 
 typedef struct {
     half d;
@@ -117,9 +129,10 @@ kernel void kernel_mul_mv_q4_K_bf16_bf16_unpk(
 
         device const uint8_t * scb = x[ib].scales;
         // Thread slice: 8 bytes of the q1 plane pair and 8 of q2 (see the
-        // shipped kernel); as uints that is 2 words each.
-        device const uint * q1 = (device const uint *)(x[ib].qs + 32 * iq + 8 * ir);
-        device const uint * q2 = q1 + 16; // +64 bytes
+        // shipped kernel); one 64-bit word each. 8-byte aligned: qs sits at
+        // offset 16 in the 144-byte block and the slice offset is 8*ir.
+        device const ulong * q1 = (device const ulong *)(x[ib].qs + 32 * iq + 8 * ir);
+        device const ulong * q2 = q1 + 8; // +64 bytes
 
         for (int row = 0; row < NDST; row++) {
             if (first_row + row >= ne01) break;
@@ -132,23 +145,22 @@ kernel void kernel_mul_mv_q4_K_bf16_bf16_unpk(
 
             device const half * dh = &((device const block_q4_K *)((device const uint8_t *)x + row * step))[ib].d;
             // Row-strided views of the same slice for row 1.
-            device const uint * q1r = (device const uint *)((device const uint8_t *)q1 + row * step);
-            device const uint * q2r = (device const uint *)((device const uint8_t *)q2 + row * step);
+            device const ulong * q1r = (device const ulong *)((device const uint8_t *)q1 + row * step);
+            device const ulong * q2r = (device const ulong *)((device const uint8_t *)q2 + row * step);
+
+            // One unpack per plane slice: even lanes are the low plane
+            // (values b -> yl[b]), odd lanes the high plane (values b+32
+            // -> yl[b+8]); q2 covers the +128 region paired with yh.
+            const vec<float, 16> v1 = unpack_q4x16(q1r[0]);
+            const vec<float, 16> v2 = unpack_q4x16(q2r[0]);
 
             float acc_l1 = 0.f, acc_h1 = 0.f;
             float acc_l2 = 0.f, acc_h2 = 0.f;
-            for (int w = 0; w < 2; ++w) {
-                packed_numeric_type<uint4b_format, 8> p1(q1r[w]);
-                packed_numeric_type<uint4b_format, 8> p2(q2r[w]);
-                const vec<float, 8> v1 = unpack<float>(p1);
-                const vec<float, 8> v2 = unpack<float>(p2);
-                const int b0 = 4 * w;
-                for (int j = 0; j < 4; ++j) {
-                    acc_l1 += yl[b0 + j + 0] * v1[2 * j + 0];
-                    acc_h1 += yl[b0 + j + 8] * v1[2 * j + 1];
-                    acc_l2 += yh[b0 + j + 0] * v2[2 * j + 0];
-                    acc_h2 += yh[b0 + j + 8] * v2[2 * j + 1];
-                }
+            for (int b = 0; b < 8; ++b) {
+                acc_l1 = fma(yl[b + 0], v1[2 * b + 0], acc_l1);
+                acc_h1 = fma(yl[b + 8], v1[2 * b + 1], acc_h1);
+                acc_l2 = fma(yh[b + 0], v2[2 * b + 0], acc_l2);
+                acc_h2 = fma(yh[b + 8], v2[2 * b + 1], acc_h2);
             }
 
             const float dall = dh[0];

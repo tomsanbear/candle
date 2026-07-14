@@ -5496,11 +5496,25 @@ void kernel_mul_mv_q4_K_wide_impl(
             mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
         }
 
-        // The sub-block's 16 nibble-plane words, decoded once for all vecs.
+        // Dequantize the sub-block ONCE into float registers (MLX qmv_wide's
+        // load-bearing move: the per-vector loop below must be pure float
+        // FMA — replaying the nibble masks per vector re-pays the unpack and
+        // measured SLOWER than the mc kernels). Scale applied at the end per
+        // vector; qf holds raw quant values so the sumy/dmin factoring stays.
         device const uint16_t * q = (device const uint16_t *)x[ib].qs + qs_off;
-        uint16_t qw[16];
-        for (int i = 0; i < 16; ++i) {
-            qw[i] = q[i];
+        float qf[32];
+        if (plane_hi == 0) {
+            for (int i = 0; i < 16; ++i) {
+                const uint16_t w = q[i];
+                qf[2 * i + 0] = float(w & 0x000F);
+                qf[2 * i + 1] = float((w >> 8) & 0x000F);
+            }
+        } else {
+            for (int i = 0; i < 16; ++i) {
+                const uint16_t w = q[i];
+                qf[2 * i + 0] = float((w >> 4) & 0x000F);
+                qf[2 * i + 1] = float((w >> 12) & 0x000F);
+            }
         }
 
         const float dsc = dall * sc;
@@ -5513,28 +5527,13 @@ void kernel_mul_mv_q4_K_wide_impl(
             q4k_load_y8(yv[v] + ib * QK_K + y_off + 16, yh_ + 0);
             q4k_load_y8(yv[v] + ib * QK_K + y_off + 24, yh_ + 8);
 
-            float acc_even = 0.f;
-            float acc_odd = 0.f;
+            float acc = 0.f;
             float sumy = 0.f;
-            if (plane_hi == 0) {
-                for (int i = 0; i < 8; ++i) {
-                    acc_even += yl[2 * i + 0] * (qw[i] & 0x000F)
-                              + yh_[2 * i + 0] * (qw[i + 8] & 0x000F);
-                    acc_odd  += yl[2 * i + 1] * (qw[i] & 0x0F00)
-                              + yh_[2 * i + 1] * (qw[i + 8] & 0x0F00);
-                    sumy += yl[2 * i] + yl[2 * i + 1] + yh_[2 * i] + yh_[2 * i + 1];
-                }
-                resf[v] += dsc * (acc_even + (1.f / 256.f) * acc_odd) - dmn * sumy;
-            } else {
-                for (int i = 0; i < 8; ++i) {
-                    acc_even += yl[2 * i + 0] * (qw[i] & 0x00F0)
-                              + yh_[2 * i + 0] * (qw[i + 8] & 0x00F0);
-                    acc_odd  += yl[2 * i + 1] * (qw[i] & 0xF000)
-                              + yh_[2 * i + 1] * (qw[i + 8] & 0xF000);
-                    sumy += yl[2 * i] + yl[2 * i + 1] + yh_[2 * i] + yh_[2 * i + 1];
-                }
-                resf[v] += dsc * (1.f / 16.f) * (acc_even + (1.f / 256.f) * acc_odd) - dmn * sumy;
+            for (int i = 0; i < 16; ++i) {
+                acc += yl[i] * qf[i] + yh_[i] * qf[i + 16];
+                sumy += yl[i] + yh_[i];
             }
+            resf[v] += dsc * acc - dmn * sumy;
         }
     }
 

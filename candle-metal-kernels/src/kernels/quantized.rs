@@ -551,7 +551,9 @@ pub fn call_mm2d_q4k_rowsums(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "mm2d_q4k_rowsums m={m} k={k}");
     let k_dim = k as i32;
-    set_params!(encoder, ((lhs, lhs_offset), rs, k_dim));
+    // rs MUST register as an output: the concurrent encoder's hazard
+    // tracking inserts the barrier the following matmul's read needs.
+    set_params!(encoder, ((lhs, lhs_offset), Output::with_offset(rs, 0), k_dim));
     let grid = MTLSize {
         width: k / 32,
         height: m,

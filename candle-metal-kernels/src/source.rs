@@ -20,6 +20,7 @@ pub const GATED_DELTA_V2: &str = include_str!("metal_src/gated_delta_v2.metal");
 pub const SKINNY_GEMM: &str = include_str!("metal_src/skinny_gemm.metal");
 pub const DSPARK: &str = include_str!("metal_src/dspark.metal");
 pub const ATTN_PREP: &str = include_str!("metal_src/attn_prep.metal");
+pub const QUANTIZED_UNPK: &str = include_str!("metal_src/quantized_unpk.metal");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
@@ -45,4 +46,5 @@ pub enum Source {
     SkinnyGemm,
     Dspark,
     AttnPrep,
+    QuantizedUnpk,
 }

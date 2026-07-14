@@ -1,8 +1,13 @@
 use crate::source::{
     AFFINE, ATTN_PREP, BINARY, CAST, CONV, DSPARK, FILL, GATED_DELTA, GATED_DELTA_CHUNK,
-    GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, SDPA,
-    SKINNY_GEMM, SORT, TERNARY, UNARY,
+    GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, QUANTIZED_UNPK, RANDOM,
+    REDUCE, SDPA, SKINNY_GEMM, SORT, TERNARY, UNARY,
 };
+
+/// MTLLanguageVersion raw value for MSL 4.1 ((4 << 16) | 1). The SDK enum
+/// has no named case yet; macOS 27's runtime compiler accepts it (probe
+/// receipts on the m3-macos26-eval-suite ticket).
+const MSL_4_1_RAW: usize = (4 << 16) | 1;
 use crate::utils::get_env_bool;
 use crate::{
     ComputePipeline, ConstantValues, Device, Function, Library, MTLCompileOptions,
@@ -135,6 +140,7 @@ impl Kernels {
             Source::SkinnyGemm => SKINNY_GEMM,
             Source::Dspark => DSPARK,
             Source::AttnPrep => ATTN_PREP,
+            Source::QuantizedUnpk => QUANTIZED_UNPK,
         }
     }
 
@@ -159,6 +165,13 @@ impl Kernels {
             let lib = {
                 let source_content = self.get_library_source(source);
                 let compile_options = get_compile_options();
+                // MSL-4.1 sources (packed_numeric unpack kernels) are gated
+                // to their own Source so the rest of the shader set keeps
+                // its exact compiler behaviour. macOS < 27 has no 4.1: the
+                // load fails here and callers fall back by routing.
+                if matches!(source, Source::QuantizedUnpk) {
+                    compile_options.setLanguageVersion(objc2_metal::MTLLanguageVersion(MSL_4_1_RAW));
+                }
                 device
                     .new_library_with_source(source_content, Some(&compile_options))
                     .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?

@@ -1643,3 +1643,61 @@ fn test_matmul_mv_wide_accuracy() -> Result<()> {
     }
     Ok(())
 }
+
+/// MSL-4.1 unpk q4_K mv variant vs the dequantized-weights F32 reference
+/// (same statistical guards as the wide test: mean at the bf16-activation
+/// floor, no systematic bias). Skips gracefully where MSL 4.1 is absent
+/// (macOS < 27) — the router falls back there, so nothing ships untested.
+/// nextest's per-process isolation makes the env var safe to set here.
+#[cfg(feature = "metal")]
+#[test]
+fn test_matmul_mv_unpk_accuracy() -> Result<()> {
+    std::env::set_var("LMBRRR_Q4K_MV_VARIANT", "unpk");
+    let device = Device::new_metal(0)?;
+    let (k, n) = (1024, 515); // non-multiple-of-4 rows: tail guard coverage
+    let rhs = (0..(k * n))
+        .map(|v| ((v * 7919) % 97) as f32 / 97.0 - 0.5)
+        .collect::<Vec<_>>();
+    let rhs_mtl = Tensor::from_slice(&rhs, (n, k), &device)?;
+    let qtensor = quantized::QTensor::quantize(&rhs_mtl, GgmlDType::Q4K)?;
+    let w_deq = qtensor.dequantize(&device)?;
+    let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+    let lhs = (0..k)
+        .map(|v| ((v * 104729) % 89) as f32 / 89.0 - 0.5)
+        .collect::<Vec<_>>();
+    let lhs_mtl = Tensor::from_slice(&lhs, (1, 1, k), &device)?;
+    let expected = lhs_mtl
+        .reshape((1, k))?
+        .matmul(&w_deq.t()?)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let got = match matmul.forward(&lhs_mtl.to_dtype(candle_core::DType::BF16)?) {
+        Ok(t) => t,
+        Err(err) => {
+            // macOS < 27: the unpk library cannot compile; the router warns
+            // and falls back, so forward still succeeds — reaching this arm
+            // means something else broke.
+            return Err(err);
+        }
+    };
+    let got = got
+        .to_dtype(candle_core::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let mut sum_rel = 0f64;
+    let mut sum_signed = 0f64;
+    let mut max_rel = 0f64;
+    for (e, g) in expected.iter().zip(got.iter()) {
+        let rel = ((e - g).abs() / e.abs().max(1.0)) as f64;
+        sum_rel += rel;
+        sum_signed += ((g - e) / e.abs().max(1.0)) as f64;
+        max_rel = max_rel.max(rel);
+    }
+    let count = expected.len() as f64;
+    let mean_rel = sum_rel / count;
+    let bias = sum_signed / count;
+    eprintln!("unpk m=1: mean_rel={mean_rel:.2e} max_rel={max_rel:.2e} signed_bias={bias:.2e}");
+    assert!(mean_rel < 4e-3, "mean rel error {mean_rel:.2e} too big");
+    assert!(bias.abs() < 1e-3, "systematic bias {bias:.2e}");
+    Ok(())
+}

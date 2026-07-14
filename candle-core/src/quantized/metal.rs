@@ -443,7 +443,45 @@ impl QMetalStorage {
                     _ => Some((2, 2, false)),
                 }
             });
-            if let (Some(geo), GgmlDType::Q4K, true, true) =
+            // MSL-4.1 packed_numeric arm (LMBRRR_Q4K_MV_VARIANT=unpk):
+            // hardware 4-bit unpack instead of the masked-FMA integer
+            // stream. Only compiles on macOS 27+; a load failure falls
+            // through to the default geometry (warned once).
+            static Q4K_MV_UNPK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let want_unpk = *Q4K_MV_UNPK.get_or_init(|| {
+                std::env::var("LMBRRR_Q4K_MV_VARIANT").as_deref() == Ok("unpk")
+            });
+            static UNPK_FELL_BACK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            let mut handled = false;
+            if want_unpk
+                && matches!(self.dtype, GgmlDType::Q4K)
+                && src1_bf16
+                && dst_bf16
+                && k % 256 == 0
+            {
+                match candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_unpk(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    (1, m, n, k),
+                    storage.buffer(),
+                    layout.start_offset() * storage.dtype().size_in_bytes(),
+                    &self.buffer,
+                    0,
+                    &dst,
+                ) {
+                    Ok(()) => handled = true,
+                    Err(err) => {
+                        UNPK_FELL_BACK.get_or_init(|| {
+                            eprintln!(
+                                "warning: q4k unpk kernel unavailable, using default ({err})"
+                            );
+                        });
+                    }
+                }
+            }
+            if handled {
+            } else if let (Some(geo), GgmlDType::Q4K, true, true) =
                 (geo, self.dtype, src1_bf16, dst_bf16)
             {
                 let geo = if small_m_route == 3 && m > 1 { (0, 0, false) } else { geo };

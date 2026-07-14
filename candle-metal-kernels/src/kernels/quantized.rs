@@ -462,6 +462,78 @@ pub fn call_quantized_matmul_mv_q4k_bf16_wide(
     Ok(())
 }
 
+/// MSL-4.1 packed_numeric variant (nr2sg2 geometry, unpack inner loop).
+/// Compiles only on macOS 27+; callers treat a load error as "route to the
+/// default kernel" (see the m3-macos26-eval-suite ticket receipts).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16_unpk(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let (nsg, ndst) = (2usize, 2usize);
+    let name = "kernel_mul_mv_q4_K_bf16_bf16_unpk";
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    let pipeline = kernels.load_pipeline(device, Source::QuantizedUnpk, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_unpk M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            ne12,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(n, ndst * nsg),
+        height: m,
+        depth: b,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 4,
+        height: 8,
+        depth: nsg,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 pub fn call_quantized_matmul_mv_q4k_bf16_geo(
     device: &Device,
     ep: impl EncoderProvider,

@@ -534,44 +534,11 @@ pub fn call_quantized_matmul_mv_q4k_bf16_unpk(
     Ok(())
 }
 
-/// Per-32-element row sums of the bf16 activations, feeding the tensor-op
-/// kernel's dmin term. rs is m x (k/32) f32.
-pub fn call_mm2d_q4k_rowsums(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    (m, k): (usize, usize),
-    lhs: &Buffer,
-    lhs_offset: usize,
-    rs: &Buffer,
-) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mm2d_q4k_rowsums")?;
-    let encoder = ep.encoder();
-    let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "mm2d_q4k_rowsums m={m} k={k}");
-    let k_dim = k as i32;
-    // rs MUST register as an output: the concurrent encoder's hazard
-    // tracking inserts the barrier the following matmul's read needs.
-    set_params!(encoder, ((lhs, lhs_offset), Output::with_offset(rs, 0), k_dim));
-    let grid = MTLSize {
-        width: k / 32,
-        height: m,
-        depth: 1,
-    };
-    let tg = MTLSize {
-        width: (k / 32).min(32),
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatch_threads(grid, tg);
-    Ok(())
-}
-
 /// Tensor-op (matmul2d) q4_K matmul for m in [1,8]: exact q4_K semantics on
 /// the repacked plane layout (nibbles [k, n_pad] + fp16 dsc/dmm planes; see
-/// mm2d_q4k.metal). rs comes from [`call_mm2d_q4k_rowsums`]. dst is bf16
-/// [m, n]. The M tile is hardware-fixed at 8; m <= 8 rides one tile.
+/// mm2d_q4k.metal). One dispatch per linear (the dmin row sums are computed
+/// in-kernel). dst is bf16 [m, n]. The M tile is hardware-fixed at 8;
+/// m <= 8 rides one tile; k caps at 8192 (threadgroup row-sum budget).
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mm2d_q4k(
     device: &Device,
@@ -583,11 +550,10 @@ pub fn call_quantized_matmul_mm2d_q4k(
     nibbles: &Buffer,
     dsc: &Buffer,
     dmm: &Buffer,
-    rs: &Buffer,
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    debug_assert!(m <= 8 && k % 32 == 0 && n_pad % 64 == 0);
+    debug_assert!(m <= 8 && k % 32 == 0 && k <= 8192 && n_pad % 64 == 0);
     let pipeline = kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mul_mm2d_q4k_bf16")?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -601,7 +567,6 @@ pub fn call_quantized_matmul_mm2d_q4k(
             nibbles,
             dsc,
             dmm,
-            rs,
             Output::with_offset(dst, dst_offset),
             &dims[..]
         )

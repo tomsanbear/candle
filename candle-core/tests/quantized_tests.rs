@@ -1766,24 +1766,11 @@ fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
     let nib_buf = mk_buf(&planes.nibbles);
     let dsc_buf = mk_buf(as_bytes(planes.dsc.as_ptr() as *const u8, planes.dsc.len() * 2));
     let dmm_buf = mk_buf(as_bytes(planes.dmm.as_ptr() as *const u8, planes.dmm.len() * 2));
-    let rs_buf = raw.new_buffer(m * (k / 32) * 4, opts).unwrap();
     let dst_buf = raw.new_buffer(m * n * 2, opts).unwrap();
 
     {
         let encoder = metal_device.command_encoder()?;
-        if let Err(err) = candle_metal_kernels::call_mm2d_q4k_rowsums(
-            raw,
-            &encoder,
-            metal_device.kernels(),
-            (m, k),
-            &lhs_buf,
-            0,
-            &rs_buf,
-        ) {
-            eprintln!("skipping: mm2d pipelines unavailable on this OS ({err})");
-            return Ok(());
-        }
-        candle_metal_kernels::call_quantized_matmul_mm2d_q4k(
+        if let Err(err) = candle_metal_kernels::call_quantized_matmul_mm2d_q4k(
             raw,
             &encoder,
             metal_device.kernels(),
@@ -1793,11 +1780,12 @@ fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
             &nib_buf,
             &dsc_buf,
             &dmm_buf,
-            &rs_buf,
             0,
             &dst_buf,
-        )
-        .map_err(candle_core::Error::wrap)?;
+        ) {
+            eprintln!("skipping: mm2d pipelines unavailable on this OS ({err})");
+            return Ok(());
+        }
     }
     metal_device.flush_and_wait_current()?;
 

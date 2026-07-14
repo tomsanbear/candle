@@ -34,79 +34,85 @@ using namespace mpp;
 // every model shape is far below.
 #define MM2D_MAX_NJ 256
 
-kernel void kernel_mul_mm2d_q4k_bf16(
-    device const bfloat * a_p   [[ buffer(0) ]],
-    device const uchar  * b_p   [[ buffer(1) ]],
-    device const half   * dsc_p [[ buffer(2) ]],
-    device const half   * dmm_p [[ buffer(3) ]],
-    device bfloat       * c_p   [[ buffer(4) ]],
-    constant int4       & dims  [[ buffer(5) ]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  tidx [[thread_index_in_threadgroup]]) {
-  const int K = dims.x;
-  const int Npad = dims.y;
-  const int Nreal = dims.z;
-  const int Mreal = dims.w;
-  const int NJ = K / 32;
-  const int n0 = int(tgid.x) * 64;
-
-  tensor<device bfloat, dextents<int, 2>, tensor_inline>
-      a((device bfloat *)a_p, dextents<int, 2>(K, Mreal));
-  tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
-      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
-
-  constexpr auto d = tensor_ops::matmul2d_descriptor(8, 64, 32);
-  tensor_ops::matmul2d<d, execution_simdgroups<4>> op;
-
-  // Per-32-slice row sums of A for the dmin term, computed in threadgroup
-  // memory instead of a separate dispatch: the A tile is SLC-resident (the
-  // matmul reads it anyway), and the extra dispatch's hazard barrier was
-  // serializing the concurrent encoder across every linear.
-  threadgroup float rs_tg[8 * MM2D_MAX_NJ];
-  const int entries = Mreal * NJ;
-  for (int e = int(tidx); e < entries; e += 128) {
-    const int m = e / NJ;
-    const int j = e % NJ;
-    device const bfloat * row = a_p + m * K + 32 * j;
-    float s = 0.0f;
-    for (int i = 0; i < 32; ++i) {
-      s += float(row[i]);
-    }
-    rs_tg[e] = s;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  auto acc = op.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    acc[i] = 0.0f;
-  }
-
-  for (int j = 0; j < NJ; ++j) {
-    auto mA = a.slice(32 * j, 0);
-    auto mB = b.slice(n0, 32 * j);
-    auto p = op.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-    op.run(mA, mB, p);
-    for (ushort i = 0; i < p.get_capacity(); ++i) {
-      auto mdi = p.get_multidimensional_index(i);
-      const int n = n0 + mdi[0];
-      const int m = mdi[1];
-      const float w = float(dsc_p[n * NJ + j]);
-      const float mn = float(dmm_p[n * NJ + j]);
-      // Tile rows beyond Mreal are dead (never stored) but must not read
-      // out of bounds.
-      const float r = m < Mreal ? rs_tg[m * NJ + j] : 0.0f;
-      acc[i] = fma(w, p[i], fma(-mn, r, acc[i]));
-    }
-  }
-
-  // Direct bf16 stores: real-N/real-m guards double as tail handling, so no
-  // padded C allocation is needed.
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    auto mdi = acc.get_multidimensional_index(i);
-    const int n = n0 + mdi[0];
-    const int m = mdi[1];
-    if (n < Nreal && m < Mreal) {
-      c_p[m * Nreal + n] = bfloat(acc[i]);
-    }
-  }
+// Two tile geometries (probe12 receipts): 64-wide/4-simdgroup wins the
+// mid-N shapes (qkv, o_proj); 32-wide/1-simdgroup halves per-TG work and
+// doubles TG count, winning wide-N (mlp up/gate, lm_head) where latency is
+// occupancy-bound. Host routing picks per shape.
+#define MM2D_Q4K_KERNEL(NAME, TILE_N, SCOPE, TG_THREADS)                      \
+kernel void NAME(                                                             \
+    device const bfloat * a_p   [[ buffer(0) ]],                              \
+    device const uchar  * b_p   [[ buffer(1) ]],                              \
+    device const half   * dsc_p [[ buffer(2) ]],                              \
+    device const half   * dmm_p [[ buffer(3) ]],                              \
+    device bfloat       * c_p   [[ buffer(4) ]],                              \
+    constant int4       & dims  [[ buffer(5) ]],                              \
+    uint2 tgid [[threadgroup_position_in_grid]],                              \
+    uint  tidx [[thread_index_in_threadgroup]]) {                             \
+  const int K = dims.x;                                                       \
+  const int Npad = dims.y;                                                    \
+  const int Nreal = dims.z;                                                   \
+  const int Mreal = dims.w;                                                   \
+  const int NJ = K / 32;                                                      \
+  const int n0 = int(tgid.x) * TILE_N;                                        \
+                                                                              \
+  tensor<device bfloat, dextents<int, 2>, tensor_inline>                      \
+      a((device bfloat *)a_p, dextents<int, 2>(K, Mreal));                    \
+  tensor<device uint4b_format, dextents<int, 2>, tensor_inline>               \
+      b((device uchar *)b_p, dextents<int, 2>(Npad, K));                      \
+                                                                              \
+  constexpr auto d = tensor_ops::matmul2d_descriptor(8, TILE_N, 32);          \
+  tensor_ops::matmul2d<d, SCOPE> op;                                          \
+                                                                              \
+  /* Per-32-slice row sums of A for the dmin term, in threadgroup memory:   */\
+  /* the A tile is SLC-resident (the matmul reads it anyway), and a second  */\
+  /* dispatch's hazard barrier serialized the concurrent encoder.           */\
+  threadgroup float rs_tg[8 * MM2D_MAX_NJ];                                   \
+  const int entries = Mreal * NJ;                                             \
+  for (int e = int(tidx); e < entries; e += TG_THREADS) {                     \
+    const int m = e / NJ;                                                     \
+    const int j = e % NJ;                                                     \
+    device const bfloat * row = a_p + m * K + 32 * j;                         \
+    float s = 0.0f;                                                           \
+    for (int i = 0; i < 32; ++i) {                                            \
+      s += float(row[i]);                                                     \
+    }                                                                         \
+    rs_tg[e] = s;                                                             \
+  }                                                                           \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                            \
+                                                                              \
+  auto acc = op.get_destination_cooperative_tensor<decltype(a), decltype(b), float>(); \
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {                           \
+    acc[i] = 0.0f;                                                            \
+  }                                                                           \
+                                                                              \
+  for (int j = 0; j < NJ; ++j) {                                              \
+    auto mA = a.slice(32 * j, 0);                                             \
+    auto mB = b.slice(n0, 32 * j);                                            \
+    auto p = op.get_destination_cooperative_tensor<decltype(a), decltype(b), float>(); \
+    op.run(mA, mB, p);                                                        \
+    for (ushort i = 0; i < p.get_capacity(); ++i) {                           \
+      auto mdi = p.get_multidimensional_index(i);                             \
+      const int n = n0 + mdi[0];                                              \
+      const int m = mdi[1];                                                   \
+      const float w = float(dsc_p[n * NJ + j]);                               \
+      const float mn = float(dmm_p[n * NJ + j]);                              \
+      /* Tile rows beyond Mreal are dead (never stored) but must not read  */ \
+      /* out of bounds.                                                    */ \
+      const float r = m < Mreal ? rs_tg[m * NJ + j] : 0.0f;                   \
+      acc[i] = fma(w, p[i], fma(-mn, r, acc[i]));                             \
+    }                                                                         \
+  }                                                                           \
+                                                                              \
+  /* Direct bf16 stores: real-N/real-m guards double as tail handling. */    \
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {                           \
+    auto mdi = acc.get_multidimensional_index(i);                             \
+    const int n = n0 + mdi[0];                                                \
+    const int m = mdi[1];                                                     \
+    if (n < Nreal && m < Mreal) {                                             \
+      c_p[m * Nreal + n] = bfloat(acc[i]);                                    \
+    }                                                                         \
+  }                                                                           \
 }
+
+MM2D_Q4K_KERNEL(kernel_mul_mm2d_q4k_bf16, 64, execution_simdgroups<4>, 128)
+MM2D_Q4K_KERNEL(kernel_mul_mm2d_q4k_bf16_t32, 32, execution_simdgroup, 32)

@@ -554,11 +554,28 @@ pub fn call_quantized_matmul_mm2d_q4k(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m <= 8 && k % 32 == 0 && k <= 8192 && n_pad % 64 == 0);
-    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mul_mm2d_q4k_bf16")?;
+    // Tile geometry by shape (probe12): the 32-wide single-simdgroup tile
+    // doubles TG count at half the per-TG work — it wins the wide-N shapes
+    // (mlp up/gate at N=3584: 49us vs 136; lm_head) where per-dispatch
+    // latency is occupancy-bound, and loses the mid-N ones (qkv, o_proj).
+    // LMBRRR_MM2D_TILE=32|64 overrides for A/B.
+    static TILE_OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let override_tile = *TILE_OVERRIDE.get_or_init(|| {
+        std::env::var("LMBRRR_MM2D_TILE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    let tile = override_tile.unwrap_or(if n >= 3584 { 32 } else { 64 });
+    let (name, tg_threads) = if tile == 32 {
+        ("kernel_mul_mm2d_q4k_bf16_t32", 32)
+    } else {
+        ("kernel_mul_mm2d_q4k_bf16", 128)
+    };
+    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ4k, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "qmm_mm2d_q4k M={m} K={k} N={n}");
+    debug_group!(encoder, "qmm_mm2d_q4k M={m} K={k} N={n} t{tile}");
     let dims: [i32; 4] = [k as i32, n_pad as i32, n as i32, m as i32];
     set_params!(
         encoder,
@@ -572,12 +589,12 @@ pub fn call_quantized_matmul_mm2d_q4k(
         )
     );
     let thread_groups_count = MTLSize {
-        width: n_pad / 64,
+        width: n_pad / tile,
         height: 1,
         depth: 1,
     };
     let threads_per_threadgroup = MTLSize {
-        width: 128,
+        width: tg_threads,
         height: 1,
         depth: 1,
     };

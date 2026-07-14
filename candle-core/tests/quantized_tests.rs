@@ -1711,6 +1711,15 @@ fn test_matmul_mv_unpk_accuracy() -> Result<()> {
 /// prebuilt metallib cannot create pipelines (pre-26.4 OS).
 #[cfg(feature = "metal")]
 #[test]
+fn test_matmul_mm2d_q4k_accuracy_t32() -> Result<()> {
+    // Same as test_matmul_mm2d_q4k_accuracy but forcing the 32-wide
+    // single-simdgroup tile (nextest process isolation makes the env safe).
+    std::env::set_var("LMBRRR_MM2D_TILE", "32");
+    test_matmul_mm2d_q4k_accuracy()
+}
+
+#[cfg(feature = "metal")]
+#[test]
 fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
     use candle_core::quantized::k_quants::BlockQ4K;
     use half::bf16;

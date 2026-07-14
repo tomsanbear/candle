@@ -180,6 +180,18 @@ struct name {                               \
     }                                       \
 };
 
+// Verbatim copies of unary.metal's recip/sigmoid templates so
+// `x * sigmoid(y)` fuses the sigmoid + mul pair (an output-gate pattern)
+// into one dispatch with a BIT-IDENTICAL result: sigmoid(y) rounds to T
+// exactly like the unary kernel's store, and the multiply is bmul's
+// expression on the same operands.
+template <typename T> METAL_FUNC T bin_recip(T x) {
+    return static_cast<T>(1.0 / x);
+}
+template <typename T> METAL_FUNC T bin_sigmoid(T x) {
+    return static_cast<T>(bin_recip(1 + exp(-x)));
+}
+
 // Define binary ops
 define_binary_op(badd, x + y);
 define_binary_op(bsub, x - y);
@@ -187,6 +199,7 @@ define_binary_op(bmul, x * y);
 define_binary_op(bdiv, x / y);
 define_binary_op(bminimum, MIN(x, y));
 define_binary_op(bmaximum, MAX(x, y));
+define_binary_op(bmulsig, x * bin_sigmoid(y));
 
 // Define binary ops that return a bool
 define_binary_bool_op(beq, x == y);
@@ -203,6 +216,12 @@ init_binary(bmul);
 init_binary(bdiv);
 init_binary(bminimum);
 init_binary(bmaximum);
+// Float-only (sigmoid has no integer form).
+init_binary_k(bmulsig, bmulsig, f32, float, float)
+init_binary_k(bmulsig, bmulsig, f16, half, half)
+#if defined(__HAVE_BFLOAT__)
+init_binary_k(bmulsig, bmulsig, bf16, bfloat, bfloat)
+#endif
 
 init_boolean_binary(eq, beq);
 init_boolean_binary(ne, bne);

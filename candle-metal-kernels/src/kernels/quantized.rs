@@ -554,18 +554,19 @@ pub fn call_quantized_matmul_mm2d_q4k(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m <= 8 && k % 32 == 0 && k <= 8192 && n_pad % 64 == 0);
-    // Tile geometry by shape (probe12): the 32-wide single-simdgroup tile
-    // doubles TG count at half the per-TG work — it wins the wide-N shapes
-    // (mlp up/gate at N=3584: 49us vs 136; lm_head) where per-dispatch
-    // latency is occupancy-bound, and loses the mid-N ones (qkv, o_proj).
-    // LMBRRR_MM2D_TILE=32|64 overrides for A/B.
+    // Tile geometry: probe12's ISOLATED latencies favoured the 32-wide
+    // single-simdgroup tile on wide-N shapes, but IN-LOOP it regressed
+    // verify by ~2.6ms/round (2026-07-14 A/B on the head shape) — isolated
+    // dispatch latency does not transfer to a dependent layer chain. The
+    // 64-wide tile stays the default everywhere; LMBRRR_MM2D_TILE=32 keeps
+    // the variant reachable for in-loop study.
     static TILE_OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let override_tile = *TILE_OVERRIDE.get_or_init(|| {
         std::env::var("LMBRRR_MM2D_TILE")
             .ok()
             .and_then(|v| v.parse().ok())
     });
-    let tile = override_tile.unwrap_or(if n >= 3584 { 32 } else { 64 });
+    let tile = override_tile.unwrap_or(64);
     let (name, tg_threads) = if tile == 32 {
         ("kernel_mul_mm2d_q4k_bf16_t32", 32)
     } else {

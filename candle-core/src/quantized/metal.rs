@@ -333,8 +333,21 @@ impl QMetalStorage {
         // readers keep each (cache-sized) weight matrix resident, so mc's
         // extra per-thread arithmetic is a measured net loss there.
         let src_minus2 = layout.shape().dims()[layout.shape().rank() - 2];
+        // LMBRRR_Q4K_SMALL_M routes the verify-chunk shapes for A/B:
+        // wide (default) | mc | mv (the plain per-row grid in ONE dispatch —
+        // concurrent rows share cache lines, the structure MLX's router uses
+        // on this GPU generation).
+        static Q4K_SMALL_M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let small_m_route = *Q4K_SMALL_M.get_or_init(|| {
+            match std::env::var("LMBRRR_Q4K_SMALL_M").as_deref() {
+                Ok("mc") => 1,
+                Ok("mv") => 2,
+                _ => 0,
+            }
+        });
         let mc_supported = src_minus2 == m
             && (2..=12).contains(&m)
+            && small_m_route != 2
             && candle_metal_kernels::quantized_matmul_mv_mc_columns(self.dtype.into()).is_some();
         // BF16 activations go straight into the quantized-block kernels where
         // a variant exists, skipping the F32 cast round-trip.
@@ -373,6 +386,7 @@ impl QMetalStorage {
         let wide_enabled = *Q4K_WIDE
             .get_or_init(|| std::env::var("LMBRRR_Q4K_WIDE").map_or(true, |v| v != "0"));
         let wide_supported = wide_enabled
+            && small_m_route == 0
             && mc_supported
             && (2..=8).contains(&m)
             && matches!(self.dtype, crate::quantized::GgmlDType::Q4K)

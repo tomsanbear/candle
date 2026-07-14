@@ -363,7 +363,36 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), dst_dtype)
             .with_label("qmatmul")
             .build()?;
-        if mc_supported {
+        // Wide q4_K route for verify-chunk shapes: streams the m rows against
+        // one weight decode instead of the mc kernels' serial per-thread
+        // column loop (measured lm_head m=2 at 1.80x m=1 on mc; the wide
+        // design's reference achieves ~1.0x). Reordered accumulation: NOT
+        // bit-compatible with mv/mc — margin-class, oracle-gated.
+        // LMBRRR_Q4K_WIDE=0 restores the mc route for A/B.
+        static Q4K_WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wide_enabled = *Q4K_WIDE
+            .get_or_init(|| std::env::var("LMBRRR_Q4K_WIDE").map_or(true, |v| v != "0"));
+        let wide_supported = wide_enabled
+            && mc_supported
+            && (2..=8).contains(&m)
+            && matches!(self.dtype, crate::quantized::GgmlDType::Q4K)
+            && src1_bf16
+            && dst_bf16
+            && k % 256 == 0;
+        if wide_supported {
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_wide(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (m, n, k),
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                &self.buffer,
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else if mc_supported {
             candle_metal_kernels::call_quantized_matmul_mv_mc(
                 device.device(),
                 &encoder,

@@ -35,9 +35,10 @@ pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_mc,
     call_quantized_matmul_mv_q4k_argmax, call_quantized_matmul_mv_q4k_bf16_geo,
     call_quantized_matmul_mv_q4k_bf16_nsg, call_quantized_matmul_mv_q4k_bf16_rowtile,
-    call_quantized_matmul_mv_q4k_bf16_soa, call_quantized_matmul_mv_t,
-    quantized_matmul_mv_bf16_dst_supported, quantized_matmul_mv_bf16_src1_supported,
-    quantized_matmul_mv_mc_columns, GgmlDType, MV_ARGMAX_ROWS_PER_TG,
+    call_quantized_matmul_mv_q4k_bf16_soa, call_quantized_matmul_mv_q4k_bf16_wide,
+    call_quantized_matmul_mv_t, quantized_matmul_mv_bf16_dst_supported,
+    quantized_matmul_mv_bf16_src1_supported, quantized_matmul_mv_mc_columns, GgmlDType,
+    MV_ARGMAX_ROWS_PER_TG,
 };
 pub use random::*;
 pub use reduce::*;

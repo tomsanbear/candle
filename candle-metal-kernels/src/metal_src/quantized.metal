@@ -5423,6 +5423,172 @@ MV_Q4K_GEO(kernel_mul_mv_q4_K_bf16_bf16_nr2sg1, bfloat, 1, 2)
 MV_Q4K_GEO(kernel_mul_mv_q4_K_f32y_bf16_base, float, 1, 4)
 
 // ---------------------------------------------------------------------------
+// Wide q4_K matvec: VECS activation rows streamed against one weight decode
+// (MLX qmv_wide's amortization applied to the q4_K block layout). The mc
+// kernels above share the weight READ across columns but run the column
+// arithmetic serially per thread — cost grows ~linearly in m (measured
+// lm_head m=2 = 1.80x m=1, the verify-chunk intercept). Here each lane owns
+// ONE 32-value sub-block per super-block (k_lanes = 8 lanes stride the 8
+// sub-blocks), extracts its (scale, min) pair once, masks its single nibble
+// plane once per 16-bit word, and FMAs every streamed vector against those
+// registers: quantization arithmetic amortizes across m instead of
+// replaying. The dmin term uses the mv kernels' algebraic factoring
+// (dot(y, v) = d*sc*dot(y, q) - dmin*mn*sum(y)) with a per-vector sumy.
+// Rows map like the mv kernels; the vector axis tiles through tgpig.x with
+// clamped reads and guarded writes so any m works at any VECS.
+
+template <int VECS>
+void kernel_mul_mv_q4_K_wide_impl(
+        device const  void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+                   int64_t   ne00,   // k
+                   int64_t   ne01,   // n (weight rows)
+                   int64_t   ne10,   // k (src1 row stride, elements)
+                   int64_t   ne0,    // n (dst row stride, elements)
+                   int64_t   m,      // activation rows
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    constexpr int K_LANES = 8;                  // lanes splitting k per row
+    constexpr int ROWS_PER_SG = 32 / K_LANES;   // 4
+    constexpr int NSG = 2;
+
+    const int k_lane = tiisg % K_LANES;
+    const int sg_row = tiisg / K_LANES;
+
+    const int nb = ne00 / QK_K;                 // super-blocks per row
+    const int out_row = (tgpig.y * NSG + sgitg) * ROWS_PER_SG + sg_row;
+    const int vec0 = tgpig.x * VECS;
+    if (out_row >= ne01) {
+        return;
+    }
+
+    device const block_q4_K * x = (device const block_q4_K *) src0 + (int64_t)out_row * nb;
+
+    // Clamped read pointers: the tail tile re-reads row m-1, writes guarded.
+    device const bfloat * yv[VECS];
+    for (int v = 0; v < VECS; v++) {
+        yv[v] = src1 + min((int64_t)(vec0 + v), m - 1) * ne10;
+    }
+
+    float resf[VECS] = {0.f};
+
+    // Sub-block k_lane of every super-block: values [32*k_lane, 32*k_lane+32),
+    // stored as one nibble plane (k_lane & 1) of qs bytes [32*(k_lane/2)..+32).
+    const int plane_hi = k_lane & 1;
+    const int qs_off = 16 * (k_lane / 2);       // in uint16 words
+    const int y_off = 32 * k_lane;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dall = float(x[ib].d);
+        const float dmin = float(x[ib].dmin);
+
+        // get_scale_min_k4 for sub-block j = k_lane (6-bit packed pairs).
+        const int j = k_lane;
+        device const uint8_t * scales = x[ib].scales;
+        uint8_t sc, mn;
+        if (j < 4) {
+            sc = scales[j] & 63;
+            mn = scales[j + 4] & 63;
+        } else {
+            sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+            mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        }
+
+        // The sub-block's 16 nibble-plane words, decoded once for all vecs.
+        device const uint16_t * q = (device const uint16_t *)x[ib].qs + qs_off;
+        uint16_t qw[16];
+        for (int i = 0; i < 16; ++i) {
+            qw[i] = q[i];
+        }
+
+        const float dsc = dall * sc;
+        const float dmn = dmin * mn;
+        for (int v = 0; v < VECS; v++) {
+            float yl[16];
+            float yh_[16];
+            q4k_load_y8(yv[v] + ib * QK_K + y_off + 0, yl + 0);
+            q4k_load_y8(yv[v] + ib * QK_K + y_off + 8, yl + 8);
+            q4k_load_y8(yv[v] + ib * QK_K + y_off + 16, yh_ + 0);
+            q4k_load_y8(yv[v] + ib * QK_K + y_off + 24, yh_ + 8);
+
+            float acc_even = 0.f;
+            float acc_odd = 0.f;
+            float sumy = 0.f;
+            if (plane_hi == 0) {
+                for (int i = 0; i < 8; ++i) {
+                    acc_even += yl[2 * i + 0] * (qw[i] & 0x000F)
+                              + yh_[2 * i + 0] * (qw[i + 8] & 0x000F);
+                    acc_odd  += yl[2 * i + 1] * (qw[i] & 0x0F00)
+                              + yh_[2 * i + 1] * (qw[i + 8] & 0x0F00);
+                    sumy += yl[2 * i] + yl[2 * i + 1] + yh_[2 * i] + yh_[2 * i + 1];
+                }
+                resf[v] += dsc * (acc_even + (1.f / 256.f) * acc_odd) - dmn * sumy;
+            } else {
+                for (int i = 0; i < 8; ++i) {
+                    acc_even += yl[2 * i + 0] * (qw[i] & 0x00F0)
+                              + yh_[2 * i + 0] * (qw[i + 8] & 0x00F0);
+                    acc_odd  += yl[2 * i + 1] * (qw[i] & 0xF000)
+                              + yh_[2 * i + 1] * (qw[i + 8] & 0xF000);
+                    sumy += yl[2 * i] + yl[2 * i + 1] + yh_[2 * i] + yh_[2 * i + 1];
+                }
+                resf[v] += dsc * (1.f / 16.f) * (acc_even + (1.f / 256.f) * acc_odd) - dmn * sumy;
+            }
+        }
+    }
+
+    // Reduce over the K_LANES lanes of this row (shuffle ladder; simd_sum
+    // would mix the ROWS_PER_SG rows sharing the simdgroup).
+    for (int v = 0; v < VECS; v++) {
+        resf[v] += simd_shuffle_down(resf[v], 4);
+        resf[v] += simd_shuffle_down(resf[v], 2);
+        resf[v] += simd_shuffle_down(resf[v], 1);
+    }
+
+    if (k_lane == 0) {
+        for (int v = 0; v < VECS; v++) {
+            if (vec0 + v < m) {
+                dst[(int64_t)(vec0 + v) * ne0 + out_row] = bfloat(resf[v]);
+            }
+        }
+    }
+}
+
+#define MV_Q4K_WIDE(NAME, VECS_N)                                           \
+kernel void NAME(                                                           \
+        device const  void * src0,                                         \
+        device const  void * src1,                                         \
+        device       float * dst,                                          \
+        constant    int64_t & ne00,                                        \
+        constant    int64_t & ne01,                                        \
+        constant    int64_t & ne02,                                        \
+        constant   uint64_t & nb00,                                        \
+        constant   uint64_t & nb01,                                        \
+        constant   uint64_t & nb02,                                        \
+        constant    int64_t & ne10,                                        \
+        constant    int64_t & ne11,                                        \
+        constant    int64_t & ne12,                                        \
+        constant   uint64_t & nb10,                                        \
+        constant   uint64_t & nb11,                                        \
+        constant   uint64_t & nb12,                                        \
+        constant    int64_t & ne0,                                         \
+        constant    int64_t & ne1,                                         \
+        constant    uint    & r2,                                          \
+        constant    uint    & r3,                                          \
+        uint3 tgpig[[threadgroup_position_in_grid]],                       \
+        uint  tiisg[[thread_index_in_simdgroup]],                          \
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {                   \
+    kernel_mul_mv_q4_K_wide_impl<VECS_N>(                                  \
+        src0, (device const bfloat *)src1, (device bfloat *)dst,           \
+        ne00, ne01, ne10, ne0, ne11, tgpig, tiisg, sgitg);                 \
+}
+
+MV_Q4K_WIDE(kernel_mul_mv_q4_K_bf16_bf16_wide_v2, 2)
+MV_Q4K_WIDE(kernel_mul_mv_q4_K_bf16_bf16_wide_v3, 3)
+MV_Q4K_WIDE(kernel_mul_mv_q4_K_bf16_bf16_wide_v4, 4)
+
+// ---------------------------------------------------------------------------
 // Fused head GEMV -> argmax (greedy decode: never materialize the 248k-row
 // logits). Per-row arithmetic is byte-for-byte the nr2sg2 path above (per-row
 // values are geometry-independent — the rowtile variants rely on the same

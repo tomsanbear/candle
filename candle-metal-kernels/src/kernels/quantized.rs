@@ -380,6 +380,88 @@ pub fn call_quantized_matmul_mv_q4k_bf16_nsg(
 /// assignment and threadgroup shape change. `f32_y` selects the f32-y
 /// instantiation of the BASELINE geometry (nsg/ndst ignored in that case).
 #[allow(clippy::too_many_arguments)]
+/// Wide q4_K matvec: VECS activation rows streamed per weight decode (the
+/// verify-chunk kernel; see kernel_mul_mv_q4_K_wide_impl). One tile of up to
+/// 4 vectors per tgpig.x step; rows follow the mv geometry (8 per
+/// threadgroup: 2 simdgroups x 4 rows). bf16 activations and dst only.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16_wide(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, k): (usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if m < 2 || !k.is_multiple_of(256) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "wide wants m >= 2 and k % 256 == 0",
+            "qmatmul_mv_wide",
+        ));
+    }
+    // Exact-fit tiles for the spec-verify chunk sizes; m > 4 tiles by 4
+    // (each extra tile re-reads the weights, like MLX's qmv_wide).
+    let (name, vecs) = match m {
+        2 => ("kernel_mul_mv_q4_K_bf16_bf16_wide_v2", 2),
+        3 => ("kernel_mul_mv_q4_K_bf16_bf16_wide_v3", 3),
+        _ => ("kernel_mul_mv_q4_K_bf16_bf16_wide_v4", 4),
+    };
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_wide{vecs} M={m} K={k} N={n}");
+
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            1i64,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            1i64,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(m, vecs),
+        height: divide(n, 8),
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 32,
+        height: 2,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 pub fn call_quantized_matmul_mv_q4k_bf16_geo(
     device: &Device,
     ep: impl EncoderProvider,

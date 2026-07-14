@@ -1720,6 +1720,14 @@ fn test_matmul_mm2d_q4k_accuracy_t32() -> Result<()> {
 
 #[cfg(feature = "metal")]
 #[test]
+fn test_matmul_mm2d_q4k_accuracy_splitk() -> Result<()> {
+    // Split-K pair (partials + reduce) at 4 splits over K=1024 (32 slices).
+    std::env::set_var("LMBRRR_MM2D_TEST_SPLITK", "4");
+    test_matmul_mm2d_q4k_accuracy()
+}
+
+#[cfg(feature = "metal")]
+#[test]
 fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
     use candle_core::quantized::k_quants::BlockQ4K;
     use half::bf16;
@@ -1777,21 +1785,46 @@ fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
     let dmm_buf = mk_buf(as_bytes(planes.dmm.as_ptr() as *const u8, planes.dmm.len() * 2));
     let dst_buf = raw.new_buffer(m * n * 2, opts).unwrap();
 
+    // Exercise the split-K pair as well when requested (env-driven like the
+    // t32 variant; nextest process isolation makes this safe).
+    let splitk: usize = std::env::var("LMBRRR_MM2D_TEST_SPLITK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     {
         let encoder = metal_device.command_encoder()?;
-        if let Err(err) = candle_metal_kernels::call_quantized_matmul_mm2d_q4k(
-            raw,
-            &encoder,
-            metal_device.kernels(),
-            (m, n, planes.n_pad, k),
-            &lhs_buf,
-            0,
-            &nib_buf,
-            &dsc_buf,
-            &dmm_buf,
-            0,
-            &dst_buf,
-        ) {
+        let result = if splitk > 1 {
+            let partials = raw.new_buffer(splitk * 8 * planes.n_pad * 4, opts).unwrap();
+            candle_metal_kernels::call_quantized_matmul_mm2d_q4k_splitk(
+                raw,
+                &encoder,
+                metal_device.kernels(),
+                (m, n, planes.n_pad, k, splitk),
+                &lhs_buf,
+                0,
+                &nib_buf,
+                &dsc_buf,
+                &dmm_buf,
+                &partials,
+                0,
+                &dst_buf,
+            )
+        } else {
+            candle_metal_kernels::call_quantized_matmul_mm2d_q4k(
+                raw,
+                &encoder,
+                metal_device.kernels(),
+                (m, n, planes.n_pad, k),
+                &lhs_buf,
+                0,
+                &nib_buf,
+                &dsc_buf,
+                &dmm_buf,
+                0,
+                &dst_buf,
+            )
+        };
+        if let Err(err) = result {
             eprintln!("skipping: mm2d pipelines unavailable on this OS ({err})");
             return Ok(());
         }

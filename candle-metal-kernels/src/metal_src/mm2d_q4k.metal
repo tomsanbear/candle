@@ -116,3 +116,103 @@ kernel void NAME(                                                             \
 
 MM2D_Q4K_KERNEL(kernel_mul_mm2d_q4k_bf16, 64, execution_simdgroups<4>, 128)
 MM2D_Q4K_KERNEL(kernel_mul_mm2d_q4k_bf16_t32, 32, execution_simdgroup, 32)
+
+// Split-K pair for small-N shapes: N/64 threadgroups under-occupy the GPU
+// when each runs the whole K loop serially (mlp_down measured 37.8 GB/s at
+// 16 TGs), so grid dim y partitions the K/32 slices across nsplit groups
+// writing f32 partials, and a tiny second dispatch reduces them. The fold
+// (dsc*P - dmm*rowsum) is linear over slices, so partial sums are exact.
+// Partial layout: part[(ks*8 + m) * Npad + n]; rows m >= Mreal are never
+// written (nor read by the reduce).
+kernel void kernel_mul_mm2d_q4k_bf16_splitk(
+    device const bfloat * a_p    [[ buffer(0) ]],
+    device const uchar  * b_p    [[ buffer(1) ]],
+    device const half   * dsc_p  [[ buffer(2) ]],
+    device const half   * dmm_p  [[ buffer(3) ]],
+    device float        * part_p [[ buffer(4) ]],
+    constant int4       & dims   [[ buffer(5) ]],
+    constant int        & nsplit [[ buffer(6) ]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tidx [[thread_index_in_threadgroup]]) {
+  const int K = dims.x;
+  const int Npad = dims.y;
+  const int Mreal = dims.w;
+  const int NJ = K / 32;
+  const int n0 = int(tgid.x) * 64;
+  const int ks = int(tgid.y);
+  const int j0 = (NJ * ks) / nsplit;
+  const int j1 = (NJ * (ks + 1)) / nsplit;
+  const int span = j1 - j0;
+
+  tensor<device bfloat, dextents<int, 2>, tensor_inline>
+      a((device bfloat *)a_p, dextents<int, 2>(K, Mreal));
+  tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
+      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
+
+  constexpr auto d = tensor_ops::matmul2d_descriptor(8, 64, 32);
+  tensor_ops::matmul2d<d, execution_simdgroups<4>> op;
+
+  threadgroup float rs_tg[8 * MM2D_MAX_NJ];
+  const int entries = Mreal * span;
+  for (int e = int(tidx); e < entries; e += 128) {
+    const int m = e / span;
+    const int j = j0 + e % span;
+    device const bfloat * row = a_p + m * K + 32 * j;
+    float s = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      s += float(row[i]);
+    }
+    rs_tg[e] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  auto acc = op.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0.0f;
+  }
+
+  for (int j = j0; j < j1; ++j) {
+    auto mA = a.slice(32 * j, 0);
+    auto mB = b.slice(n0, 32 * j);
+    auto p = op.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+    op.run(mA, mB, p);
+    for (ushort i = 0; i < p.get_capacity(); ++i) {
+      auto mdi = p.get_multidimensional_index(i);
+      const int n = n0 + mdi[0];
+      const int m = mdi[1];
+      const float w = float(dsc_p[n * NJ + j]);
+      const float mn = float(dmm_p[n * NJ + j]);
+      const float r = m < Mreal ? rs_tg[m * span + (j - j0)] : 0.0f;
+      acc[i] = fma(w, p[i], fma(-mn, r, acc[i]));
+    }
+  }
+
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    auto mdi = acc.get_multidimensional_index(i);
+    const int n = n0 + mdi[0];
+    const int m = mdi[1];
+    if (m < Mreal) {
+      part_p[(ks * 8 + m) * Npad + n] = acc[i];
+    }
+  }
+}
+
+kernel void kernel_mm2d_q4k_splitk_reduce(
+    device const float * part_p [[ buffer(0) ]],
+    device bfloat      * c_p    [[ buffer(1) ]],
+    constant int4      & dims   [[ buffer(2) ]],
+    constant int       & nsplit [[ buffer(3) ]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const int Npad = dims.y;
+  const int Nreal = dims.z;
+  const int n = int(tid.x);
+  const int m = int(tid.y);
+  if (n >= Nreal) {
+    return;
+  }
+  float s = 0.0f;
+  for (int ks = 0; ks < nsplit; ++ks) {
+    s += part_p[(ks * 8 + m) * Npad + n];
+  }
+  c_p[m * Nreal + n] = bfloat(s);
+}

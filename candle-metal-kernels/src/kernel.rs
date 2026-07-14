@@ -1,7 +1,7 @@
 use crate::source::{
     AFFINE, ATTN_PREP, BINARY, CAST, CONV, DSPARK, FILL, GATED_DELTA, GATED_DELTA_CHUNK,
-    GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, QUANTIZED_UNPK, RANDOM,
-    REDUCE, SDPA, SKINNY_GEMM, SORT, TERNARY, UNARY,
+    GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, MM2D_Q4K_LIB, QUANTIZED, QUANTIZED_UNPK,
+    RANDOM, REDUCE, SDPA, SKINNY_GEMM, SORT, TERNARY, UNARY,
 };
 
 /// MTLLanguageVersion raw value for MSL 4.1 ((4 << 16) | 1). The SDK enum
@@ -141,6 +141,7 @@ impl Kernels {
             Source::Dspark => DSPARK,
             Source::AttnPrep => ATTN_PREP,
             Source::QuantizedUnpk => QUANTIZED_UNPK,
+            Source::Mm2dQ4k => unreachable!("Mm2dQ4k loads from a prebuilt metallib"),
         }
     }
 
@@ -162,7 +163,15 @@ impl Kernels {
         if let Some(lib) = libraries.get(&source) {
             Ok(lib.clone())
         } else {
-            let lib = {
+            let lib = if matches!(source, Source::Mm2dQ4k) {
+                // Prebuilt tensor-op metallib: the source needs framework
+                // headers the runtime compiler cannot see. Loads everywhere;
+                // pre-26.4 OSes fail at pipeline creation and callers fall
+                // back by routing.
+                device
+                    .new_library_with_data(MM2D_Q4K_LIB)
+                    .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?
+            } else {
                 let source_content = self.get_library_source(source);
                 let compile_options = get_compile_options();
                 // MSL-4.1 sources (packed_numeric unpack kernels) are gated

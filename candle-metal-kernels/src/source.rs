@@ -21,6 +21,10 @@ pub const SKINNY_GEMM: &str = include_str!("metal_src/skinny_gemm.metal");
 pub const DSPARK: &str = include_str!("metal_src/dspark.metal");
 pub const ATTN_PREP: &str = include_str!("metal_src/attn_prep.metal");
 pub const QUANTIZED_UNPK: &str = include_str!("metal_src/quantized_unpk.metal");
+/// Prebuilt metallib (see scripts/build_mm2d_q4k.sh): the tensor-op source
+/// needs the MetalPerformancePrimitives framework header, which the runtime
+/// compiler cannot see.
+pub const MM2D_Q4K_LIB: &[u8] = include_bytes!("metal_src/mm2d_q4k.metallib");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
@@ -47,4 +51,5 @@ pub enum Source {
     Dspark,
     AttnPrep,
     QuantizedUnpk,
+    Mm2dQ4k,
 }

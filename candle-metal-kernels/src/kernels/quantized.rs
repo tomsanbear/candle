@@ -534,6 +534,90 @@ pub fn call_quantized_matmul_mv_q4k_bf16_unpk(
     Ok(())
 }
 
+/// Per-32-element row sums of the bf16 activations, feeding the tensor-op
+/// kernel's dmin term. rs is m x (k/32) f32.
+pub fn call_mm2d_q4k_rowsums(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, k): (usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rs: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mm2d_q4k_rowsums")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "mm2d_q4k_rowsums m={m} k={k}");
+    let k_dim = k as i32;
+    set_params!(encoder, ((lhs, lhs_offset), rs, k_dim));
+    let grid = MTLSize {
+        width: k / 32,
+        height: m,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: (k / 32).min(32),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(grid, tg);
+    Ok(())
+}
+
+/// Tensor-op (matmul2d) q4_K matmul for m in [1,8]: exact q4_K semantics on
+/// the repacked plane layout (nibbles [k, n_pad] + fp16 dsc/dmm planes; see
+/// mm2d_q4k.metal). rs comes from [`call_mm2d_q4k_rowsums`]. dst is bf16
+/// [m, n]. The M tile is hardware-fixed at 8; m <= 8 rides one tile.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm2d_q4k(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, n_pad, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    nibbles: &Buffer,
+    dsc: &Buffer,
+    dmm: &Buffer,
+    rs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    debug_assert!(m <= 8 && k % 32 == 0 && n_pad % 64 == 0);
+    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mul_mm2d_q4k_bf16")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mm2d_q4k M={m} K={k} N={n}");
+    let dims: [i32; 4] = [k as i32, n_pad as i32, n as i32, m as i32];
+    set_params!(
+        encoder,
+        (
+            (lhs, lhs_offset),
+            nibbles,
+            dsc,
+            dmm,
+            rs,
+            Output::with_offset(dst, dst_offset),
+            &dims[..]
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: n_pad / 64,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 pub fn call_quantized_matmul_mv_q4k_bf16_geo(
     device: &Device,
     ep: impl EncoderProvider,

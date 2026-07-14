@@ -1701,3 +1701,124 @@ fn test_matmul_mv_unpk_accuracy() -> Result<()> {
     assert!(bias.abs() < 1e-3, "systematic bias {bias:.2e}");
     Ok(())
 }
+
+/// End-to-end tensor-op (matmul2d) q4_K path: quantize -> CPU repack to the
+/// mm2d plane layout -> rowsums + kernel via the raw call wrappers ->
+/// compare against the dequantized-weights reference. Exercises m < 8 (tile
+/// padding), an N that is not a multiple of 64 (tail guard), and the fp16
+/// dsc/dmm planes (expected extra ~5e-4 relative vs the f32-scale kernels —
+/// still under the bf16 activation floor). Skips gracefully where the
+/// prebuilt metallib cannot create pipelines (pre-26.4 OS).
+#[cfg(feature = "metal")]
+#[test]
+fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
+    use candle_core::quantized::k_quants::BlockQ4K;
+    use half::bf16;
+
+    let device = Device::new_metal(0)?;
+    let metal_device = match &device {
+        Device::Metal(m) => m.clone(),
+        _ => unreachable!(),
+    };
+    let (k, n, m) = (1024, 515, 3); // n % 64 != 0, m < 8
+    let rhs = (0..(k * n))
+        .map(|v| ((v * 7919) % 97) as f32 / 97.0 - 0.5)
+        .collect::<Vec<_>>();
+    let rhs_cpu = Tensor::from_slice(&rhs, (n, k), &Device::Cpu)?;
+    let qtensor = quantized::QTensor::quantize(&rhs_cpu, GgmlDType::Q4K)?;
+    let data = qtensor.data()?;
+    let blocks = unsafe {
+        std::slice::from_raw_parts(
+            data.as_ptr() as *const BlockQ4K,
+            data.len() / std::mem::size_of::<BlockQ4K>(),
+        )
+    };
+    let planes = candle_core::quantized::metal::q4k_mm2d_planes(blocks, n, k)?;
+    drop(data);
+
+    // Reference: dequantized f32 matmul.
+    let w_deq = qtensor.dequantize(&Device::Cpu)?;
+    let lhs = (0..(m * k))
+        .map(|v| {
+            bf16::from_f32(((v * 104729) % 89) as f32 / 89.0 - 0.5)
+        })
+        .collect::<Vec<_>>();
+    let lhs_f32 = lhs.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+    let expected = Tensor::from_slice(&lhs_f32, (m, k), &Device::Cpu)?
+        .matmul(&w_deq.t()?)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    // Device buffers + kernel calls through the raw wrappers.
+    use candle_metal_kernels::metal::MTLResourceOptions;
+    let opts = MTLResourceOptions::StorageModeShared;
+    let raw = metal_device.device();
+    let as_bytes = |p: *const u8, len: usize| unsafe { std::slice::from_raw_parts(p, len) };
+    let mk_buf = |bytes: &[u8]| {
+        raw.new_buffer_with_data(
+            bytes.as_ptr() as *const std::ffi::c_void,
+            bytes.len(),
+            opts,
+        )
+        .unwrap()
+    };
+    let lhs_buf = mk_buf(as_bytes(lhs.as_ptr() as *const u8, lhs.len() * 2));
+    let nib_buf = mk_buf(&planes.nibbles);
+    let dsc_buf = mk_buf(as_bytes(planes.dsc.as_ptr() as *const u8, planes.dsc.len() * 2));
+    let dmm_buf = mk_buf(as_bytes(planes.dmm.as_ptr() as *const u8, planes.dmm.len() * 2));
+    let rs_buf = raw.new_buffer(m * (k / 32) * 4, opts).unwrap();
+    let dst_buf = raw.new_buffer(m * n * 2, opts).unwrap();
+
+    {
+        let encoder = metal_device.command_encoder()?;
+        if let Err(err) = candle_metal_kernels::call_mm2d_q4k_rowsums(
+            raw,
+            &encoder,
+            metal_device.kernels(),
+            (m, k),
+            &lhs_buf,
+            0,
+            &rs_buf,
+        ) {
+            eprintln!("skipping: mm2d pipelines unavailable on this OS ({err})");
+            return Ok(());
+        }
+        candle_metal_kernels::call_quantized_matmul_mm2d_q4k(
+            raw,
+            &encoder,
+            metal_device.kernels(),
+            (m, n, planes.n_pad, k),
+            &lhs_buf,
+            0,
+            &nib_buf,
+            &dsc_buf,
+            &dmm_buf,
+            &rs_buf,
+            0,
+            &dst_buf,
+        )
+        .map_err(candle_core::Error::wrap)?;
+    }
+    metal_device.flush_and_wait_current()?;
+
+    let got = unsafe {
+        std::slice::from_raw_parts(dst_buf.contents() as *const bf16, m * n)
+    };
+    let mut sum_rel = 0f64;
+    let mut sum_signed = 0f64;
+    let mut max_rel = 0f64;
+    for (e, g) in expected.iter().zip(got.iter()) {
+        let g = g.to_f32();
+        let rel = ((e - g).abs() / e.abs().max(1.0)) as f64;
+        sum_rel += rel;
+        sum_signed += ((g - e) / e.abs().max(1.0)) as f64;
+        max_rel = max_rel.max(rel);
+    }
+    let count = expected.len() as f64;
+    let mean_rel = sum_rel / count;
+    let bias = sum_signed / count;
+    eprintln!("mm2d q4k m={m}: mean_rel={mean_rel:.2e} max_rel={max_rel:.2e} signed_bias={bias:.2e}");
+    assert!(mean_rel < 4e-3, "mean rel error {mean_rel:.2e} too big");
+    assert!(bias.abs() < 1e-3, "systematic bias {bias:.2e}");
+    Ok(())
+}

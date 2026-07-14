@@ -4,6 +4,80 @@ use crate::{DType, Layout, MetalDevice, MetalStorage, Result, Shape, D};
 use candle_metal_kernels::metal::Buffer;
 use std::sync::Arc;
 
+/// CPU-side repack of ggml q4_K blocks into the tensor-op (matmul2d) plane
+/// layout consumed by `call_quantized_matmul_mm2d_q4k`:
+/// - `nibbles`: `[k, n_pad]` little-endian 4-bit, n innermost, `n_pad =
+///   ceil(n/64)*64`, padding zero;
+/// - `dsc`/`dmm`: `[n_pad, k/32]` fp16 `d*sc_j` / `dmin*m_j` (padding rows
+///   zero, so padded outputs are inert).
+/// One-time cost, intended to be cached by the caller (lmbrrr pack sidecar).
+pub struct Q4kMm2dPlanes {
+    pub nibbles: Vec<u8>,
+    pub dsc: Vec<half::f16>,
+    pub dmm: Vec<half::f16>,
+    pub n: usize,
+    pub n_pad: usize,
+    pub k: usize,
+}
+
+pub fn q4k_mm2d_planes(
+    blocks: &[super::k_quants::BlockQ4K],
+    n: usize,
+    k: usize,
+) -> Result<Q4kMm2dPlanes> {
+    use super::k_quants::QK_K;
+    if k % QK_K != 0 || blocks.len() != n * (k / QK_K) {
+        crate::bail!(
+            "q4k_mm2d_planes: bad shape n={n} k={k} blocks={}",
+            blocks.len()
+        );
+    }
+    let n_pad = n.div_ceil(64) * 64;
+    let nj = k / 32;
+    let mut nibbles = vec![0u8; k * n_pad / 2];
+    let mut dsc = vec![half::f16::ZERO; n_pad * nj];
+    let mut dmm = vec![half::f16::ZERO; n_pad * nj];
+    let blocks_per_row = k / QK_K;
+    for row in 0..n {
+        for bi in 0..blocks_per_row {
+            let block = &blocks[row * blocks_per_row + bi];
+            let d = block.d.to_f32();
+            let dmin = block.dmin.to_f32();
+            for j in 0..QK_K / 32 {
+                let (sc, m) = super::utils::get_scale_min_k4(j, &block.scales);
+                let kj = bi * (QK_K / 32) + j;
+                dsc[row * nj + kj] = half::f16::from_f32(d * sc as f32);
+                dmm[row * nj + kj] = half::f16::from_f32(dmin * m as f32);
+            }
+            // qs byte (r/64)*32 + r%32 holds value r (low nibble, r%64 < 32)
+            // and value r+32 (high nibble) of the 256-value block.
+            for chunk in 0..QK_K / 64 {
+                for l in 0..32 {
+                    let q = block.qs[chunk * 32 + l];
+                    for (half_sel, v) in [(0usize, q & 0xF), (32usize, q >> 4)] {
+                        let r = chunk * 64 + half_sel + l;
+                        let k_idx = bi * QK_K + r;
+                        let idx = k_idx * n_pad + row;
+                        if idx % 2 == 0 {
+                            nibbles[idx / 2] |= v;
+                        } else {
+                            nibbles[idx / 2] |= v << 4;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Q4kMm2dPlanes {
+        nibbles,
+        dsc,
+        dmm,
+        n,
+        n_pad,
+        k,
+    })
+}
+
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,

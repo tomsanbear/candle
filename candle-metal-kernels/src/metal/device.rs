@@ -114,6 +114,19 @@ impl Device {
         Ok(Library::new(raw))
     }
 
+    /// Load a prebuilt .metallib from bytes. Used for kernels the runtime
+    /// compiler cannot build (tensor-op sources needing framework headers);
+    /// fails on OSes older than the metallib's target and callers fall back
+    /// by routing.
+    pub fn new_library_with_data(&self, data: &[u8]) -> Result<Library, MetalKernelError> {
+        let data = dispatch2::DispatchData::from_bytes(data);
+        let raw = self
+            .as_ref()
+            .newLibraryWithData_error(&data)
+            .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?;
+        Ok(Library::new(raw))
+    }
+
     pub fn new_compute_pipeline_state_with_function(
         &self,
         function: &Function,

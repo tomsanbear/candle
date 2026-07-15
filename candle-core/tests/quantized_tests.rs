@@ -1194,6 +1194,15 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+
+        // prism-ml ternary/binary Q1_0/Q2_0: from_float + to_float are
+        // implemented and unit-tested directly (quantized::k_quants
+        // ternary_tests), but their 128-element blocks don't share the
+        // 32-element Q8_0 VecDotType the CPU quantized-matmul harness assumes,
+        // so they are not part of this matmul-error reference set.
+        GgmlDType::Q1_0 | GgmlDType::Q2_0 => {
+            bail!("{dtype:?} is not part of the CPU quantized-matmul error set")
+        }
     };
     Ok(err)
 }

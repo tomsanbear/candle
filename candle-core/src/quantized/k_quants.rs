@@ -18,6 +18,13 @@ pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
+// prism-ml ternary Q2_0 (ggml type 42): {-1,0,+1} in 2-bit slots, one fp16
+// scale per 128-weight group ("Q2_0_g128"). Deployed 2.125 bpw. See
+// lmbrrr docs/research/ternary-type42-format.md.
+pub const QK2_0: usize = 128;
+// prism-ml binary Q1_0 (ggml type 41): {-1,+1} 1-bit, one fp16 scale per
+// 128-weight group. Deployed 1.125 bpw (the Bonsai phone-class companion).
+pub const QK1_0: usize = 128;
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -120,6 +127,26 @@ const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
+// prism-ml ternary Q2_0_g128 (ggml type 42): fp16 group scale then 128 ternary
+// codes packed 4-per-byte (2 bits each), LSB-first. 34 bytes / 128 weights.
+pub struct BlockQ2_0 {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK2_0 / 4],
+}
+const _: () = assert!(std::mem::size_of::<BlockQ2_0>() == 34);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+// prism-ml binary Q1_0 (ggml type 41): fp16 group scale then 128 sign bits
+// packed 8-per-byte, LSB-first. 18 bytes / 128 weights.
+pub struct BlockQ1_0 {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK1_0 / 8],
+}
+const _: () = assert!(std::mem::size_of::<BlockQ1_0>() == 18);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
 pub struct BlockQ8_1 {
     pub(crate) d: f16,
     pub(crate) s: f16,
@@ -209,6 +236,125 @@ pub(crate) struct BlockQ4Kx8 {
 }
 #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 const _: () = assert!(std::mem::size_of::<BlockQ4Kx8>() == 1152);
+
+impl GgmlType for BlockQ1_0 {
+    const DTYPE: GgmlDType = GgmlDType::Q1_0;
+    const BLCK_SIZE: usize = QK1_0;
+    type VecDotType = BlockQ8_0;
+
+    // Binary dequant: sign bit -> {-1,+1}, w = bit ? +d : -d, bits packed
+    // 8-per-byte LSB-first (matches the fork's dequantize_q1_0).
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        let qk = Self::BLCK_SIZE;
+        debug_assert!(
+            k.is_multiple_of(qk),
+            "dequantize_row_q1_0: {k} is not divisible by {qk}"
+        );
+        let nb = k / qk;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..qk {
+                let bit = (xs[i].qs[j / 8] >> (j % 8)) & 1;
+                ys[i * qk + j] = if bit == 1 { d } else { -d };
+            }
+        }
+    }
+
+    // quantize_row_q1_0_ref: per-block scale d = mean(|w|); each weight stores
+    // its sign bit (w >= 0 -> 1 -> +d, else 0 -> -d), packed 8-per-byte LSB-first.
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        let qk = Self::BLCK_SIZE;
+        let k = xs.len();
+        debug_assert!(k.is_multiple_of(qk), "{k} is not divisible by {qk}");
+        debug_assert_eq!(ys.len(), k / qk);
+        for (i, y) in ys.iter_mut().enumerate() {
+            let xs = &xs[i * qk..(i + 1) * qk];
+            let sum_abs: f32 = xs.iter().map(|x| x.abs()).sum();
+            y.d = f16::from_f32(sum_abs / qk as f32);
+            y.qs = [0u8; QK1_0 / 8];
+            for (j, &w) in xs.iter().enumerate() {
+                if w >= 0.0 {
+                    y.qs[j / 8] |= 1 << (j % 8);
+                }
+            }
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        let mut xf = vec![0f32; n];
+        let mut yf = vec![0f32; n];
+        Self::to_float(xs, &mut xf);
+        BlockQ8_0::to_float(ys, &mut yf);
+        xf.iter().zip(yf.iter()).map(|(a, b)| a * b).sum()
+    }
+}
+
+impl GgmlType for BlockQ2_0 {
+    const DTYPE: GgmlDType = GgmlDType::Q2_0;
+    const BLCK_SIZE: usize = QK2_0;
+    type VecDotType = BlockQ8_0;
+
+    // Ternary dequant: code 00->-1 01->0 10->+1 11->+2 (ternary uses 0/1/2),
+    // w = (q-1)*d, codes packed 4-per-byte LSB-first. Validated cosine 1.0 vs
+    // the F16 reference (lmbrrr docs/research/ternary-type42-format.md).
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        let qk = Self::BLCK_SIZE;
+        debug_assert!(
+            k.is_multiple_of(qk),
+            "dequantize_row_q2_0: {k} is not divisible by {qk}"
+        );
+        let nb = k / qk;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..qk {
+                let q = ((xs[i].qs[j / 4] >> ((j % 4) * 2)) & 0x3) as i32;
+                ys[i * qk + j] = (q - 1) as f32 * d;
+            }
+        }
+    }
+
+    // quantize_row_q2_0_ref: per-block scale d = max(|w|); code = clamp(
+    // round(w/d) + 1, 0, 3) i.e. {-1,0,+1,+2} biased to {0,1,2,3}, packed
+    // 4-per-byte LSB-first. Ternary weights only ever use codes 0/1/2; a naive
+    // f32 could round to +2 (code 3), exactly as the reference does.
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        let qk = Self::BLCK_SIZE;
+        let k = xs.len();
+        debug_assert!(k.is_multiple_of(qk), "{k} is not divisible by {qk}");
+        debug_assert_eq!(ys.len(), k / qk);
+        for (i, y) in ys.iter_mut().enumerate() {
+            let xs = &xs[i * qk..(i + 1) * qk];
+            let amax = xs.iter().fold(0f32, |m, &x| m.max(x.abs()));
+            let id = if amax > 0.0 { 1.0 / amax } else { 0.0 };
+            y.d = f16::from_f32(amax);
+            y.qs = [0u8; QK2_0 / 4];
+            for (j, &w) in xs.iter().enumerate() {
+                let q = ((w * id).round() as i32 + 1).clamp(0, 3) as u8;
+                y.qs[j / 4] |= q << ((j % 4) * 2);
+            }
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    // Reference dot via dequant. CPU matmul is not the deployment path (Metal
+    // is), so this favours correctness over speed.
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        let mut xf = vec![0f32; n];
+        let mut yf = vec![0f32; n];
+        Self::to_float(xs, &mut xf);
+        BlockQ8_0::to_float(ys, &mut yf);
+        xf.iter().zip(yf.iter()).map(|(a, b)| a * b).sum()
+    }
+}
 
 impl GgmlType for BlockQ4_0 {
     const DTYPE: GgmlDType = GgmlDType::Q4_0;
@@ -2839,3 +2985,67 @@ verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
     BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
 );
+// BlockQ1_0/BlockQ2_0 are intentionally excluded from verify_block_sizes!: they
+// are load-only (dequantize-first), and their 128-element blocks don't match a
+// 32-element Q8_0 VecDotType (the CPU-matmul invariant the macro checks). Byte
+// sizes are asserted at their definitions (18 / 34).
+
+#[cfg(test)]
+mod ternary_tests {
+    use super::*;
+
+    // Ternary Q2_0: code 00->-1 01->0 10->+1 11->+2, w=(q-1)*d, LSB-first.
+    #[test]
+    fn q2_0_dequant() {
+        let d = f16::from_f32(2.0);
+        let mut qs = [0u8; QK2_0 / 4];
+        qs[0] = 0b11_10_01_00; // weights 0..3 = codes 00,01,10,11
+        let mut out = vec![0f32; QK2_0];
+        BlockQ2_0::to_float(&[BlockQ2_0 { d, qs }], &mut out);
+        assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]);
+        assert!(out[4..].iter().all(|&x| x == -2.0)); // code 00 -> (0-1)*d
+    }
+
+    // Binary Q1_0: bit -> {-1,+1}, w = bit ? +d : -d, LSB-first.
+    #[test]
+    fn q1_0_dequant() {
+        let d = f16::from_f32(3.0);
+        let mut qs = [0u8; QK1_0 / 8];
+        qs[0] = 0b0000_0101; // bits 1,0,1,0 at positions 0..3
+        let mut out = vec![0f32; QK1_0];
+        BlockQ1_0::to_float(&[BlockQ1_0 { d, qs }], &mut out);
+        assert_eq!(&out[0..4], &[3.0, -3.0, 3.0, -3.0]);
+        assert!(out[8..].iter().all(|&x| x == -3.0)); // bit 0 -> -d
+    }
+
+    // from_float (quantizer) round-trip: on-grid values reconstruct exactly,
+    // sub-half values snap to 0 — mirrors quantize_row_q2_0_ref (d = max|w|).
+    #[test]
+    fn q2_0_from_float_roundtrip() {
+        let mut xs = vec![0f32; QK2_0];
+        xs[0] = 20.0; // == d -> +d
+        xs[1] = 0.0;
+        xs[2] = -20.0; // == -d -> -d
+        xs[3] = 5.0; // |5| < d/2 -> snaps to 0
+        let mut blk = vec![BlockQ2_0 { d: f16::ZERO, qs: [0; QK2_0 / 4] }];
+        BlockQ2_0::from_float(&xs, &mut blk);
+        assert_eq!(blk[0].d.to_f32(), 20.0); // d = max|w|
+        let mut out = vec![0f32; QK2_0];
+        BlockQ2_0::to_float(&blk, &mut out);
+        assert_eq!(&out[0..4], &[20.0, 0.0, -20.0, 0.0]);
+    }
+
+    // Q1_0 quantizer: sign preserved, magnitude replaced by mean|w| (d).
+    #[test]
+    fn q1_0_from_float_roundtrip() {
+        let xs: Vec<f32> = (0..QK1_0)
+            .map(|j| if j % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut blk = vec![BlockQ1_0 { d: f16::ZERO, qs: [0; QK1_0 / 8] }];
+        BlockQ1_0::from_float(&xs, &mut blk);
+        assert_eq!(blk[0].d.to_f32(), 1.0); // mean|w| = 1
+        let mut out = vec![0f32; QK1_0];
+        BlockQ1_0::to_float(&blk, &mut out);
+        assert_eq!(out, xs); // |w| == d so reconstruction is exact
+    }
+}

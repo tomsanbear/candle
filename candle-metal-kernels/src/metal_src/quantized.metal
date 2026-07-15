@@ -2713,7 +2713,9 @@ void kernel_mul_mv_q2_0_impl_t(
                    uint3     tgpig,
                    uint      tiisg,
                    uint      sgitg) {
-    const int nr  = N_DST;        // rows per simdgroup (4)
+    const int nr  = 2;            // rows per simdgroup: nr2 halves the sumf
+                                  // accumulator vs N_DST=4 -> more resident
+                                  // simdgroups hide DRAM latency (q4k nr2sg2).
     const int nsg = N_SIMDGROUP;  // simdgroups per threadgroup (2)
     const int nw  = N_SIMDWIDTH;  // 32
     const short tpb = NB_Q2_0;    // threads cooperating per block (8)

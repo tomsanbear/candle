@@ -180,12 +180,18 @@ pub fn call_quantized_matmul_mv_t(
         | GgmlDType::Q5_0
         | GgmlDType::Q5_1
         | GgmlDType::Q8_0
-        | GgmlDType::Q8_1
-        // Q2_0's kernel splits each 128-code block across tpb=8 threads.
-        | GgmlDType::Q2_0 => {
+        | GgmlDType::Q8_1 => {
             let nth0 = 8;
             let nth1 = 8;
             let align = 8;
+            (nth0, nth1, align)
+        }
+        GgmlDType::Q2_0 => {
+            // 2 simdgroups x nr=2 rows -> align 4. Each 128-code block is
+            // split across tpb=8 threads.
+            let nth0 = 8;
+            let nth1 = 8;
+            let align = 4;
             (nth0, nth1, align)
         }
         GgmlDType::Q2K => {

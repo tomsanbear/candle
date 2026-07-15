@@ -2596,3 +2596,116 @@ fn attn_prep_matches_unfused_chain() {
         }
     }
 }
+
+/// mtp_fc_prep contract: byte-identical to the unfused rmsnorm_bf16 x2 +
+/// concat + mlx gemv (bm4_bn1_sm1_sn32_tm4_tn4) chain, per row.
+#[test]
+fn mtp_fc_prep_matches_unfused_chain() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+
+    // The production shape: hidden 1024, fc [1024, 2048]. m=2 exercises the
+    // row indexing; production routes m == 1 (bitwise parity only holds
+    // against the gemv tile, which mlx picks at m == 1).
+    let (m, h_dim, out_dim) = (2usize, 1024usize, 1024usize);
+    let k_dim = 2 * h_dim;
+    let eps = 1e-6f32;
+
+    let mut r = rand::rng();
+    let mut rand_vec = |n: usize| -> Vec<bf16> {
+        (0..n)
+            .map(|_| bf16::from_f32(r.random_range(-2.0..2.0)))
+            .collect()
+    };
+    let embeds: Vec<bf16> = rand_vec(m * h_dim);
+    let hidden: Vec<bf16> = rand_vec(m * h_dim);
+    let alpha_e: Vec<bf16> = rand_vec(h_dim);
+    let alpha_h: Vec<bf16> = rand_vec(h_dim);
+    let fc_w: Vec<bf16> = rand_vec(out_dim * k_dim);
+
+    let embeds_buf = new_buffer(&device, &embeds);
+    let hidden_buf = new_buffer(&device, &hidden);
+    let alpha_e_buf = new_buffer(&device, &alpha_e);
+    let alpha_h_buf = new_buffer(&device, &alpha_h);
+    let fc_w_buf = new_buffer(&device, &fc_w);
+    let fused_out = new_buffer(&device, &vec![bf16::from_f32(0.0); m * out_dim]);
+
+    {
+        let encoder = commands.command_encoder().unwrap();
+        call_mtp_fc_prep(
+            &device, &encoder, &kernels, "mtp_fc_prep_bf16",
+            m, h_dim, out_dim, eps,
+            &embeds_buf, 0, &hidden_buf, 0,
+            &alpha_e_buf, 0, &alpha_h_buf, 0,
+            &fc_w_buf, 0, &fused_out,
+        )
+        .unwrap();
+        drop(encoder);
+    }
+    commands.wait_until_completed().unwrap();
+
+    // Reference: the production kernels, unfused. Both norms run at
+    // el_per_block = h_dim (BLOCKSIZE 512, the width the fused kernel
+    // emulates); the concat is a byte copy; the gemv runs once per row at
+    // m == 1, reproducing the production dispatch exactly.
+    let e_norm = new_buffer(&device, &vec![bf16::from_f32(0.0); m * h_dim]);
+    let h_norm = new_buffer(&device, &vec![bf16::from_f32(0.0); m * h_dim]);
+    {
+        let encoder = commands.command_encoder().unwrap();
+        call_rms_norm(
+            &device, &encoder, &kernels, "rmsnorm_bf16",
+            m * h_dim, h_dim, eps, &embeds_buf, 0, &alpha_e_buf, 0, &e_norm,
+        )
+        .unwrap();
+        call_rms_norm(
+            &device, &encoder, &kernels, "rmsnorm_bf16",
+            m * h_dim, h_dim, eps, &hidden_buf, 0, &alpha_h_buf, 0, &h_norm,
+        )
+        .unwrap();
+        drop(encoder);
+    }
+    commands.wait_until_completed().unwrap();
+
+    let e_normed: Vec<bf16> = read_to_vec(&e_norm, m * h_dim);
+    let h_normed: Vec<bf16> = read_to_vec(&h_norm, m * h_dim);
+    let mut cat: Vec<bf16> = Vec::with_capacity(m * k_dim);
+    for row in 0..m {
+        cat.extend_from_slice(&e_normed[row * h_dim..(row + 1) * h_dim]);
+        cat.extend_from_slice(&h_normed[row * h_dim..(row + 1) * h_dim]);
+    }
+    let cat_buf = new_buffer(&device, &cat);
+
+    let got: Vec<bf16> = read_to_vec(&fused_out, m * out_dim);
+    for row in 0..m {
+        let ref_out = new_buffer(&device, &vec![bf16::from_f32(0.0); out_dim]);
+        {
+            let encoder = commands.command_encoder().unwrap();
+            // x [1, k] (contiguous) x w.t() [k, out] (strides [1, k]).
+            call_mlx_gemv(
+                &device, &encoder, &kernels, GemmDType::BF16,
+                (1, 1, out_dim, k_dim),
+                &[k_dim, 1], row * k_dim * std::mem::size_of::<bf16>(), &cat_buf,
+                &[1, k_dim], 0, &fc_w_buf,
+                &ref_out,
+            )
+            .unwrap();
+            drop(encoder);
+        }
+        commands.wait_until_completed().unwrap();
+        let expected: Vec<bf16> = read_to_vec(&ref_out, out_dim);
+
+        let diffs: Vec<(usize, u16, u16)> = got[row * out_dim..(row + 1) * out_dim]
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .filter(|(_, (g, e))| g.to_bits() != e.to_bits())
+            .map(|(i, (g, e))| (i, g.to_bits(), e.to_bits()))
+            .take(8)
+            .collect();
+        assert!(
+            diffs.is_empty(),
+            "fused mtp_fc_prep diverges from the unfused chain (row {row}); first diffs (idx, got, want): {diffs:?}"
+        );
+    }
+}

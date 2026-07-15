@@ -160,4 +160,147 @@ kernel void attn_kv_prep_bf16(
     attn_row_norm_rope(k_row, alpha, cos_row, sin_row, k_dst, d, rd, eps, tid, red, nbuf);
 }
 
+// ---------------------------------------------------------------------------
+// MTP pre-fc fusion: out[r, :] = fc_w x cat(rmsnorm(e[r]), rmsnorm(h[r])) in
+// ONE dispatch — the unfused chain (norm, norm, cat copy, GEMV) is 4
+// serially-dependent dispatches per MTP chain step.
+//
+// Bitwise contract (byte-parity with the unfused chain, m == 1):
+//   * Each norm reproduces rms_norm<bfloat, 512> (reduce.metal) exactly: 512
+//     virtual-thread f32 sum-of-squares partials in load order, folded by
+//     the same [i] + [i+s] binary-tree pairing (block_reducer's shared tree
+//     + simd_shuffle tail combine identically), scale =
+//     rsqrt(fast::divide(sum, d) + eps) rounded to bf16 FIRST, then per-op
+//     bf16 (x * scale) * alpha. Valid iff the unfused dispatch picks
+//     BLOCKSIZE 512, i.e. (h_dim / 2).next_power_of_two() == 512.
+//   * The GEMV reproduces gemv_bfloat16_bm4_bn1_sm1_sn32_tm4_tn4 (gemv.metal,
+//     the tile mlx_gemv selects for K=2*h_dim, out_dim < 4096 at m == 1):
+//     each simdgroup owns 4 consecutive output rows, lane l owns K positions
+//     l*4+tn + iter*128, f32 v_coeff upcast, bf16 weights promoted at the
+//     multiply, result[tm] += inter[tn] * v_coeff[tn] in the same loop
+//     order, simd_shuffle_down ladder 16..1, lane-0 bf16 stores. The cat is
+//     the nbuf layout: [normed e | normed h].
+//   Enforced by tests::mtp_fc_prep_matches_unfused_chain against the
+//   production kernels.
+//
+// Grid: (out_dim / 16, m) threadgroups x MTP_FC_BLOCK threads. Every
+// threadgroup recomputes its row's two rms scales redundantly (the
+// normalize-on-load price: ~2*h_dim cached loads per TG, accepted per the
+// gated_delta_v2 doctrine of redundant scalar recompute over extra syncs).
+// ---------------------------------------------------------------------------
+
+constant constexpr uint MTP_FC_BLOCK = 128;
+// rms_norm's BLOCKSIZE for h_dim in (512, 1024] — the only sizes served.
+constant constexpr uint MTP_FC_LEAVES = 512;
+constant constexpr uint MTP_FC_MAX_H = 1024;
+
+// Pairing-exact emulation of rms_norm<bfloat, 512>'s reduction with
+// MTP_FC_BLOCK threads: each thread materializes 4 virtual-thread leaf
+// partials, then the tree folds red[i] += red[i + s] for s = 256 .. 1 —
+// the identical combine sequence, so the f32 sum is bit-identical.
+METAL_FUNC float mtp_row_sumsq_512(
+    const device bfloat *row,
+    uint d,
+    uint tid,
+    threadgroup float *red
+) {
+    for (uint p = 0; p < MTP_FC_LEAVES / MTP_FC_BLOCK; p++) {
+        const uint v = tid + p * MTP_FC_BLOCK;
+        float acc = 0.0f;
+        for (uint i = v; i < d; i += MTP_FC_LEAVES) {
+            float x = float(row[i]);
+            acc = acc + x * x;
+        }
+        red[v] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = MTP_FC_LEAVES / 2; s >= 1; s >>= 1) {
+        for (uint i = tid; i < s; i += MTP_FC_BLOCK) {
+            red[i] = red[i] + red[i + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return red[0];
+}
+
+kernel void mtp_fc_prep_bf16(
+    constant uint &h_dim,
+    constant uint &out_dim,
+    constant float &eps,
+    device const bfloat *embeds,   // [m, h_dim]
+    device const bfloat *hidden,   // [m, h_dim]
+    device const bfloat *alpha_e,  // [h_dim] (zero-centred +1 pre-applied)
+    device const bfloat *alpha_h,  // [h_dim]
+    device const bfloat *fc_w,     // [out_dim, 2*h_dim] row-major
+    device bfloat *out,            // [m, out_dim]
+    uint2 gid [[ threadgroup_position_in_grid ]],
+    uint simd_gid [[ simdgroup_index_in_threadgroup ]],
+    uint simd_lid [[ thread_index_in_simdgroup ]]
+) {
+    threadgroup float red[MTP_FC_LEAVES];
+    threadgroup bfloat nbuf[2 * MTP_FC_MAX_H];
+
+    // Linear thread index; a second [[thread_position_*]] input would force
+    // gid to stay scalar (Metal wants matching vector-ness across them).
+    const uint tid = simd_gid * 32 + simd_lid;
+
+    const uint r = gid.y;
+    const device bfloat *e_row = embeds + r * h_dim;
+    const device bfloat *h_row = hidden + r * h_dim;
+
+    const float se = mtp_row_sumsq_512(e_row, h_dim, tid, red);
+    const bfloat scale_e = static_cast<bfloat>(rsqrt(fast::divide(se, float(h_dim)) + eps));
+    // red[0] is consumed by every thread above; fence before the reuse below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sh = mtp_row_sumsq_512(h_row, h_dim, tid, red);
+    const bfloat scale_h = static_cast<bfloat>(rsqrt(fast::divide(sh, float(h_dim)) + eps));
+
+    for (uint i = tid; i < h_dim; i += MTP_FC_BLOCK) {
+        bfloat ve = e_row[i] * scale_e;
+        ve *= alpha_e[i];
+        nbuf[i] = ve;
+        bfloat vh = h_row[i] * scale_h;
+        vh *= alpha_h[i];
+        nbuf[h_dim + i] = vh;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // GEMV over nbuf, replicating gemv bm4_bn1_sm1_sn32_tm4_tn4 bit-for-bit.
+    const uint k_dim = 2 * h_dim;
+    thread float result[4] = {0.0f};
+    thread bfloat inter[4];
+    thread float v_coeff[4];
+    const int bm = int(simd_gid) * 4;
+    int bn = int(simd_lid) * 4;
+    const int out_row = int(gid.x) * 16 + bm;
+    const device bfloat *mat = fc_w + (ulong)out_row * k_dim;
+    const int n_iter = int(k_dim) / 128;
+    for (int it = 0; it < n_iter; ++it) {
+        for (int tn = 0; tn < 4; tn++) {
+            v_coeff[tn] = static_cast<float>(nbuf[bn + tn]);
+        }
+        int mat_offset = 0;
+        for (int tm = 0; tm < 4; tm++) {
+            for (int tn = 0; tn < 4; tn++) {
+                inter[tn] = mat[mat_offset + bn + tn];
+            }
+            for (int tn = 0; tn < 4; tn++) {
+                result[tm] += inter[tn] * v_coeff[tn];
+            }
+            mat_offset += int(k_dim);
+        }
+        bn += 128;
+    }
+    for (int tm = 0; tm < 4; tm++) {
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            result[tm] += simd_shuffle_down(result[tm], sn);
+        }
+    }
+    if (simd_lid == 0) {
+        for (int tm = 0; tm < 4; tm++) {
+            out[(ulong)r * out_dim + out_row + tm] = static_cast<bfloat>(result[tm]);
+        }
+    }
+}
+
 #endif

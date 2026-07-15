@@ -10,10 +10,11 @@ pub use kernel::{KernelName, Kernels};
 pub use kernels::{
     affine::*, call_attn_kv_prep, call_attn_q_prep, call_binary_contiguous, call_binary_strided,
     call_gated_delta_chunk, call_gated_delta_decode, call_markov_chain, call_mlx_gemm,
-    call_mlx_gemv, call_skinny_gemm, cast::*, convolution::*, fill::*, indexing::*, quantized::*,
-    random::*, reduce::*, sdpa::*, sort::*, ternary::*, unary, unary::*, GatedDeltaParams,
-    GemmDType, GgmlDType, MarkovChainArgs, ATTN_PREP_BLOCK, ATTN_PREP_MAX_D, MARKOV_FUSED_MAX_VD,
-    MARKOV_NTG, MARKOV_TPG,
+    call_mlx_gemv, call_mtp_fc_prep, call_skinny_gemm, cast::*, convolution::*, fill::*,
+    indexing::*, quantized::*, random::*, reduce::*, sdpa::*, sort::*, ternary::*, unary,
+    unary::*, GatedDeltaParams, GemmDType, GgmlDType, MarkovChainArgs, ATTN_PREP_BLOCK,
+    ATTN_PREP_MAX_D, MARKOV_FUSED_MAX_VD, MARKOV_NTG, MARKOV_TPG, MTP_FC_BLOCK, MTP_FC_LEAVES,
+    MTP_FC_MAX_H,
 };
 use metal::{
     Buffer, CommandQueue, ComputeCommandEncoder, ComputePipeline, ConstantValues, Device, Function,

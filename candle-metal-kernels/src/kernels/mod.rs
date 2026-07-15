@@ -19,7 +19,10 @@ pub mod ternary;
 pub mod unary;
 
 pub use affine::*;
-pub use attn_prep::{call_attn_kv_prep, call_attn_q_prep, ATTN_PREP_BLOCK, ATTN_PREP_MAX_D};
+pub use attn_prep::{
+    call_attn_kv_prep, call_attn_q_prep, call_mtp_fc_prep, ATTN_PREP_BLOCK, ATTN_PREP_MAX_D,
+    MTP_FC_BLOCK, MTP_FC_LEAVES, MTP_FC_MAX_H,
+};
 pub use binary::{call_binary_contiguous, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;

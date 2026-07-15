@@ -285,12 +285,17 @@ kernel void gated_delta_v2_decode_bf16(
     constant uint  &value_dim  [[buffer(15)]],
     constant uint  &ksz        [[buffer(16)]],
     constant float &l2_eps     [[buffer(17)]],
+    constant uint  &num_k_heads [[buffer(18)]],
     uint2 tg        [[threadgroup_position_in_grid]],
     uint2 tp        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]]) {
     const uint bh = tg.y;
     const uint bi = bh / heads;
     const uint h = bh % heads;
+    // GQA DeltaNet: value-head h reads its group's shared key/query head. When
+    // num_k_heads == heads this is the identity. v, gates (b/a), decay and the
+    // recurrent state stay per value-head.
+    const uint kh = num_k_heads == heads ? h : h * num_k_heads / heads;
     const uint col = tg.x * 4 + tp.y;
     const uint lane = tp.x;
     const uint n_per_lane = dk / 32; // 4 at dk=128
@@ -306,8 +311,8 @@ kernel void gated_delta_v2_decode_bf16(
     float kc[4];
     for (uint i = 0; i < n_per_lane; i++) {
         const uint slot = lane * n_per_lane + i;
-        const uint chq = h * dk + slot;
-        const uint chk = key_dim + h * dk + slot;
+        const uint chq = kh * dk + slot;
+        const uint chk = key_dim + kh * dk + slot;
         float accq = 0.0f;
         float acck = 0.0f;
         for (uint t = 0; t + 1 < ksz; t++) {
@@ -379,10 +384,10 @@ kernel void gated_delta_v2_decode_bf16(
     // (tg.x == 0, tp.y == 0) simdgroup covers this head's q/k channels
     // (lane-owned slots); each column's simdgroup lane 0 covers its v
     // channel.
-    if (tg.x == 0 && tp.y == 0) {
+    if (tg.x == 0 && tp.y == 0 && (num_k_heads == heads || h % (heads / num_k_heads) == 0)) {
         for (uint i = 0; i < n_per_lane; i++) {
             const uint slot = lane * n_per_lane + i;
-            const uint chans2[2] = {h * dk + slot, key_dim + h * dk + slot};
+            const uint chans2[2] = {kh * dk + slot, key_dim + kh * dk + slot};
             for (uint c = 0; c < 2; c++) {
                 const uint ch = chans2[c];
                 for (uint t = 0; t + 1 < ksz; t++) {

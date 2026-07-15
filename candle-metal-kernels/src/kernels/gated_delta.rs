@@ -17,6 +17,9 @@ pub struct GatedDeltaParams {
     pub ksz: u32,
     pub l2_eps: f32,
     pub norm_eps: f32,
+    /// GQA key/query heads (== heads for MiniCPM; < heads for Bonsai's
+    /// grouped DeltaNet). Only the v2 decode kernel reads it.
+    pub num_k_heads: u32,
 }
 
 /// Fused GatedDeltaNet chunk step (l <= 12); see gated_delta_chunk.metal.
@@ -410,7 +413,8 @@ pub fn call_gated_delta_v2_decode(
             params.key_dim,
             params.value_dim,
             params.ksz,
-            params.l2_eps
+            params.l2_eps,
+            params.num_k_heads
         )
     );
     encoder.dispatch_thread_groups(

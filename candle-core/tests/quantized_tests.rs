@@ -1909,3 +1909,65 @@ fn test_matmul_q8_0_bf16_accuracy() -> Result<()> {
     }
     Ok(())
 }
+
+/// Packed Q2_0 ternary GEMV (kernel_mul_mv_q2_0_*) vs the dequantized
+/// reference. The ternary error is common to both sides, isolating the
+/// kernel: the f32 path matches the dense reference near-exactly, the bf16
+/// path to the bf16 activation floor. m=1 (decode GEMV) — m>1 prefill routing
+/// lands with the loader. n=515 exercises the row tail guard.
+#[cfg(feature = "metal")]
+#[test]
+fn test_matmul_q2_0_accuracy() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let m = 1usize;
+    for (k, n) in [(2048usize, 1024usize), (3584, 515), (256, 128)] {
+        let rhs = (0..(k * n))
+            .map(|v| ((v * 7919) % 97) as f32 / 97.0 - 0.5)
+            .collect::<Vec<_>>();
+        let rhs_mtl = Tensor::from_slice(&rhs, (n, k), &device)?;
+        let qtensor = quantized::QTensor::quantize(&rhs_mtl, GgmlDType::Q2_0)?;
+        let w_deq = qtensor.dequantize(&device)?;
+        let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+        let lhs = (0..(m * k))
+            .map(|v| ((v * 104729) % 89) as f32 / 89.0 - 0.5)
+            .collect::<Vec<_>>();
+        let lhs_mtl = Tensor::from_slice(&lhs, (1, m, k), &device)?;
+        let expected = lhs_mtl
+            .reshape((m, k))?
+            .matmul(&w_deq.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        for (label, got, bound) in [
+            (
+                "f32",
+                matmul.forward(&lhs_mtl)?.flatten_all()?.to_vec1::<f32>()?,
+                5e-4f64,
+            ),
+            (
+                "bf16",
+                matmul
+                    .forward(&lhs_mtl.to_dtype(candle_core::DType::BF16)?)?
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                5e-3f64,
+            ),
+        ] {
+            let mut sum_rel = 0f64;
+            let mut max_rel = 0f64;
+            for (e, g) in expected.iter().zip(got.iter()) {
+                let rel = ((e - g).abs() / e.abs().max(1.0)) as f64;
+                sum_rel += rel;
+                max_rel = max_rel.max(rel);
+            }
+            let mean_rel = sum_rel / expected.len() as f64;
+            eprintln!("q2_0 {label} k={k} n={n}: mean_rel={mean_rel:.2e} max_rel={max_rel:.2e}");
+            assert!(
+                mean_rel < bound,
+                "q2_0 {label} k={k} n={n}: mean rel {mean_rel:.2e} exceeds {bound:.0e}"
+            );
+        }
+    }
+    Ok(())
+}

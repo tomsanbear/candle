@@ -2667,6 +2667,196 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
+// Q2_0 ternary GEMV (prism-ml type 42), 2 bits/code 4-per-byte LSB-first;
+// code c in {0,1,2,3} is weight (c-1)*d. Stays packed (dequant to bf16 would
+// not fit in RAM), so this kernel is required, not a speed option. Layout
+// matches candle_core BlockQ2_0.
+#define QK2_0 128
+typedef struct {
+    half d;
+    uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// tpb threads split one 128-code block; reuses the Q8_0 dispatch geometry.
+#define NB_Q2_0 8
+#define SW_Q2_0 (QK2_0 / NB_Q2_0)
+
+// With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).
+template<short SW>
+static inline float q2_0_dot_y(thread const uint8_t * b, const float d, const float sumy, thread const float * yl) {
+    float acc_lo = 0.0f;
+    float acc_hi = 0.0f;
+    for (short i = 0; i < SW; i++) {
+        acc_lo += select(0.0f, yl[i], bool(b[i/4] & (1u << (2*(i%4) + 0))));
+        acc_hi += select(0.0f, yl[i], bool(b[i/4] & (1u << (2*(i%4) + 1))));
+    }
+    return d * (acc_lo + 2.0f*acc_hi - sumy);
+}
+
+// F32 accumulation; DT only changes the final store (see q8_0_impl_t).
+template <typename YT, typename DT = float>
+void kernel_mul_mv_q2_0_impl_t(
+        device const  void * src0,
+        device const    YT * src1,
+        device          DT * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    const int nr  = N_DST;        // rows per simdgroup (4)
+    const int nsg = N_SIMDGROUP;  // simdgroups per threadgroup (2)
+    const int nw  = N_SIMDWIDTH;  // 32
+    const short tpb = NB_Q2_0;    // threads cooperating per block (8)
+    const short SW  = SW_Q2_0;    // elements per thread (16)
+
+    const int nb = ne00/QK2_0;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q2_0 * x = (device const block_q2_0 *) src0 + offset0;
+    device const YT         * y = (device const YT         *) src1 + r1*ne10 + im*ne00*ne1;
+
+    float yl[SW_Q2_0];
+    float sumf[nr] = {0.f};
+
+    const short ix = tiisg/tpb;
+    const short il = (tiisg%tpb)*SW;
+
+    device const YT * yb = y + ix*QK2_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/NB_Q2_0) {
+        float sumy = 0.f;
+        for (short i = 0; i < SW; ++i) {
+            yl[i] = (float) yb[i];
+            sumy += yl[i];
+        }
+
+        for (int row = 0; row < nr; row++) {
+            // stop before qs reads walk past src0 (store is row-guarded too)
+            if (first_row + row >= ne01) break;
+            device const block_q2_0 * qb = x + ib + row*nb;
+            device const uint8_t    * qs = qb->qs + il/4;
+            uint8_t b[SW_Q2_0/4];
+            for (short i = 0; i < SW/4; ++i) {
+                b[i] = qs[i];
+            }
+            sumf[row] += q2_0_dot_y<SW_Q2_0>(b, (float) qb->d, sumy, yl);
+        }
+
+        yb += QK2_0 * (nw/NB_Q2_0);
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_q2_0_f32")]]
+kernel void kernel_mul_mv_q2_0_f32(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q2_0_impl_t<float>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+#if defined(__HAVE_BFLOAT__)
+[[host_name("kernel_mul_mv_q2_0_bf16")]]
+kernel void kernel_mul_mv_q2_0_bf16(
+        device const   void * src0,
+        device const bfloat * src1,
+        device        float * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q2_0_impl_t<bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+// bf16 activations AND bf16 dst: skips the cast_f32_bf16 dispatch the
+// F32-dst variant forces on every bf16-pipeline caller.
+[[host_name("kernel_mul_mv_q2_0_bf16_bf16")]]
+kernel void kernel_mul_mv_q2_0_bf16_bf16(
+        device const   void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q2_0_impl_t<bfloat, bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+#endif
+
 #define N_MV_T_T 4
 
 template<typename T0, typename T04, typename T1, typename T14>

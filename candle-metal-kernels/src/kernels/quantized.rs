@@ -13,6 +13,7 @@ pub enum GgmlDType {
     Q5_1,
     Q8_0,
     Q8_1,
+    Q2_0,
     Q2K,
     Q3K,
     Q4K,
@@ -27,7 +28,10 @@ pub enum GgmlDType {
 /// True when `dtype` has BF16-activation (src1) mv kernel variants, i.e. the
 /// F32 cast round-trip around the matmul can be skipped.
 pub fn quantized_matmul_mv_bf16_src1_supported(dtype: GgmlDType) -> bool {
-    matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K)
+    matches!(
+        dtype,
+        GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::Q2_0
+    )
 }
 
 /// True when `dtype` has BF16-dst mv/mc kernel variants (only with BF16
@@ -35,7 +39,10 @@ pub fn quantized_matmul_mv_bf16_src1_supported(dtype: GgmlDType) -> bool {
 /// store, so a BF16 dst is bit-identical to an F32 dst followed by a
 /// cast_f32_bf16 dispatch — it just skips that dispatch.
 pub fn quantized_matmul_mv_bf16_dst_supported(dtype: GgmlDType) -> bool {
-    matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K)
+    matches!(
+        dtype,
+        GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::Q2_0
+    )
 }
 
 /// SoA plane-split q4_K mv experiment (bench-only until the micro gate
@@ -173,7 +180,9 @@ pub fn call_quantized_matmul_mv_t(
         | GgmlDType::Q5_0
         | GgmlDType::Q5_1
         | GgmlDType::Q8_0
-        | GgmlDType::Q8_1 => {
+        | GgmlDType::Q8_1
+        // Q2_0's kernel splits each 128-code block across tpb=8 threads.
+        | GgmlDType::Q2_0 => {
             let nth0 = 8;
             let nth1 = 8;
             let align = 8;
@@ -233,14 +242,17 @@ pub fn call_quantized_matmul_mv_t(
         (GgmlDType::Q8_0, true) if dst_bf16 => "kernel_mul_mv_q8_0_bf16_bf16",
         (GgmlDType::Q4K, true) if dst_bf16 => "kernel_mul_mv_q4_K_bf16_bf16",
         (GgmlDType::Q6K, true) if dst_bf16 => "kernel_mul_mv_q6_K_bf16_bf16",
+        (GgmlDType::Q2_0, true) if dst_bf16 => "kernel_mul_mv_q2_0_bf16_bf16",
         (GgmlDType::Q8_0, true) => "kernel_mul_mv_q8_0_bf16",
         (GgmlDType::Q4K, true) => "kernel_mul_mv_q4_K_bf16",
         (GgmlDType::Q6K, true) => "kernel_mul_mv_q6_K_bf16",
+        (GgmlDType::Q2_0, true) => "kernel_mul_mv_q2_0_bf16",
         (GgmlDType::Q4_0, _) => "kernel_mul_mv_q4_0_f32",
         (GgmlDType::Q4_1, _) => "kernel_mul_mv_q4_1_f32",
         (GgmlDType::Q5_0, _) => "kernel_mul_mv_q5_0_f32",
         (GgmlDType::Q5_1, _) => "kernel_mul_mv_q5_1_f32",
         (GgmlDType::Q8_0, false) => "kernel_mul_mv_q8_0_f32",
+        (GgmlDType::Q2_0, false) => "kernel_mul_mv_q2_0_f32",
         (GgmlDType::Q8_1, _) => "kernel_mul_mv_q8_1_f32",
         (GgmlDType::Q2K, _) => "kernel_mul_mv_q2_K_f32",
         (GgmlDType::Q3K, _) => "kernel_mul_mv_q3_K_f32",
@@ -1188,6 +1200,8 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+        // No tile-mm kernel; m>1 (prefill) must route through the mv path.
+        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "qmatmul"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -1256,6 +1270,8 @@ pub fn call_quantized_get_rows(
         GgmlDType::Q6K => "kernel_get_rows_q6_K",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
+        // Packed-embedding lookup lands with the GGUF loader; dequant for now.
+        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "get_rows"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

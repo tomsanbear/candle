@@ -813,11 +813,10 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::BF16,
-            // prism-ml ternary/binary types have no packed Metal matmul kernel
-            // yet (lmbrrr ticket metal-ternary-matmul-kernel). The deployment
-            // path dequantizes these to bf16 at load, so a quantized-matmul
-            // dispatch on them is a misuse — fail loud rather than silently.
-            GgmlDType::Q1_0 | GgmlDType::Q2_0 => panic!(
+            GgmlDType::Q2_0 => candle_metal_kernels::GgmlDType::Q2_0,
+            // Q1_0 (binary) still has no packed Metal matmul kernel; the
+            // deployment path dequantizes it to bf16, so a dispatch is a misuse.
+            GgmlDType::Q1_0 => panic!(
                 "{value:?} has no Metal quantized-matmul kernel; dequantize to bf16 first"
             ),
         }

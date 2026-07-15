@@ -689,6 +689,82 @@ pub fn call_quantized_matmul_mm2d_q4k_splitk(
     Ok(())
 }
 
+/// Fused m-row head argmax on the mm2d plane layout: per-tile fold +
+/// bf16-rounded per-row best (lowest-index ties, matching fast_argmax on
+/// the stored tensor) + a per-row reduce. `out` receives m u32 ids; the
+/// m x n logits tensor is never materialized. Scratch: pval (n_pad/64 * 8
+/// f32), pidx (same, u32).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm2d_q4k_argmax(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, n_pad, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    nibbles: &Buffer,
+    dsc: &Buffer,
+    dmm: &Buffer,
+    pval: &Buffer,
+    pidx: &Buffer,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    debug_assert!(m <= 8 && k % 32 == 0 && k <= 8192 && n_pad % 64 == 0);
+    let dims: [i32; 4] = [k as i32, n_pad as i32, n as i32, m as i32];
+    let n_tiles = n_pad / 64;
+
+    let pipeline =
+        kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mul_mm2d_q4k_argmax")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mm2d_q4k_argmax M={m} K={k} N={n}");
+    set_params!(
+        encoder,
+        (
+            (lhs, lhs_offset),
+            nibbles,
+            dsc,
+            dmm,
+            Output::with_offset(pval, 0),
+            Output::with_offset(pidx, 0),
+            &dims[..]
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: n_tiles,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    let reduce =
+        kernels.load_pipeline(device, Source::Mm2dQ4k, "kernel_mm2d_q4k_argmax_reduce")?;
+    encoder.set_compute_pipeline_state(&reduce);
+    debug_group!(encoder, "qmm_mm2d_q4k_argmax_reduce M={m}");
+    let nt = n_tiles as i32;
+    set_params!(encoder, (pval, pidx, Output::with_offset(out, 0), nt));
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: m,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 pub fn call_quantized_matmul_mv_q4k_bf16_geo(
     device: &Device,
     ep: impl EncoderProvider,

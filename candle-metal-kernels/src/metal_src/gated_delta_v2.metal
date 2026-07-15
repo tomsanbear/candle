@@ -292,10 +292,11 @@ kernel void gated_delta_v2_decode_bf16(
     const uint bh = tg.y;
     const uint bi = bh / heads;
     const uint h = bh % heads;
-    // GQA DeltaNet: value-head h reads its group's shared key/query head. When
-    // num_k_heads == heads this is the identity. v, gates (b/a), decay and the
+    // GQA DeltaNet: value-head h reads key/query head h % num_k_heads. This
+    // matches maybe_repeat_heads (cat of n_rep tiles -> [0..K-1, 0..K-1, ...]).
+    // Identity when num_k_heads == heads. v, gates (b/a), decay and the
     // recurrent state stay per value-head.
-    const uint kh = num_k_heads == heads ? h : h * num_k_heads / heads;
+    const uint kh = num_k_heads == heads ? h : h % num_k_heads;
     const uint col = tg.x * 4 + tp.y;
     const uint lane = tp.x;
     const uint n_per_lane = dk / 32; // 4 at dk=128
@@ -384,7 +385,7 @@ kernel void gated_delta_v2_decode_bf16(
     // (tg.x == 0, tp.y == 0) simdgroup covers this head's q/k channels
     // (lane-owned slots); each column's simdgroup lane 0 covers its v
     // channel.
-    if (tg.x == 0 && tp.y == 0 && (num_k_heads == heads || h % (heads / num_k_heads) == 0)) {
+    if (tg.x == 0 && tp.y == 0 && (num_k_heads == heads || h < num_k_heads)) {
         for (uint i = 0; i < n_per_lane; i++) {
             const uint slot = lane * n_per_lane + i;
             const uint chans2[2] = {kh * dk + slot, key_dim + kh * dk + slot};

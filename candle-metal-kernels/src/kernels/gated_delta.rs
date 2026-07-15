@@ -628,6 +628,16 @@ pub fn call_gated_delta_v2_tree(
     Ok(())
 }
 
+/// Output mode of the rollback reconstruction store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnReconstructOut {
+    F32,
+    Bf16,
+    /// F32 buffer holding bf16-rounded values — exactly what the Bf16 store
+    /// plus a cast_bf16_f32 dispatch would produce, without the cast.
+    Bf16RoundedF32,
+}
+
 /// Rollback state reconstruction, one dispatch per layer (see
 /// gated_delta_v2_reconstruct_* in gated_delta_v2.metal): replaces the f32
 /// broadcast/exp/GEMM chain a partial accept otherwise runs on the host op
@@ -640,7 +650,7 @@ pub fn call_gated_delta_v2_reconstruct(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     (heads_batch, da, db, prefix, c_total): (usize, usize, usize, usize, usize),
-    out_bf16: bool,
+    out_mode: GdnReconstructOut,
     s0: &Buffer,
     fmat: &Buffer,
     gmat: &Buffer,
@@ -648,10 +658,10 @@ pub fn call_gated_delta_v2_reconstruct(
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(prefix >= 1 && prefix <= c_total);
-    let name = if out_bf16 {
-        "gated_delta_v2_reconstruct_bf16"
-    } else {
-        "gated_delta_v2_reconstruct_f32"
+    let name = match out_mode {
+        GdnReconstructOut::Bf16 => "gated_delta_v2_reconstruct_bf16",
+        GdnReconstructOut::F32 => "gated_delta_v2_reconstruct_f32",
+        GdnReconstructOut::Bf16RoundedF32 => "gated_delta_v2_reconstruct_bf16r_f32",
     };
     let pipeline = kernels.load_pipeline(device, Source::GatedDeltaV2, name)?;
     let encoder = ep.encoder();

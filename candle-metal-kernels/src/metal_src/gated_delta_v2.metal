@@ -673,13 +673,13 @@ kernel void gated_delta_v2_core_tree(
 // the capture's FULL chunk stride (c_total), so callers pass untrimmed
 // tensors and only rows i < prefix are read. Grid: (da*db, heads*batch).
 // ---------------------------------------------------------------------------
-#define GDN_RECONSTRUCT(NAME, OUT_T)                                          \
+#define GDN_RECONSTRUCT(NAME, PTR_T, STORE)                                   \
 kernel void NAME(                                                             \
     device const float *s0   [[buffer(0)]],                                   \
     device const float *fmat [[buffer(1)]],                                   \
     device const float *gmat [[buffer(2)]],                                   \
     device const float *gcs  [[buffer(3)]],                                   \
-    device OUT_T       *out  [[buffer(4)]],                                   \
+    device PTR_T       *out  [[buffer(4)]],                                   \
     constant uint &da       [[buffer(5)]],                                    \
     constant uint &db       [[buffer(6)]],                                    \
     constant uint &prefix   [[buffer(7)]],                                    \
@@ -701,11 +701,16 @@ kernel void NAME(                                                             \
         const float g = gmat[((ulong)hb * c_total + i) * db + b];             \
         acc = fma(f * rel, g, acc);                                           \
     }                                                                         \
-    out[((ulong)hb * da + a) * db + b] = OUT_T(acc);                          \
+    out[((ulong)hb * da + a) * db + b] = STORE(acc);                          \
 }
 
-GDN_RECONSTRUCT(gated_delta_v2_reconstruct_f32, float)
-GDN_RECONSTRUCT(gated_delta_v2_reconstruct_bf16, bfloat)
+// bf16-rounded f32 store: exactly the values the bf16 kernel plus a
+// cast_bf16_f32 dispatch would produce, minus the cast's dispatch + traffic.
+#define GDN_BF16R(x) float(bfloat(x))
+
+GDN_RECONSTRUCT(gated_delta_v2_reconstruct_f32, float, float)
+GDN_RECONSTRUCT(gated_delta_v2_reconstruct_bf16, bfloat, bfloat)
+GDN_RECONSTRUCT(gated_delta_v2_reconstruct_bf16r_f32, float, GDN_BF16R)
 
 // ---------------------------------------------------------------------------
 // epilogue: grid (heads * batch) TGs x dv threads. Group RMSNorm over the

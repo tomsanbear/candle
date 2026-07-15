@@ -1852,3 +1852,51 @@ fn test_matmul_mm2d_q4k_accuracy() -> Result<()> {
     assert!(bias.abs() < 1e-3, "systematic bias {bias:.2e}");
     Ok(())
 }
+
+/// Accuracy of the q8_0 BF16-activation paths vs the dequantized reference —
+/// q8_0 error is ~1e-3 relative, so anything worse is a kernel bug. Filed
+/// 2026-07-15: quantizing ANY MTP-drafter linear at q8_0 collapsed draft
+/// acceptance with damage scaling in K, which no honest quantizer does.
+/// Covers m=1 (mv kernel) and m=3 (the m-in-[2,8] route).
+#[cfg(feature = "metal")]
+#[test]
+fn test_matmul_q8_0_bf16_accuracy() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    for (m, k, n) in [(1usize, 2048usize, 1024usize), (3, 2048, 1024), (1, 3584, 515), (3, 3584, 515)] {
+        let rhs = (0..(k * n))
+            .map(|v| ((v * 7919) % 97) as f32 / 97.0 - 0.5)
+            .collect::<Vec<_>>();
+        let rhs_mtl = Tensor::from_slice(&rhs, (n, k), &device)?;
+        let qtensor = quantized::QTensor::quantize(&rhs_mtl, GgmlDType::Q8_0)?;
+        let w_deq = qtensor.dequantize(&device)?;
+        let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+        let lhs = (0..(m * k))
+            .map(|v| ((v * 104729) % 89) as f32 / 89.0 - 0.5)
+            .collect::<Vec<_>>();
+        let lhs_mtl = Tensor::from_slice(&lhs, (1, m, k), &device)?;
+        let expected = lhs_mtl
+            .reshape((m, k))?
+            .matmul(&w_deq.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let got = matmul
+            .forward(&lhs_mtl.to_dtype(candle_core::DType::BF16)?)?
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut sum_rel = 0f64;
+        let mut max_rel = 0f64;
+        for (e, g) in expected.iter().zip(got.iter()) {
+            let rel = ((e - g).abs() / e.abs().max(1.0)) as f64;
+            sum_rel += rel;
+            max_rel = max_rel.max(rel);
+        }
+        let mean_rel = sum_rel / expected.len() as f64;
+        eprintln!("q8_0 bf16 m={m} k={k} n={n}: mean_rel={mean_rel:.2e} max_rel={max_rel:.2e}");
+        assert!(
+            mean_rel < 4e-3,
+            "q8_0 m={m} k={k}: mean rel {mean_rel:.2e} beyond the bf16+q8 floor"
+        );
+    }
+    Ok(())
+}

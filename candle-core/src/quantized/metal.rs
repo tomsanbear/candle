@@ -652,6 +652,11 @@ impl QMetalStorage {
         if src_shape.dim(D::Minus2)? == 1 {
             return self.fwd_mv(self_shape, storage, layout);
         }
+        // Ternary Q1_0/Q2_0 have no tile-mm kernel; the mv kernel services m>1
+        // in one dispatch (each tgpig.y is a src1 row), so route prefill there.
+        if matches!(self.dtype, GgmlDType::Q1_0 | GgmlDType::Q2_0) {
+            return self.fwd_mv(self_shape, storage, layout);
+        }
         // Small-m matmuls (speculative-verify chunks, small batches) are
         // weight-read-bound; the tile mm kernel under-occupies the GPU there
         // while the multi-column mv variants stream the weights near-once.

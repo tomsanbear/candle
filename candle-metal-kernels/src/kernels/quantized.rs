@@ -1033,10 +1033,8 @@ pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
         GgmlDType::Q8_0 => Some(8),
         GgmlDType::Q4K => Some(8),
         GgmlDType::Q6K => Some(8),
-        // Small-m verify (block-size 4-5): the mc kernel (weight shared across
-        // columns) beats the tile mm, which under-occupies + pays a bf16->f32
-        // cast at m<8. The tile mm still serves large-m prefill (m>=8).
-        GgmlDType::Q2_0 => Some(8),
+        // Q2_0 small-m verify uses the dedicated BM=64/BN=8 smallm GEMM (mm
+        // path), not the compute-bound mc.
         _ => None,
     }
 }
@@ -1186,6 +1184,38 @@ pub fn call_quantized_matmul_mm_t(
     let ne1 = dst_shape[dst_shape.len() - 2] as i64;
     let r2 = (ne12 / ne02) as u32;
     let r3 = (ne13 / ne03) as u32;
+
+    // Small-m weight-bound Q2_0 GEMM (DSpark verify, 2<=m<=8): BM=64 weight rows
+    // per threadgroup, BN=8 (no padding waste). Needs a contiguous f32
+    // activation [m, k] (the fwd path casts bf16->f32) and a single batch.
+    if matches!(dtype, GgmlDType::Q2_0)
+        && (2..=8).contains(&(ne11 as usize))
+        && ne12 * ne13 == 1
+        && nb10 == 4
+        && nb11 == ne00 * 4
+    {
+        let pipeline =
+            kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mm_q2_0_smallm")?;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        set_params!(
+            encoder,
+            (
+                src0,
+                (src1, src1_offset),
+                Output::with_offset(dst, dst_offset),
+                ne00,
+                ne01,
+                ne1
+            )
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize { width: divide(ne01 as usize, 64), height: 1, depth: 1 },
+            MTLSize { width: 128, height: 1, depth: 1 },
+        );
+        return Ok(());
+    }
 
     let thread_groups_count = MTLSize {
         width: divide(ne11 as usize, 32),

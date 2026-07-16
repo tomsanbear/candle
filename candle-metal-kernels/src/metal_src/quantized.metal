@@ -3163,9 +3163,10 @@ template [[host_name("kernel_mul_mv_q2_0_bf16_bf16_mct")]] kernel mul_mv_q2_0_mc
 //         activation-block read serves NR rows -> fewer threadgroups re-read it).
 //   NC  = activation columns streamed per dispatch.
 //   NSG = simdgroups per threadgroup.
-//   VEC = 1 -> vectorized half4 activation loads (fewer, wider transactions).
-// Dispatch: width = n/(NR*NSG), height = m/NC, threads = NSG*32.
-template <typename YT, typename DT, int NR, int NC, int NSG, int VEC>
+// Dispatch: width = n/(NR*NSG), height = m/NC, threads = NSG*32. IDENTICAL
+// structure to _mc (inline activation address, early-break at the nc tail,
+// single acc per column) so mcx_2_8_2 reproduces _mc exactly.
+template <typename YT, typename DT, int NR, int NC, int NSG>
 kernel void kernel_mul_mv_q2_0_mcx_t(
         device const  void * src0,
         device const  char * src1,
@@ -3210,12 +3211,6 @@ kernel void kernel_mul_mv_q2_0_mcx_t(
     const short il = (tiisg%tpb)*SW;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/NB_Q2_0) {
-        // Per-column base pointers for this block (clamped for the tail).
-        device const YT * yc[NC];
-        for (int c = 0; c < NC; ++c) {
-            const int cc = c < nc ? c : 0;
-            yc[c] = y0 + cc*ne10 + ib*QK2_0 + il;
-        }
         for (int row = 0; row < NR; row++) {
             if (first_row + row >= ne01) break;
             device const block_q2_0 * qb = x + ib + row*nb;
@@ -3226,19 +3221,10 @@ kernel void kernel_mul_mv_q2_0_mcx_t(
                 cv[i] = (half)(int((qs[i/4] >> (2*(i%4))) & 3) - 1);
             }
             for (int c = 0; c < NC; ++c) {
+                if (c >= nc) break;
+                device const YT * yb = y0 + c*ne10 + ib*QK2_0 + il;
                 float acc = 0.f;
-                if (VEC) {
-                    device const YT * yb = yc[c];
-                    for (short i = 0; i < SW; i += 4) {
-                        acc += (float)cv[i]   * (float)yb[i]
-                             + (float)cv[i+1] * (float)yb[i+1]
-                             + (float)cv[i+2] * (float)yb[i+2]
-                             + (float)cv[i+3] * (float)yb[i+3];
-                    }
-                } else {
-                    device const YT * yb = yc[c];
-                    for (short i = 0; i < SW; ++i) acc += (float)cv[i] * (float)yb[i];
-                }
+                for (short i = 0; i < SW; ++i) acc += (float) cv[i] * (float) yb[i];
                 sumf[row][c] += d * acc;
             }
         }
@@ -3254,26 +3240,24 @@ kernel void kernel_mul_mv_q2_0_mcx_t(
     }
 }
 
-#define instantiate_mcx(nr, nc, nsg, vec)                                         \
-  typedef decltype(kernel_mul_mv_q2_0_mcx_t<bfloat, float, nr, nc, nsg, vec>)     \
-      mcx_##nr##_##nc##_##nsg##_##vec##_t;                                        \
-  template [[host_name("kernel_mul_mv_q2_0_bf16_mcx_" #nr "_" #nc "_" #nsg "_" #vec)]] \
-  kernel mcx_##nr##_##nc##_##nsg##_##vec##_t                                      \
-      kernel_mul_mv_q2_0_mcx_t<bfloat, float, nr, nc, nsg, vec>;
+#define instantiate_mcx(nr, nc, nsg)                                           \
+  typedef decltype(kernel_mul_mv_q2_0_mcx_t<bfloat, float, nr, nc, nsg>)        \
+      mcx_##nr##_##nc##_##nsg##_t;                                              \
+  template [[host_name("kernel_mul_mv_q2_0_bf16_mcx_" #nr "_" #nc "_" #nsg)]]   \
+  kernel mcx_##nr##_##nc##_##nsg##_t                                            \
+      kernel_mul_mv_q2_0_mcx_t<bfloat, float, nr, nc, nsg>;
 
-// NR sweep (amortization) at NC=8, NSG=2, scalar:
-instantiate_mcx(2, 8, 2, 0)
-instantiate_mcx(4, 8, 2, 0)
-instantiate_mcx(8, 8, 2, 0)
-// vectorized at each NR:
-instantiate_mcx(2, 8, 2, 1)
-instantiate_mcx(4, 8, 2, 1)
-instantiate_mcx(8, 8, 2, 1)
-// NC sweep at NR=4:
-instantiate_mcx(4, 4, 2, 0)
-instantiate_mcx(4, 16, 2, 0)
-// NSG=4 at NR=4:
-instantiate_mcx(4, 8, 4, 0)
+// NR sweep (amortize the activation re-read) at NC=8, NSG=2:
+instantiate_mcx(2, 8, 2)
+instantiate_mcx(4, 8, 2)
+instantiate_mcx(8, 8, 2)
+instantiate_mcx(16, 8, 2)
+// NC sweep at NR=8:
+instantiate_mcx(8, 4, 2)
+instantiate_mcx(8, 16, 2)
+// NSG=4:
+instantiate_mcx(4, 8, 4)
+instantiate_mcx(8, 8, 4)
 
 #define N_MV_T_T 4
 

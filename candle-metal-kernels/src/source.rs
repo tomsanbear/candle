@@ -25,6 +25,12 @@ pub const QUANTIZED_UNPK: &str = include_str!("metal_src/quantized_unpk.metal");
 /// needs the MetalPerformancePrimitives framework header, which the runtime
 /// compiler cannot see.
 pub const MM2D_Q4K_LIB: &[u8] = include_bytes!("metal_src/mm2d_q4k.metallib");
+/// Prebuilt Metal-4.1 metallib (see scripts/build_mm2d_q2_0.sh): the ternary
+/// Q2_0 matmul2d with a uint2b_format weight operand. Same framework-header
+/// constraint as MM2D_Q4K_LIB, plus it needs a 2-bit-capable toolchain to
+/// build; pipeline creation fails on GPUs/toolchains without 2-bit support and
+/// callers fall back by routing.
+pub const MM2D_Q2_0_LIB: &[u8] = include_bytes!("metal_src/mm2d_q2_0.metallib");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
@@ -52,4 +58,5 @@ pub enum Source {
     AttnPrep,
     QuantizedUnpk,
     Mm2dQ4k,
+    Mm2dQ2_0,
 }

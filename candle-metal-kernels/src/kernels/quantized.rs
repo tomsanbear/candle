@@ -621,6 +621,72 @@ pub fn call_quantized_matmul_mm2d_q4k(
     Ok(())
 }
 
+/// Tensor-op (matmul2d) Q2_0 (ternary) matmul for m in [1,8], the ternary
+/// mirror of [`call_quantized_matmul_mm2d_q4k`]: the packed 2-bit codes are the
+/// hardware uint2b_format weight operand and a single per-128 fp16 `d` plane
+/// folds `d*(P - rowsum)` in the epilogue (vs q4_K's dsc*P - dmm*rowsum). Plane
+/// layout: codes [k, n_pad] 2-bit + d [k/128, n_pad] fp16 (candle-core
+/// q2_0_mm2d_planes). One dispatch per linear; dst is bf16 [m, n]. Requires the
+/// Metal 4.1 toolchain (see mm2d_q2_0.metal); on unsupported toolchains
+/// pipeline creation fails and callers fall back by routing.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm2d_q2_0(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, n_pad, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    codes: &Buffer,
+    d: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    debug_assert!(m <= 8 && k % 128 == 0 && k <= 8192 && n_pad % 64 == 0);
+    // Mirror mm2d_q4k's tile routing: 64-wide/4-simdgroup default, 32-wide
+    // reachable via LMBRRR_MM2D_TILE=32 for in-loop study.
+    static TILE_OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let override_tile = *TILE_OVERRIDE.get_or_init(|| {
+        std::env::var("LMBRRR_MM2D_TILE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    let tile = override_tile.unwrap_or(64);
+    let (name, tg_threads) = if tile == 32 {
+        ("kernel_mul_mm2d_q2_0_bf16_t32", 32)
+    } else {
+        ("kernel_mul_mm2d_q2_0_bf16", 128)
+    };
+    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ2_0, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mm2d_q2_0 M={m} K={k} N={n} t{tile}");
+    let dims: [i32; 4] = [k as i32, n_pad as i32, n as i32, m as i32];
+    set_params!(
+        encoder,
+        (
+            (lhs, lhs_offset),
+            codes,
+            d,
+            Output::with_offset(dst, dst_offset),
+            &dims[..]
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: n_pad / tile,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: tg_threads,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Split-K variant of [`call_quantized_matmul_mm2d_q4k`] for small-N shapes:
 /// the K/32 slices are partitioned across `n_splits` threadgroup rows
 /// writing f32 partials into caller-provided scratch (`n_splits * 8 * n_pad`

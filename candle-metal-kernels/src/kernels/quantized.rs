@@ -1491,7 +1491,7 @@ pub fn call_quantized_matmul_mv_q2_0_mct(
         (
             weights,
             (act_t, act_offset),
-            dst,
+            Output::new(dst),
             ne00,
             ne01,
             1i64,
@@ -1556,7 +1556,7 @@ pub fn call_quantized_matmul_mv_q2_0_mcx(
         (
             weights,
             (act, act_offset),
-            dst,
+            Output::new(dst),
             ne00,
             ne01,
             1i64,

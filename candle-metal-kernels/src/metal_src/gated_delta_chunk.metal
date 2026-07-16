@@ -71,12 +71,17 @@ kernel void gated_delta_chunk_bf16(
     constant uint  &seq_len    [[buffer(20)]],
     constant float &l2_eps     [[buffer(21)]],
     constant float &norm_eps   [[buffer(22)]],
+    constant uint  &num_k_heads [[buffer(23)]],
     uint h          [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint row_stride = conv_dim + value_dim + 2 * heads;
     const uint l = seq_len;
+    // GQA: value head h reads its group's shared q/k channels (Bonsai: 48
+    // value heads over 16 k-heads). Sibling threadgroups redo the same q/k
+    // conv + write identical conv_out bytes for those channels — benign.
+    const uint kq = h / (heads / num_k_heads);
 
     threadgroup float k_sh[GDC_MAX_L * GDC_DIM];   // normed k, [t][dk]
     threadgroup float q_sh[GDC_MAX_L * GDC_DIM];   // normed+scaled q, [t][dk]
@@ -90,8 +95,8 @@ kernel void gated_delta_chunk_bf16(
     // ---- Phase 1: conv + silu across the chunk for this head's channels.
     // Window walks the ksz-1 retained inputs then the chunk's own inputs.
     const uint chans[3] = {
-        h * dk + tid,
-        key_dim + h * dk + tid,
+        kq * dk + tid,
+        key_dim + kq * dk + tid,
         2 * key_dim + h * dv + tid,
     };
     for (uint c = 0; c < 3; c++) {

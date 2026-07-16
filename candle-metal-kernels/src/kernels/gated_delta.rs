@@ -84,7 +84,8 @@ pub fn call_gated_delta_chunk(
             params.ksz,
             seq_len as u32,
             params.l2_eps,
-            params.norm_eps
+            params.norm_eps,
+            params.num_k_heads
         )
     );
 

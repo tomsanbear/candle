@@ -2681,7 +2681,7 @@ static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block 
 // tpb threads split one 128-code block; reuses the Q8_0 dispatch geometry.
 // tpb=8 keeps 4 blocks in flight per simdgroup (tpb=16 measured slower: too
 // few blocks in flight); yl is half to hold down registers.
-#define NB_Q2_0 4
+#define NB_Q2_0 8
 #define SW_Q2_0 (QK2_0 / NB_Q2_0)
 
 // With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).
@@ -2862,6 +2862,96 @@ kernel void kernel_mul_mv_q2_0_bf16_bf16(
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q2_0_impl_t<bfloat, bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
+#endif
+
+// Verify-width Q2_0 GEMV (DSpark spec verify, m in 2..=8): cache each weight
+// block in registers and stream NC src1 columns against it, so the (dominant)
+// weight read is shared across the whole draft chunk instead of re-read per
+// column. Mirrors kernel_mul_mv_q8_0_mc_t; activation re-read per row is
+// L1-cheap. Weight bandwidth ~ 1x regardless of m (vs m x for the base mv).
+#define NC_MV_Q2_0 8
+
+template <typename YT, typename DT = float>
+kernel void kernel_mul_mv_q2_0_mc_t(
+        device const  void * src0,
+        device const  char * src1,
+        device          DT * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int nr  = 2;
+    const int nsg = N_SIMDGROUP;
+    const short tpb = NB_Q2_0;
+    const short SW  = SW_Q2_0;
+
+    const int nb = ne00/QK2_0;
+    const int r0 = tgpig.x;
+    const int im = tgpig.z;
+    const int r1_base = tgpig.y * NC_MV_Q2_0;
+    const int nc = min((int)NC_MV_Q2_0, (int)(ne11 - r1_base));
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q2_0 * x  = (device const block_q2_0 *) src0 + offset0;
+    device const YT         * y0 = (device const YT         *) src1 + r1_base*ne10 + im*ne00*ne1;
+
+    float sumf[nr][NC_MV_Q2_0] = {{0.f}};
+    const short ix = tiisg/tpb;
+    const short il = (tiisg%tpb)*SW;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/NB_Q2_0) {
+        for (int row = 0; row < nr; row++) {
+            if (first_row + row >= ne01) break;
+            device const block_q2_0 * qb = x + ib + row*nb;
+            device const uint8_t    * qs = qb->qs + il/4;
+            uint8_t b[SW_Q2_0/4];
+            for (short i = 0; i < SW/4; ++i) b[i] = qs[i];
+            const float d = (float) qb->d;
+            for (int c = 0; c < NC_MV_Q2_0; ++c) {
+                if (c >= nc) break;
+                device const YT * yb = y0 + c*ne10 + ib*QK2_0 + il;
+                half yl[SW_Q2_0];
+                float sumy = 0.f;
+                for (short i = 0; i < SW; ++i) { yl[i] = (half) yb[i]; sumy += (float) yl[i]; }
+                sumf[row][c] += q2_0_dot_y<SW_Q2_0>(b, d, sumy, yl);
+            }
+        }
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        for (int c = 0; c < NC_MV_Q2_0; ++c) {
+            const float tot = simd_sum(sumf[row][c]);
+            if (tiisg == 0 && first_row + row < ne01 && c < nc) {
+                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_q2_0_mc_t<float>) mul_mv_q2_0_mc_t;
+template [[host_name("kernel_mul_mv_q2_0_f32_mc")]] kernel mul_mv_q2_0_mc_t kernel_mul_mv_q2_0_mc_t<float>;
+#if defined(__HAVE_BFLOAT__)
+template [[host_name("kernel_mul_mv_q2_0_bf16_mc")]] kernel mul_mv_q2_0_mc_t kernel_mul_mv_q2_0_mc_t<bfloat>;
+typedef decltype(kernel_mul_mv_q2_0_mc_t<bfloat, bfloat>) mul_mv_q2_0_mc_bf16dst_t;
+template [[host_name("kernel_mul_mv_q2_0_bf16_bf16_mc")]] kernel mul_mv_q2_0_mc_bf16dst_t kernel_mul_mv_q2_0_mc_t<bfloat, bfloat>;
 #endif
 
 #define N_MV_T_T 4

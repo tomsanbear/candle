@@ -1033,6 +1033,7 @@ pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
         GgmlDType::Q8_0 => Some(8),
         GgmlDType::Q4K => Some(8),
         GgmlDType::Q6K => Some(8),
+        GgmlDType::Q2_0 => Some(8),
         _ => None,
     }
 }
@@ -1081,10 +1082,13 @@ pub fn call_quantized_matmul_mv_mc(
 
     let (name, nth0, nth1, align) = match (dtype, src1_bf16) {
         (GgmlDType::Q8_0, true) if dst_bf16 => ("kernel_mul_mv_q8_0_bf16_bf16_mc", 8, 8, 8),
+        (GgmlDType::Q2_0, true) if dst_bf16 => ("kernel_mul_mv_q2_0_bf16_bf16_mc", 8, 8, 4),
         (GgmlDType::Q4K, true) if dst_bf16 => ("kernel_mul_mv_q4_K_bf16_bf16_mc", 4, 8, 4),
         (GgmlDType::Q6K, true) if dst_bf16 => ("kernel_mul_mv_q6_K_bf16_bf16_mc", 2, 32, 2),
         (GgmlDType::Q8_0, false) => ("kernel_mul_mv_q8_0_f32_mc", 8, 8, 8),
         (GgmlDType::Q8_0, true) => ("kernel_mul_mv_q8_0_bf16_mc", 8, 8, 8),
+        (GgmlDType::Q2_0, false) => ("kernel_mul_mv_q2_0_f32_mc", 8, 8, 4),
+        (GgmlDType::Q2_0, true) => ("kernel_mul_mv_q2_0_bf16_mc", 8, 8, 4),
         (GgmlDType::Q4K, false) => ("kernel_mul_mv_q4_K_f32_mc", 4, 8, 4),
         (GgmlDType::Q4K, true) => ("kernel_mul_mv_q4_K_bf16_mc", 4, 8, 4),
         (GgmlDType::Q6K, false) => ("kernel_mul_mv_q6_K_f32_mc", 2, 32, 2),

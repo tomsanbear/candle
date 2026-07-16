@@ -1028,6 +1028,51 @@ pub fn call_quantized_matmul_mv_q4k_bf16_rowtile(
 /// Column count handled per threadgroup by the multi-column mv kernels, or
 /// None when the dtype has no `_mc` variant. Must match the NC_MV_* defines in
 /// quantized.metal.
+/// Coalesced weight-bound Q2_0 verify GEMM (2<=m<=8) over a planar repack
+/// (`codes` [k][n_pad] 2-bit, `dscale` [k/128][n_pad]). Activation is f32
+/// contiguous [m, k]; dst is f32 [m, n].
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm2d_q2_0_smallm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, k, n_pad): (usize, usize, usize, usize),
+    codes: &Buffer,
+    dscale: &Buffer,
+    lhs: &Buffer,
+    lhs_offset: usize,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne1 = m as i64;
+    let npad = n_pad as i64;
+    let pipeline =
+        kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mm2d_q2_0_smallm")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            codes,
+            dscale,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne1,
+            npad
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize { width: divide(n_pad, 64), height: 1, depth: 1 },
+        MTLSize { width: 128, height: 1, depth: 1 },
+    );
+    Ok(())
+}
+
 pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
     match dtype {
         GgmlDType::Q8_0 => Some(8),

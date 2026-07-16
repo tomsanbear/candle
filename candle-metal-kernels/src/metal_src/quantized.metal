@@ -8766,6 +8766,81 @@ template [[host_name("kernel_mul_mm_iq1_m_f32")]]   kernel mat_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq4_nl_f32")]]  kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl>;
 template [[host_name("kernel_mul_mm_iq4_xs_f32")]]  kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
 
+// Coalesced weight-bound Q2_0 GEMM for DSpark verify (2 <= m <= 8) reading a
+// PLANAR repack (candle q2_0_mm2d_planes): codes [k][n_pad] 2-bit n-innermost,
+// d [k/128][n_pad]. Reading 64 rows for a fixed k is contiguous -> coalesced
+// (the [row][block] layout could not: 64 strided reads capped it at 21 GB/s).
+// BM=64 rows/threadgroup, BN=8 cols, BK=32. dst [m, n] row-major.
+[[host_name("kernel_mul_mm2d_q2_0_smallm")]]
+kernel void kernel_mul_mm2d_q2_0_smallm(
+        device const uchar * codes,
+        device const half  * dscale,
+        device const float * src1,
+        device       float * dst,
+        constant  int64_t  & ne00,   // k
+        constant  int64_t  & ne01,   // n
+        constant  int64_t  & ne1,    // m
+        constant  int64_t  & npad,
+        uint  tgpig [[threadgroup_position_in_grid]],
+        uint  tiitg [[thread_index_in_threadgroup]],
+        uint  sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int k = (int) ne00;
+    const int n = (int) ne01;
+    const int m = (int) ne1;
+    const int n_pad = (int) npad;
+    const int row0 = (int) tgpig * 64;
+    const int t = (int) tiitg;
+
+    threadgroup half  sw[32 * 64];
+    threadgroup float sx[8 * 32];
+    simdgroup_float8x8 mc0 = make_filled_simdgroup_matrix<float, 8>(0.f);
+    simdgroup_float8x8 mc1 = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        const int b = k0 / QK2_0;
+        {
+            const int seg = t / 4;       // k within the 32-wide tile
+            const int j   = t % 4;       // 16-row group
+            const int kidx = k0 + seg;
+            device const uchar * cp = codes + (kidx * n_pad + row0 + j*16) / 4;
+            for (int rr = 0; rr < 16; rr++) {
+                const int code = (cp[rr/4] >> (2*(rr%4))) & 3;
+                const half d = dscale[b * n_pad + row0 + j*16 + rr];
+                sw[seg*64 + j*16 + rr] = (half)(code - 1) * d;
+            }
+        }
+        for (int i = t; i < 256; i += 128) {
+            const int col = i / 32;
+            const int kk = i % 32;
+            sx[i] = (col < m) ? src1[col * k + k0 + kk] : 0.f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < 32; kk += 8) {
+            simdgroup_float8x8 A;
+            simdgroup_half8x8  B0, B1;
+            simdgroup_load(A, sx + kk, 32);
+            simdgroup_load(B0, sw + kk*64 + sgitg*16,     64);
+            simdgroup_load(B1, sw + kk*64 + sgitg*16 + 8, 64);
+            simdgroup_multiply_accumulate(mc0, A, B0, mc0);
+            simdgroup_multiply_accumulate(mc1, A, B1, mc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float st[8 * 64];
+    simdgroup_store(mc0, st + sgitg*16,     64);
+    simdgroup_store(mc1, st + sgitg*16 + 8, 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = t; i < 8 * 64; i += 128) {
+        const int col = i / 64;
+        const int row = i % 64;
+        if (col < m && row0 + row < n) {
+            dst[col * n + row0 + row] = st[i];
+        }
+    }
+}
+
 //
 // indirect matrix-matrix multiplication
 //

@@ -78,6 +78,47 @@ pub fn q4k_mm2d_planes(
     })
 }
 
+/// Planar repack of Q2_0 `[n, k]` weights for the coalesced small-m mm2d verify
+/// kernel: `codes` is `[k, n_pad]` 2-bit with n innermost (so reading all rows
+/// for a fixed k is contiguous → coalesced cross-row), `d` is `[k/128, n_pad]`
+/// fp16 per-block scales. `n_pad = ceil(n/64)*64` (padding rows are zero → inert
+/// outputs). Mirrors `q4k_mm2d_planes`.
+pub struct Q2_0Mm2dPlanes {
+    pub codes: Vec<u8>,
+    pub d: Vec<half::f16>,
+    pub n: usize,
+    pub n_pad: usize,
+    pub k: usize,
+}
+
+pub fn q2_0_mm2d_planes(
+    blocks: &[super::k_quants::BlockQ2_0],
+    n: usize,
+    k: usize,
+) -> Result<Q2_0Mm2dPlanes> {
+    const QK2_0: usize = 128;
+    let nb = k / QK2_0;
+    if k % QK2_0 != 0 || blocks.len() != n * nb {
+        crate::bail!("q2_0_mm2d_planes: bad shape n={n} k={k} blocks={}", blocks.len());
+    }
+    let n_pad = n.div_ceil(64) * 64;
+    let mut codes = vec![0u8; k * n_pad / 4];
+    let mut d = vec![half::f16::ZERO; nb * n_pad];
+    for row in 0..n {
+        for b in 0..nb {
+            let blk = &blocks[row * nb + b];
+            d[b * n_pad + row] = blk.d;
+            for c in 0..QK2_0 {
+                let code = (blk.qs[c / 4] >> (2 * (c % 4))) & 3;
+                let k_idx = b * QK2_0 + c;
+                let idx = k_idx * n_pad + row;
+                codes[idx / 4] |= code << (2 * (idx % 4));
+            }
+        }
+    }
+    Ok(Q2_0Mm2dPlanes { codes, d, n, n_pad, k })
+}
+
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,

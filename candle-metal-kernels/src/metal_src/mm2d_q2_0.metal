@@ -34,12 +34,18 @@
 using namespace metal;
 using namespace mpp;
 
-// Row-sum capacity: NJ = K/BK entries per activation row, 8 rows max. With the
-// smallest BK=32 and K<=8192 that is 256 (8KB threadgroup budget).
-#define MM2D_MAX_NJ 256
+// Row-sum threadgroup capacity is right-sized PER BK: NJ = K/BK <= 8192/BK
+// (the wrapper asserts K <= 8192), 8 activation rows. Sizing it 8*(8192/BK)
+// instead of a fixed 8*256 keeps the static threadgroup allocation small for
+// the large-BK variants (k128: 2 KB, not 8 KB) so it does not cap occupancy.
+// NOTE: no max_total_threads_per_threadgroup attribute — pinning it to 128 (=
+// NSIMD*32) let the compiler bloat registers per thread (maxTPT 128 vs q4_K's
+// 1024); the matmul2d scope already fixes the simdgroup count, and the host
+// dispatches exactly NSIMD*32 threads.
+#define MM2D_MAX_NJ(bk) (8192 / (bk))
 
 template <int TILE_N, int BK, int NSIMD, bool RELAXED>
-[[kernel, max_total_threads_per_threadgroup(NSIMD * 32)]]
+[[kernel]]
 void mm2d_q2_0(
     device const bfloat * a_p  [[ buffer(0) ]],
     device const uchar  * b_p  [[ buffer(1) ]],
@@ -66,7 +72,7 @@ void mm2d_q2_0(
   tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
 
   // Per-BK-slice row sums of A (for the -d*rowsum term), threadgroup memory.
-  threadgroup float rs_tg[8 * MM2D_MAX_NJ];
+  threadgroup float rs_tg[8 * MM2D_MAX_NJ(BK)];
   const int entries = Mreal * NJ;
   for (int e = int(tidx); e < entries; e += TG_THREADS) {
     const int m = e / NJ;

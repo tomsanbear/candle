@@ -2922,16 +2922,21 @@ kernel void kernel_mul_mv_q2_0_mc_t(
             if (first_row + row >= ne01) break;
             device const block_q2_0 * qb = x + ib + row*nb;
             device const uint8_t    * qs = qb->qs + il/4;
-            uint8_t b[SW_Q2_0/4];
-            for (short i = 0; i < SW/4; ++i) b[i] = qs[i];
             const float d = (float) qb->d;
+            // Unpack the 2-bit codes to signed weights (-1,0,1,2) ONCE, shared
+            // across all NC columns: at verify width the per-column dot is the
+            // bottleneck, so an unpack+FMA (16 madd/col) beats the select-form
+            // (32 cmov/col) re-decoding per column.
+            half cv[SW_Q2_0];
+            for (short i = 0; i < SW; ++i) {
+                cv[i] = (half)(int((qs[i/4] >> (2*(i%4))) & 3) - 1);
+            }
             for (int c = 0; c < NC_MV_Q2_0; ++c) {
                 if (c >= nc) break;
                 device const YT * yb = y0 + c*ne10 + ib*QK2_0 + il;
-                half yl[SW_Q2_0];
-                float sumy = 0.f;
-                for (short i = 0; i < SW; ++i) { yl[i] = (half) yb[i]; sumy += (float) yl[i]; }
-                sumf[row][c] += q2_0_dot_y<SW_Q2_0>(b, d, sumy, yl);
+                float acc = 0.f;
+                for (short i = 0; i < SW; ++i) acc += (float) cv[i] * (float) yb[i];
+                sumf[row][c] += d * acc;
             }
         }
     }

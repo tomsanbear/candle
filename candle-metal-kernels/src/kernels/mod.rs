@@ -38,7 +38,7 @@ pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm2d_q2_0,
-    call_quantized_matmul_mm2d_q2_0_smallm, call_quantized_matmul_mm2d_q4k,
+    call_quantized_matmul_mm2d_q2_0_smallm, call_quantized_matmul_mm2d_q4k, Mm2dQ2Variant,
     call_quantized_matmul_mm2d_q4k_argmax, call_quantized_matmul_mm2d_q4k_splitk,
     call_quantized_matmul_mm_t, call_quantized_matmul_mv_mc,
     call_quantized_matmul_mv_q4k_argmax, call_quantized_matmul_mv_q4k_bf16_geo,

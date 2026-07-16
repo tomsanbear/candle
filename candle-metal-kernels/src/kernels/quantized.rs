@@ -621,6 +621,60 @@ pub fn call_quantized_matmul_mm2d_q4k(
     Ok(())
 }
 
+/// A compile-time `mm2d_q2_0` kernel variant (see the `instantiate_mm2d_q2_0`
+/// list in mm2d_q2_0.metal). `tile_n` is the output-N tile (threadgroup count =
+/// n_pad / tile_n); `tg_threads` is `NSIMD * 32`.
+#[derive(Clone, Copy, Debug)]
+pub struct Mm2dQ2Variant {
+    pub kernel: &'static str,
+    pub tile_n: usize,
+    pub tg_threads: usize,
+}
+
+impl Mm2dQ2Variant {
+    pub const T64_K32: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t64_k32",
+        tile_n: 64,
+        tg_threads: 128,
+    };
+    pub const T64_K64: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t64_k64",
+        tile_n: 64,
+        tg_threads: 128,
+    };
+    pub const T64_K128: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t64_k128",
+        tile_n: 64,
+        tg_threads: 128,
+    };
+    pub const T64_K128_RELAXED: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t64_k128_relaxed",
+        tile_n: 64,
+        tg_threads: 128,
+    };
+    pub const T32_K128: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t32_k128",
+        tile_n: 32,
+        tg_threads: 32,
+    };
+    pub const T32_K128_RELAXED: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t32_k128_relaxed",
+        tile_n: 32,
+        tg_threads: 32,
+    };
+    /// Every variant, for benchmark sweeps.
+    pub const ALL: [Self; 6] = [
+        Self::T64_K32,
+        Self::T64_K64,
+        Self::T64_K128,
+        Self::T64_K128_RELAXED,
+        Self::T32_K128,
+        Self::T32_K128_RELAXED,
+    ];
+    /// Production default (the sweep winner).
+    pub const DEFAULT: Self = Self::T64_K128;
+}
+
 /// Tensor-op (matmul2d) Q2_0 (ternary) matmul for m in [1,8], the ternary
 /// mirror of [`call_quantized_matmul_mm2d_q4k`]: the packed 2-bit codes are the
 /// hardware uint2b_format weight operand and a single per-128 fp16 `d` plane
@@ -641,27 +695,14 @@ pub fn call_quantized_matmul_mm2d_q2_0(
     d: &Buffer,
     dst_offset: usize,
     dst: &Buffer,
+    variant: Mm2dQ2Variant,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m <= 8 && k % 128 == 0 && k <= 8192 && n_pad % 64 == 0);
-    // Mirror mm2d_q4k's tile routing: 64-wide/4-simdgroup default, 32-wide
-    // reachable via LMBRRR_MM2D_TILE=32 for in-loop study.
-    static TILE_OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let override_tile = *TILE_OVERRIDE.get_or_init(|| {
-        std::env::var("LMBRRR_MM2D_TILE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    });
-    let tile = override_tile.unwrap_or(64);
-    let (name, tg_threads) = if tile == 32 {
-        ("kernel_mul_mm2d_q2_0_bf16_t32", 32)
-    } else {
-        ("kernel_mul_mm2d_q2_0_bf16", 128)
-    };
-    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ2_0, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Mm2dQ2_0, variant.kernel)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "qmm_mm2d_q2_0 M={m} K={k} N={n} t{tile}");
+    debug_group!(encoder, "qmm_mm2d_q2_0 M={m} K={k} N={n} {}", variant.kernel);
     let dims: [i32; 4] = [k as i32, n_pad as i32, n as i32, m as i32];
     set_params!(
         encoder,
@@ -674,12 +715,12 @@ pub fn call_quantized_matmul_mm2d_q2_0(
         )
     );
     let thread_groups_count = MTLSize {
-        width: n_pad / tile,
+        width: n_pad / variant.tile_n,
         height: 1,
         depth: 1,
     };
     let threads_per_threadgroup = MTLSize {
-        width: tg_threads,
+        width: variant.tg_threads,
         height: 1,
         depth: 1,
     };

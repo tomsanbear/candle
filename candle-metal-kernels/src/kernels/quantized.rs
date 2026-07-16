@@ -1474,9 +1474,12 @@ pub fn call_quantized_matmul_mv_q2_0_mcx(
         height: divide(m, nc),
         depth: 1,
     };
+    // Match the mc's (8,8) threadgroup shape (NB_Q2_0=8 wide, 4*nsg tall =
+    // 32*nsg threads = nsg simdgroups). The 2D shape affects Metal's physical
+    // thread adjacency / memory scheduling even at identical thread count.
     let threads_per_threadgroup = MTLSize {
-        width: 32,
-        height: nsg,
+        width: 8,
+        height: 4 * nsg,
         depth: 1,
     };
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);

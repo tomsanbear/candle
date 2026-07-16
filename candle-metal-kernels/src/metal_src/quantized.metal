@@ -2679,7 +2679,9 @@ typedef struct {
 static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
 // tpb threads split one 128-code block; reuses the Q8_0 dispatch geometry.
-#define NB_Q2_0 8
+// tpb=16 (SW=8) halves the per-thread yl cache vs tpb=8 -> fewer registers ->
+// lifts the occupancy-manager cap (measured occupancy-limited, not ALU-bound).
+#define NB_Q2_0 16
 #define SW_Q2_0 (QK2_0 / NB_Q2_0)
 
 // With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).

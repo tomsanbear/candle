@@ -662,14 +662,22 @@ impl Mm2dQ2Variant {
         tile_n: 32,
         tg_threads: 32,
     };
+    /// Diagnostic probe (numerically WRONG): matmul structure without the fold
+    /// epilogue — isolates the scalar-fold instruction cost. See mm2d_q2_0.metal.
+    pub const PROBE_NOFOLD_T64_K128: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_probe_nofold_t64_k128",
+        tile_n: 64,
+        tg_threads: 128,
+    };
     /// Every variant, for benchmark sweeps.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::T64_K32,
         Self::T64_K64,
         Self::T64_K128,
         Self::T64_K128_RELAXED,
         Self::T32_K128,
         Self::T32_K128_RELAXED,
+        Self::PROBE_NOFOLD_T64_K128,
     ];
     /// Production default (the sweep winner).
     pub const DEFAULT: Self = Self::T64_K128;

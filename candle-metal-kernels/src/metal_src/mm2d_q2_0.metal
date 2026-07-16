@@ -132,3 +132,67 @@ instantiate_mm2d_q2_0(64, 128, 4, 0, t64_k128)
 instantiate_mm2d_q2_0(64, 128, 4, 1, t64_k128_relaxed)
 instantiate_mm2d_q2_0(32, 128, 1, 0, t32_k128)
 instantiate_mm2d_q2_0(32, 128, 1, 1, t32_k128_relaxed)
+
+// PROBE (numerically WRONG — bandwidth/instruction diagnosis only). Identical
+// matmul structure (NJ op.run calls over the same B), but the per-tile scalar
+// fold epilogue is stripped to `acc += p` — no d load, no rs_tg rowsum, no
+// in-loop get_multidimensional_index. If this is much faster than the real
+// kernel, the scalar fold IS the instruction-throughput bottleneck; if it is
+// the same, the matmul2d op itself is the wall. Same 5-buffer signature so the
+// existing wrapper can dispatch it. rel_err will be garbage by design.
+template <int TILE_N, int BK, int NSIMD>
+[[kernel]]
+void mm2d_q2_0_probe_nofold(
+    device const bfloat * a_p  [[ buffer(0) ]],
+    device const uchar  * b_p  [[ buffer(1) ]],
+    device const half   * d_p  [[ buffer(2) ]],
+    device bfloat       * c_p  [[ buffer(3) ]],
+    constant int4       & dims [[ buffer(4) ]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tidx [[thread_index_in_threadgroup]]) {
+  const int K = dims.x;
+  const int Npad = dims.y;
+  const int Nreal = dims.z;
+  const int Mreal = dims.w;
+  const int NJ = K / BK;
+  const int n0 = int(tgid.x) * TILE_N;
+  (void)d_p;
+  (void)tidx;
+  tensor<device bfloat, dextents<int, 2>, tensor_inline>
+      a((device bfloat *)a_p, dextents<int, 2>(K, Mreal));
+  tensor<device uint2b_format, dextents<int, 2>, tensor_inline>
+      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
+  constexpr auto desc =
+      tensor_ops::matmul2d_descriptor(8, TILE_N, BK, false, false, false);
+  tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
+  auto acc =
+      op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0.0f;
+  }
+  for (int j = 0; j < NJ; ++j) {
+    auto mA = a.slice(BK * j, 0);
+    auto mB = b.slice(n0, BK * j);
+    auto p =
+        op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+    op.run(mA, mB, p);
+    for (ushort i = 0; i < p.get_capacity(); ++i) {
+      acc[i] += p[i]; // no fold
+    }
+  }
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    auto mdi = acc.get_multidimensional_index(i);
+    const int n = n0 + mdi[0];
+    const int m = mdi[1];
+    if (n < Nreal && m < Mreal) {
+      c_p[m * Nreal + n] = bfloat(acc[i]);
+    }
+  }
+}
+
+#define instantiate_mm2d_q2_0_probe(tile_n, bk, nsimd, suffix)                \
+  template [[host_name("kernel_mul_mm2d_q2_0_probe_" #suffix)]] [[kernel]]     \
+  decltype(mm2d_q2_0_probe_nofold<tile_n, bk, nsimd>)                          \
+      mm2d_q2_0_probe_nofold<tile_n, bk, nsimd>;
+
+instantiate_mm2d_q2_0_probe(64, 128, 4, nofold_t64_k128)

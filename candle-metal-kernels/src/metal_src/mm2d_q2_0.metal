@@ -34,17 +34,17 @@
 using namespace metal;
 using namespace mpp;
 
-// Row-sum threadgroup capacity is right-sized PER BK: NJ = K/BK <= 8192/BK
-// (the wrapper asserts K <= 8192), 8 activation rows. Sizing it 8*(8192/BK)
-// instead of a fixed 8*256 keeps the static threadgroup allocation small for
-// the large-BK variants (k128: 2 KB, not 8 KB) so it does not cap occupancy.
+// Row-sum threadgroup capacity is right-sized PER (KMAX, BK): NJ = K/BK <=
+// KMAX/BK (the wrapper asserts K <= the variant's KMAX), 8 activation rows.
+// Sizing it per-variant instead of a fixed 8*256 keeps the static threadgroup
+// allocation small for the common shapes (k128/KMAX 8192: 2 KB) so it does not
+// cap occupancy; the KMAX=17408 instantiation (ffn_down) pays 4.35 KB.
 // NOTE: no max_total_threads_per_threadgroup attribute — pinning it to 128 (=
 // NSIMD*32) let the compiler bloat registers per thread (maxTPT 128 vs q4_K's
 // 1024); the matmul2d scope already fixes the simdgroup count, and the host
 // dispatches exactly NSIMD*32 threads.
-#define MM2D_MAX_NJ(bk) (8192 / (bk))
 
-template <int TILE_N, int BK, int NSIMD, bool RELAXED>
+template <int TILE_N, int BK, int NSIMD, bool RELAXED, int KMAX>
 [[kernel]]
 void mm2d_q2_0(
     device const bfloat * a_p  [[ buffer(0) ]],
@@ -72,7 +72,7 @@ void mm2d_q2_0(
   tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
 
   // Per-BK-slice row sums of A (for the -d*rowsum term), threadgroup memory.
-  threadgroup float rs_tg[8 * MM2D_MAX_NJ(BK)];
+  threadgroup float rs_tg[8 * (KMAX / BK)];
   const int entries = Mreal * NJ;
   for (int e = int(tidx); e < entries; e += TG_THREADS) {
     const int m = e / NJ;
@@ -121,17 +121,19 @@ void mm2d_q2_0(
 
 // Explicit instantiations (mlx decltype pattern; see gemv.metal). Host name
 // kernel_mul_mm2d_q2_0_<suffix>; the wrapper picks by suffix.
-#define instantiate_mm2d_q2_0(tile_n, bk, nsimd, relaxed, suffix)             \
+#define instantiate_mm2d_q2_0(tile_n, bk, nsimd, relaxed, kmax, suffix)       \
   template [[host_name("kernel_mul_mm2d_q2_0_" #suffix)]] [[kernel]]          \
-  decltype(mm2d_q2_0<tile_n, bk, nsimd, (bool)relaxed>)                       \
-      mm2d_q2_0<tile_n, bk, nsimd, (bool)relaxed>;
+  decltype(mm2d_q2_0<tile_n, bk, nsimd, (bool)relaxed, kmax>)                 \
+      mm2d_q2_0<tile_n, bk, nsimd, (bool)relaxed, kmax>;
 
-instantiate_mm2d_q2_0(64, 32, 4, 0, t64_k32)
-instantiate_mm2d_q2_0(64, 64, 4, 0, t64_k64)
-instantiate_mm2d_q2_0(64, 128, 4, 0, t64_k128)
-instantiate_mm2d_q2_0(64, 128, 4, 1, t64_k128_relaxed)
-instantiate_mm2d_q2_0(32, 128, 1, 0, t32_k128)
-instantiate_mm2d_q2_0(32, 128, 1, 1, t32_k128_relaxed)
+instantiate_mm2d_q2_0(64, 32, 4, 0, 8192, t64_k32)
+instantiate_mm2d_q2_0(64, 64, 4, 0, 8192, t64_k64)
+instantiate_mm2d_q2_0(64, 128, 4, 0, 8192, t64_k128)
+instantiate_mm2d_q2_0(64, 128, 4, 1, 8192, t64_k128_relaxed)
+instantiate_mm2d_q2_0(32, 128, 1, 0, 8192, t32_k128)
+instantiate_mm2d_q2_0(32, 128, 1, 1, 8192, t32_k128_relaxed)
+// Deep-K instantiation for ffn_down ([5120, 17408]): 4.35 KB rs_tg.
+instantiate_mm2d_q2_0(64, 128, 4, 0, 17408, t64_k128_k17408)
 
 // PROBE (numerically WRONG — bandwidth/instruction diagnosis only). Identical
 // matmul structure (NJ op.run calls over the same B), but the per-tile scalar
@@ -258,59 +260,7 @@ instantiate_mm2d_q2_0_probe_fullk(64, 32, 4, fullk_t64_m32)
 instantiate_mm2d_q2_0_probe_fullk(32, 8, 1, fullk_t32)
 instantiate_mm2d_q2_0_probe_fullk(128, 8, 8, fullk_t128)
 
-// PROBE (throughput only): INTEGER tensor path — int8 A × int2b_format B →
-// int32 accumulate, single op.run over full K. Tests whether the M3 tensor unit
-// runs integer MMA faster than the bfloat path (the original goal's "int8
-// activation" lever). A data here is a raw int8 buffer (garbage — timing only);
-// a real kernel would quantize activations per-row to int8 and dequantize
-// out = sA[m]·d[n]·P. Ternary as signed int2 needs no rowsum (the code IS the
-// value). Same 5-buffer signature; buffer 0 reinterpreted as int8.
-template <int TILE_N, int NSIMD>
-[[kernel]]
-void mm2d_q2_0_probe_int8(
-    device const char   * a_p  [[ buffer(0) ]],
-    device const uchar  * b_p  [[ buffer(1) ]],
-    device const half   * d_p  [[ buffer(2) ]],
-    device bfloat       * c_p  [[ buffer(3) ]],
-    constant int4       & dims [[ buffer(4) ]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  tidx [[thread_index_in_threadgroup]]) {
-  const int K = dims.x;
-  const int Npad = dims.y;
-  const int Nreal = dims.z;
-  const int Mreal = dims.w;
-  const int n0 = int(tgid.x) * TILE_N;
-  (void)K;
-  (void)d_p;
-  (void)tidx;
-  tensor<device char, dextents<int, 2>, tensor_inline>
-      a((device char *)a_p, dextents<int, 2>(K, Mreal));
-  tensor<device int2b_format, dextents<int, 2>, tensor_inline>
-      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
-  constexpr auto desc = tensor_ops::matmul2d_descriptor(
-      8, TILE_N, static_cast<int>(metal::dynamic_extent));
-  tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
-  auto acc =
-      op.template get_destination_cooperative_tensor<decltype(a), decltype(b), int>();
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    acc[i] = 0;
-  }
-  auto mA = a.slice(0, 0);
-  auto mB = b.slice(n0, 0);
-  op.run(mA, mB, acc);
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    auto mdi = acc.get_multidimensional_index(i);
-    const int n = n0 + mdi[0];
-    const int m = mdi[1];
-    if (n < Nreal && m < Mreal) {
-      c_p[m * Nreal + n] = bfloat(float(acc[i]));
-    }
-  }
-}
-
-#define instantiate_mm2d_q2_0_probe_int8(tile_n, nsimd, suffix)              \
-  template [[host_name("kernel_mul_mm2d_q2_0_probe_" #suffix)]] [[kernel]]    \
-  decltype(mm2d_q2_0_probe_int8<tile_n, nsimd>)                               \
-      mm2d_q2_0_probe_int8<tile_n, nsimd>;
-
-instantiate_mm2d_q2_0_probe_int8(64, 4, int8_t64)
+// (The int8/int2b integer-MMA probe that lived here never compiled — `char`
+// is not in the MPP operand whitelist — and its branch is refuted on M3
+// regardless: pre-M5 GPUs have no integer tensor datapath. See metal_notes
+// §15's refuted-branch record.)

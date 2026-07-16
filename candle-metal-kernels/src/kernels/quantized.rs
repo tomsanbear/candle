@@ -629,6 +629,9 @@ pub struct Mm2dQ2Variant {
     pub kernel: &'static str,
     pub tile_n: usize,
     pub tg_threads: usize,
+    /// The instantiation's KMAX (rs_tg threadgroup capacity); dispatching a
+    /// deeper K overruns the row-sum staging.
+    pub max_k: usize,
 }
 
 impl Mm2dQ2Variant {
@@ -636,31 +639,44 @@ impl Mm2dQ2Variant {
         kernel: "kernel_mul_mm2d_q2_0_t64_k32",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     pub const T64_K64: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_t64_k64",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     pub const T64_K128: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_t64_k128",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     pub const T64_K128_RELAXED: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_t64_k128_relaxed",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     pub const T32_K128: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_t32_k128",
         tile_n: 32,
         tg_threads: 32,
+        max_k: 8192,
     };
     pub const T32_K128_RELAXED: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_t32_k128_relaxed",
         tile_n: 32,
         tg_threads: 32,
+        max_k: 8192,
+    };
+    /// Deep-K instantiation (ffn_down [5120, 17408]): 4.35 KB rs_tg.
+    pub const T64_K128_K17408: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_t64_k128_k17408",
+        tile_n: 64,
+        tg_threads: 128,
+        max_k: 17408,
     };
     /// Diagnostic probe (numerically WRONG): matmul structure without the fold
     /// epilogue — isolates the scalar-fold instruction cost. See mm2d_q2_0.metal.
@@ -668,6 +684,7 @@ impl Mm2dQ2Variant {
         kernel: "kernel_mul_mm2d_q2_0_probe_nofold_t64_k128",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     /// Diagnostic probe (numerically WRONG): a single op.run over the full K
     /// (dynamic_extent), no host K-loop — separates the op's MMA throughput from
@@ -676,36 +693,42 @@ impl Mm2dQ2Variant {
         kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t64",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     /// M-tile sweep probes (does a bigger tile amortize the weight read for free?).
     pub const PROBE_FULLK_T64_M16: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t64_m16",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     pub const PROBE_FULLK_T64_M32: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t64_m32",
         tile_n: 64,
         tg_threads: 128,
+        max_k: 8192,
     };
     pub const PROBE_FULLK_T32: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t32",
         tile_n: 32,
         tg_threads: 32,
+        max_k: 8192,
     };
     pub const PROBE_FULLK_T128: Self = Self {
         kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t128",
         tile_n: 128,
         tg_threads: 256,
+        max_k: 8192,
     };
     /// Every variant, for benchmark sweeps.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::T64_K32,
         Self::T64_K64,
         Self::T64_K128,
         Self::T64_K128_RELAXED,
         Self::T32_K128,
         Self::T32_K128_RELAXED,
+        Self::T64_K128_K17408,
         Self::PROBE_NOFOLD_T64_K128,
         Self::PROBE_FULLK_T64,
         Self::PROBE_FULLK_T64_M16,
@@ -739,7 +762,7 @@ pub fn call_quantized_matmul_mm2d_q2_0(
     dst: &Buffer,
     variant: Mm2dQ2Variant,
 ) -> Result<(), MetalKernelError> {
-    debug_assert!(m <= 8 && k % 128 == 0 && k <= 8192 && n_pad % 64 == 0);
+    debug_assert!(m <= 8 && k % 128 == 0 && k <= variant.max_k && n_pad % 64 == 0);
     let pipeline = kernels.load_pipeline(device, Source::Mm2dQ2_0, variant.kernel)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();

@@ -1352,6 +1352,72 @@ pub fn call_quantized_matmul_mv_mc(
     Ok(())
 }
 
+/// Transposed-activation Q2_0 verify GEMV (mct): same geometry as the Q2_0 mc,
+/// but `act_t` is the activation TRANSPOSED to `[K][M]` (bf16), so the NC column
+/// reads are contiguous (the mc's L1-thrash fix). dst is f32 `[m, n]`
+/// (`dst[col*n + row]`). Diagnostic wrapper for the bench A/B.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q2_0_mct(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, k): (usize, usize, usize),
+    weights: &Buffer,
+    act_t: &Buffer,
+    act_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let (nc, nth0, nth1, align) = (8usize, 8usize, 8usize, 4usize);
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let pipeline =
+        kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q2_0_bf16_mct")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_mct M={m} K={k} N={n}");
+    set_params!(
+        encoder,
+        (
+            weights,
+            (act_t, act_offset),
+            dst,
+            ne00,
+            ne01,
+            1i64,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            1i64,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            1u32,
+            1u32
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(n, align),
+        height: divide(m, nc),
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// - src0 is usually weight
 /// - src1 is usually xs
 #[allow(clippy::too_many_arguments)]

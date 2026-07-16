@@ -3060,6 +3060,103 @@ typedef decltype(kernel_mul_mv_q2_0_mc2_t<bfloat, bfloat>) mul_mv_q2_0_mc2_bf16d
 template [[host_name("kernel_mul_mv_q2_0_bf16_bf16_mc2")]] kernel mul_mv_q2_0_mc2_bf16dst_t kernel_mul_mv_q2_0_mc2_t<bfloat, bfloat>;
 #endif
 
+// Verify-width Q2_0 GEMV, TRANSPOSED activation (mct). The mc reads its NC
+// columns as NC streams ne10 apart (measured: l1_eviction 1.42, occupancy
+// capped at 41% -> L1 thrash). Here src1 is the activation TRANSPOSED to [K][M]
+// (M = ne11, M-innermost), so the NC column values for a given k are CONTIGUOUS
+// (one coalesced read) instead of NC scattered streams. Weight + activation are
+// then two sequential streams -> should be weight-bandwidth-bound.
+template <typename YT, typename DT = float>
+kernel void kernel_mul_mv_q2_0_mct_t(
+        device const  void * src0,
+        device const  char * src1,
+        device          DT * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int nr  = 2;
+    const int nsg = N_SIMDGROUP;
+    const short tpb = NB_Q2_0;
+    const short SW  = SW_Q2_0;
+
+    const int nb = ne00/QK2_0;
+    const int r0 = tgpig.x;
+    const int im = tgpig.z;
+    const int M  = (int) ne11; // verify width (activation columns), M-innermost
+    const int r1_base = tgpig.y * NC_MV_Q2_0;
+    const int nc = min((int)NC_MV_Q2_0, (int)(ne11 - r1_base));
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q2_0 * x  = (device const block_q2_0 *) src0 + offset0;
+    // Transposed activation base [K][M]: element (k,col) at yT[k*M + col].
+    device const YT * yT = (device const YT *) src1 + (uint)im*ne00*M;
+
+    float sumf[nr][NC_MV_Q2_0] = {{0.f}};
+    const short ix = tiisg/tpb;
+    const short il = (tiisg%tpb)*SW;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/NB_Q2_0) {
+        for (int row = 0; row < nr; row++) {
+            if (first_row + row >= ne01) break;
+            device const block_q2_0 * qb = x + ib + row*nb;
+            device const uint8_t    * qs = qb->qs + il/4;
+            const float d = (float) qb->d;
+            half cv[SW_Q2_0];
+            for (short i = 0; i < SW; ++i) {
+                cv[i] = (half)(int((qs[i/4] >> (2*(i%4))) & 3) - 1);
+            }
+            float acc[NC_MV_Q2_0] = {0.f};
+            for (short i = 0; i < SW; ++i) {
+                const int kidx = ib*QK2_0 + il + i;
+                device const YT * yk = yT + (uint)kidx*M + r1_base; // contiguous over c
+                const float cvi = (float) cv[i];
+                for (int c = 0; c < NC_MV_Q2_0; ++c) {
+                    acc[c] += cvi * (float) yk[c];
+                }
+            }
+            for (int c = 0; c < NC_MV_Q2_0; ++c) {
+                sumf[row][c] += d * acc[c];
+            }
+        }
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        for (int c = 0; c < NC_MV_Q2_0; ++c) {
+            const float tot = simd_sum(sumf[row][c]);
+            if (tiisg == 0 && first_row + row < ne01 && c < nc) {
+                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_q2_0_mct_t<float>) mul_mv_q2_0_mct_t;
+template [[host_name("kernel_mul_mv_q2_0_f32_mct")]] kernel mul_mv_q2_0_mct_t kernel_mul_mv_q2_0_mct_t<float>;
+#if defined(__HAVE_BFLOAT__)
+template [[host_name("kernel_mul_mv_q2_0_bf16_mct")]] kernel mul_mv_q2_0_mct_t kernel_mul_mv_q2_0_mct_t<bfloat>;
+typedef decltype(kernel_mul_mv_q2_0_mct_t<bfloat, bfloat>) mul_mv_q2_0_mct_bf16dst_t;
+template [[host_name("kernel_mul_mv_q2_0_bf16_bf16_mct")]] kernel mul_mv_q2_0_mct_bf16dst_t kernel_mul_mv_q2_0_mct_t<bfloat, bfloat>;
+#endif
+
 #define N_MV_T_T 4
 
 template<typename T0, typename T04, typename T1, typename T14>

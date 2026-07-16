@@ -8802,11 +8802,15 @@ kernel void kernel_mul_mm2d_q2_0_smallm(
             const int seg = t / 4;       // k within the 32-wide tile
             const int j   = t % 4;       // 16-row group
             const int kidx = k0 + seg;
-            device const uchar * cp = codes + (kidx * n_pad + row0 + j*16) / 4;
-            for (int rr = 0; rr < 16; rr++) {
-                const int code = (cp[rr/4] >> (2*(rr%4))) & 3;
-                const half d = dscale[b * n_pad + row0 + j*16 + rr];
-                sw[seg*64 + j*16 + rr] = (half)(code - 1) * d;
+            // one 4-byte load = 16 rows' 2-bit codes; two half8 loads = 16 scales.
+            device const uint  * cp = (device const uint  *)(codes  + (kidx * n_pad + row0 + j*16) / 4);
+            device const half8 * dp = (device const half8 *)(dscale + b * n_pad + row0 + j*16);
+            const uint w4 = cp[0];
+            const half8 d0 = dp[0];
+            const half8 d1 = dp[1];
+            for (int rr = 0; rr < 8; rr++) {
+                sw[seg*64 + j*16 + rr]     = (half)(int((w4 >> (2*rr))       & 3) - 1) * d0[rr];
+                sw[seg*64 + j*16 + 8 + rr] = (half)(int((w4 >> (2*(rr+8))) & 3) - 1) * d1[rr];
             }
         }
         for (int i = t; i < 256; i += 128) {

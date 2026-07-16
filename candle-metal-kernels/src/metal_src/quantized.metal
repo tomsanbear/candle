@@ -8788,40 +8788,51 @@ kernel void kernel_mul_mm_q2_0_smallm(
     const int m = (int) ne1;
     const int nb = k / QK2_0;
     const int row0 = (int) tgpig * 8;
+    const int t = (int) tiisg;
 
-    threadgroup float sa[64]; // activation tile [col][kk]
-    threadgroup half  sb[64]; // weight tile transposed [kk][row]
+    // sw: dequantized weight for the current 128-block, laid out [kk][row] (the
+    // B tile, transposed). sx: activation [col][kk].
+    threadgroup half  sw[QK2_0 * 8];
+    threadgroup float sx[QK2_0 * 8];
 
     simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
     device const block_q2_0 * x = (device const block_q2_0 *) src0 + row0 * nb;
 
-    for (int k0 = 0; k0 < k; k0 += 8) {
-        for (int e = (int) tiisg; e < 64; e += 32) {
-            const int col = e >> 3;
-            const int kk  = e & 7;
-            sa[e] = (col < m) ? src1[col * k + k0 + kk] : 0.f;
-            const int kk2 = e >> 3;
-            const int row = e & 7;
-            const int gk = k0 + kk2;
-            device const block_q2_0 * b = x + row * nb + gk / QK2_0;
-            const int off = gk % QK2_0;
-            const int code = (b->qs[off/4] >> (2*(off%4))) & 3;
-            sb[e] = (half)(code - 1) * b->d;
+    for (int b = 0; b < nb; b++) {
+        // Coalesced weight load: for each of the 8 rows, the 32 threads read the
+        // 32 contiguous qs bytes (one burst) and dequantize 4 codes each.
+        for (int r = 0; r < 8; r++) {
+            device const block_q2_0 * blk = x + r*nb + b;
+            const uint8_t qbyte = blk->qs[t];
+            const half d = blk->d;
+            for (int cc = 0; cc < 4; cc++) {
+                const int code = (qbyte >> (2*cc)) & 3;
+                sw[(t*4 + cc)*8 + r] = (half)(code - 1) * d;
+            }
+        }
+        // Coalesced activation load: 4 elements/thread per column.
+        for (int col = 0; col < 8; col++) {
+            for (int q = 0; q < 4; q++) {
+                const int kk = q*32 + t;
+                sx[col*QK2_0 + kk] = (col < m) ? src1[col*k + b*QK2_0 + kk] : 0.f;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 A;
-        simdgroup_half8x8  B;
-        simdgroup_load(A, sa, 8);
-        simdgroup_load(B, sb, 8);
-        simdgroup_multiply_accumulate(acc, A, B, acc);
+        for (int kk = 0; kk < QK2_0; kk += 8) {
+            simdgroup_float8x8 A;
+            simdgroup_half8x8  B;
+            simdgroup_load(A, sx + kk, QK2_0);  // A[col][k8] = sx[col*128 + kk + k8]
+            simdgroup_load(B, sw + kk*8, 8);    // B[k8][row] = sw[(kk+k8)*8 + row]
+            simdgroup_multiply_accumulate(acc, A, B, acc);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     threadgroup float st[64];
     simdgroup_store(acc, st, 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int e = (int) tiisg; e < 64; e += 32) {
+    for (int e = t; e < 64; e += 32) {
         const int col = e >> 3;
         const int row = e & 7;
         if (col < m && row0 + row < n) {

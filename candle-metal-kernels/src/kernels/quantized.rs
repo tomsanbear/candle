@@ -1033,8 +1033,10 @@ pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
         GgmlDType::Q8_0 => Some(8),
         GgmlDType::Q4K => Some(8),
         GgmlDType::Q6K => Some(8),
-        // Q2_0's mc kernel is compute-bound (the ternary unpack), so m>1 uses
-        // the weight-bound tile mm instead — no mc route.
+        // Small-m verify (block-size 4-5): the mc kernel (weight shared across
+        // columns) beats the tile mm, which under-occupies + pays a bf16->f32
+        // cast at m<8. The tile mm still serves large-m prefill (m>=8).
+        GgmlDType::Q2_0 => Some(8),
         _ => None,
     }
 }

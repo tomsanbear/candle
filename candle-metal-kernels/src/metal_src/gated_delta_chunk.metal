@@ -78,10 +78,12 @@ kernel void gated_delta_chunk_bf16(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint row_stride = conv_dim + value_dim + 2 * heads;
     const uint l = seq_len;
-    // GQA: value head h reads its group's shared q/k channels (Bonsai: 48
-    // value heads over 16 k-heads). Sibling threadgroups redo the same q/k
-    // conv + write identical conv_out bytes for those channels — benign.
-    const uint kq = h / (heads / num_k_heads);
+    // GQA: value head h reads key/query head h % num_k_heads — the SAME map
+    // as the v2 decode kernel and the tensor path's cat-repeat
+    // (maybe_repeat_heads stacks whole copies, so head h's k/q live at
+    // h % num_k). Sibling threadgroups redo the shared q/k conv and write
+    // identical conv_out bytes for those channels — benign.
+    const uint kq = num_k_heads == heads ? h : h % num_k_heads;
 
     threadgroup float k_sh[GDC_MAX_L * GDC_DIM];   // normed k, [t][dk]
     threadgroup float q_sh[GDC_MAX_L * GDC_DIM];   // normed+scaled q, [t][dk]

@@ -3157,6 +3157,124 @@ typedef decltype(kernel_mul_mv_q2_0_mct_t<bfloat, bfloat>) mul_mv_q2_0_mct_bf16d
 template [[host_name("kernel_mul_mv_q2_0_bf16_bf16_mct")]] kernel mul_mv_q2_0_mct_bf16dst_t kernel_mul_mv_q2_0_mct_t<bfloat, bfloat>;
 #endif
 
+// Parameterized verify GEMV (mcx) for the knob sweep. Same weight-shared-columns
+// structure as _mc but templated on:
+//   NR  = weight rows per simdgroup (amortizes the activation re-read: each
+//         activation-block read serves NR rows -> fewer threadgroups re-read it).
+//   NC  = activation columns streamed per dispatch.
+//   NSG = simdgroups per threadgroup.
+//   VEC = 1 -> vectorized half4 activation loads (fewer, wider transactions).
+// Dispatch: width = n/(NR*NSG), height = m/NC, threads = NSG*32.
+template <typename YT, typename DT, int NR, int NC, int NSG, int VEC>
+kernel void kernel_mul_mv_q2_0_mcx_t(
+        device const  void * src0,
+        device const  char * src1,
+        device          DT * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short tpb = NB_Q2_0;
+    const short SW  = SW_Q2_0;
+
+    const int nb = ne00/QK2_0;
+    const int r0 = tgpig.x;
+    const int im = tgpig.z;
+    const int r1_base = tgpig.y * NC;
+    const int nc = min((int)NC, (int)(ne11 - r1_base));
+    const int first_row = (r0 * NSG + sgitg) * NR;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q2_0 * x  = (device const block_q2_0 *) src0 + offset0;
+    device const YT         * y0 = (device const YT         *) src1 + r1_base*ne10 + im*ne00*ne1;
+
+    float sumf[NR][NC] = {{0.f}};
+    const short ix = tiisg/tpb;
+    const short il = (tiisg%tpb)*SW;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/NB_Q2_0) {
+        // Per-column base pointers for this block (clamped for the tail).
+        device const YT * yc[NC];
+        for (int c = 0; c < NC; ++c) {
+            const int cc = c < nc ? c : 0;
+            yc[c] = y0 + cc*ne10 + ib*QK2_0 + il;
+        }
+        for (int row = 0; row < NR; row++) {
+            if (first_row + row >= ne01) break;
+            device const block_q2_0 * qb = x + ib + row*nb;
+            device const uint8_t    * qs = qb->qs + il/4;
+            const float d = (float) qb->d;
+            half cv[SW_Q2_0];
+            for (short i = 0; i < SW; ++i) {
+                cv[i] = (half)(int((qs[i/4] >> (2*(i%4))) & 3) - 1);
+            }
+            for (int c = 0; c < NC; ++c) {
+                float acc = 0.f;
+                if (VEC) {
+                    device const YT * yb = yc[c];
+                    for (short i = 0; i < SW; i += 4) {
+                        acc += (float)cv[i]   * (float)yb[i]
+                             + (float)cv[i+1] * (float)yb[i+1]
+                             + (float)cv[i+2] * (float)yb[i+2]
+                             + (float)cv[i+3] * (float)yb[i+3];
+                    }
+                } else {
+                    device const YT * yb = yc[c];
+                    for (short i = 0; i < SW; ++i) acc += (float)cv[i] * (float)yb[i];
+                }
+                sumf[row][c] += d * acc;
+            }
+        }
+    }
+
+    for (int row = 0; row < NR; ++row) {
+        for (int c = 0; c < NC; ++c) {
+            const float tot = simd_sum(sumf[row][c]);
+            if (tiisg == 0 && first_row + row < ne01 && c < nc) {
+                dst[(r1_base+c)*ne0 + im*ne0*ne1 + first_row + row] = static_cast<DT>(tot);
+            }
+        }
+    }
+}
+
+#define instantiate_mcx(nr, nc, nsg, vec)                                         \
+  typedef decltype(kernel_mul_mv_q2_0_mcx_t<bfloat, float, nr, nc, nsg, vec>)     \
+      mcx_##nr##_##nc##_##nsg##_##vec##_t;                                        \
+  template [[host_name("kernel_mul_mv_q2_0_bf16_mcx_" #nr "_" #nc "_" #nsg "_" #vec)]] \
+  kernel mcx_##nr##_##nc##_##nsg##_##vec##_t                                      \
+      kernel_mul_mv_q2_0_mcx_t<bfloat, float, nr, nc, nsg, vec>;
+
+// NR sweep (amortization) at NC=8, NSG=2, scalar:
+instantiate_mcx(2, 8, 2, 0)
+instantiate_mcx(4, 8, 2, 0)
+instantiate_mcx(8, 8, 2, 0)
+// vectorized at each NR:
+instantiate_mcx(2, 8, 2, 1)
+instantiate_mcx(4, 8, 2, 1)
+instantiate_mcx(8, 8, 2, 1)
+// NC sweep at NR=4:
+instantiate_mcx(4, 4, 2, 0)
+instantiate_mcx(4, 16, 2, 0)
+// NSG=4 at NR=4:
+instantiate_mcx(4, 8, 4, 0)
+
 #define N_MV_T_T 4
 
 template<typename T0, typename T04, typename T1, typename T14>

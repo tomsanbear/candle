@@ -1418,6 +1418,71 @@ pub fn call_quantized_matmul_mv_q2_0_mct(
     Ok(())
 }
 
+/// Parameterized verify GEMV (mcx) dispatch for the knob sweep. `act` is the
+/// NON-transposed activation `[M][K]` bf16 (mc layout). `(nr, nc, nsg)` must
+/// match the kernel's template params. dst f32 `[m, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q2_0_mcx(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    (nr, nc, nsg): (usize, usize, usize),
+    (m, n, k): (usize, usize, usize),
+    weights: &Buffer,
+    act: &Buffer,
+    act_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv_mcx {name} M={m} K={k} N={n}");
+    set_params!(
+        encoder,
+        (
+            weights,
+            (act, act_offset),
+            dst,
+            ne00,
+            ne01,
+            1i64,
+            0i64,
+            0i64,
+            0i64,
+            ne10,
+            ne11,
+            1i64,
+            0i64,
+            0i64,
+            0i64,
+            ne0,
+            ne1,
+            1u32,
+            1u32
+        )
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(n, nr * nsg),
+        height: divide(m, nc),
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 32,
+        height: nsg,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// - src0 is usually weight
 /// - src1 is usually xs
 #[allow(clippy::too_many_arguments)]

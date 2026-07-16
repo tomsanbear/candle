@@ -306,6 +306,71 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+/// Q2_0 int8-activation GEMV (m=1 decode): pre-quantize the bf16 activation to
+/// int8 + per-128 scales in one dispatch, then an integer-dot GEMV. Approximate
+/// (int8 activation), F32 dst. Scratch buffers are allocated per call.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q2_0_i8(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (n, k): (usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    qa: &Buffer,
+    scales: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let nblk = k / 128;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+
+    let qpipe = kernels.load_pipeline(device, Source::Quantized, "kernel_quantize_act_i8_bf16")?;
+    encoder.set_compute_pipeline_state(&qpipe);
+    debug_group!(encoder, "q2_0_i8 quantize K={k}");
+    let ki = k as i32;
+    set_params!(
+        encoder,
+        ((lhs, lhs_offset), Output::new(qa), Output::new(scales), ki)
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize { width: nblk, height: 1, depth: 1 },
+        MTLSize { width: 128, height: 1, depth: 1 },
+    );
+
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = 1i64;
+    let ne10 = k as i64;
+    let ne11 = 1i64;
+    let ne12 = 1i64;
+    let ne0 = n as i64;
+    let ne1 = 1i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+    let gpipe = kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q2_0_i8_f32")?;
+    encoder.set_compute_pipeline_state(&gpipe);
+    debug_group!(encoder, "q2_0_i8 mv N={n} K={k}");
+    set_params!(
+        encoder,
+        (
+            rhs,
+            qa,
+            scales,
+            Output::with_offset(dst, dst_offset),
+            ne00, ne01, ne02, ne10, ne11, ne12, ne0, ne1, r2, r3
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize { width: divide(n, 4), height: 1, depth: 1 },
+        MTLSize { width: 8, height: 8, depth: 1 },
+    );
+    Ok(())
+}
+
 /// V1 experiment (q4k-mv-rewrite-round2): q4_K bf16-in/bf16-out mv with `nsg`
 /// simdgroups per threadgroup. Same per-row arithmetic as the nsg=1 kernel
 /// (bit-identical results); the threadgroup count shrinks nsg-fold, which

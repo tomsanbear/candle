@@ -446,12 +446,25 @@ impl QMetalStorage {
             }
             dt => crate::bail!("unsupported src1 dtype {dt:?} for quantized matmul metal"),
         };
+        // Q2_0 int8-activation GEMV (opt-in A/B): pre-quantize the bf16
+        // activation to int8 + per-128 scales, then an integer-dot GEMV whose
+        // int8 registers relieve the occupancy limiter the half-yl kernel hits.
+        // Approximate (int8 activation) + F32 dst, so it's off by default.
+        static Q2_I8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let q2_i8 = *Q2_I8
+            .get_or_init(|| std::env::var("LMBRRR_Q2_I8").map_or(false, |v| v == "1"));
+        let q2_i8_route = q2_i8
+            && matches!(self.dtype, crate::quantized::GgmlDType::Q2_0)
+            && m == 1
+            && src1_bf16
+            && k % 128 == 0;
         // BF16 activations get a BF16 dst where the kernel variant exists:
         // the kernels accumulate in F32 and convert at the store, so this is
         // bit-identical to the F32 dst + the cast_f32_bf16 dispatch callers
         // in a BF16 pipeline would otherwise pay per matmul. F32 activations
         // (and the per-batch dense-ggml loop below) keep the F32 dst.
         let dst_bf16 = src1_bf16
+            && !q2_i8_route
             && (mc_supported || single_dispatch)
             && candle_metal_kernels::quantized_matmul_mv_bf16_dst_supported(self.dtype.into());
         let dst_dtype = if dst_bf16 { DType::BF16 } else { DType::F32 };
@@ -477,7 +490,32 @@ impl QMetalStorage {
             && src1_bf16
             && dst_bf16
             && k % 256 == 0;
-        if wide_supported {
+        if q2_i8_route {
+            let qa = device
+                .new_buffer_builder()
+                .with_size_for(k, DType::U8)
+                .with_label("q2i8_act")
+                .build()?;
+            let scales = device
+                .new_buffer_builder()
+                .with_size_for(k / 128, DType::F16)
+                .with_label("q2i8_scales")
+                .build()?;
+            candle_metal_kernels::call_quantized_matmul_mv_q2_0_i8(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (n, k),
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                &self.buffer,
+                &qa,
+                &scales,
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else if wide_supported {
             candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16_wide(
                 device.device(),
                 &encoder,

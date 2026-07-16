@@ -2684,20 +2684,19 @@ static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block 
 #define NB_Q2_0 8
 #define SW_Q2_0 (QK2_0 / NB_Q2_0)
 
-// int8-activation integer dot: yl is int8 (per-slice scaled), so the code x
-// activation products accumulate as integers (fast on Apple GPUs) and yl uses
-// a quarter of float's registers -> higher occupancy (measured occupancy-bound
-// by register pressure). Returns sum(code * yl_i8); caller scales by d*s and
-// subtracts sum(yl_i8). code = lo + 2*hi via the select-form conditional add.
+// With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).
+// select-form beats unpack+FMA here (measured): the conditional-move on the
+// pre-loaded activation avoids the int->float convert. yl is half (16-bit) to
+// cut register pressure and lift occupancy (Apple GPUs favour 16-bit).
 template<short SW>
-static inline int q2_0_dot_y(thread const uint8_t * b, thread const char * yl) {
-    int acc_lo = 0;
-    int acc_hi = 0;
+static inline float q2_0_dot_y(thread const uint8_t * b, const float d, const float sumy, thread const half * yl) {
+    float acc_lo = 0.0f;
+    float acc_hi = 0.0f;
     for (short i = 0; i < SW; i++) {
-        acc_lo += select(0, int(yl[i]), bool(b[i/4] & (1u << (2*(i%4) + 0))));
-        acc_hi += select(0, int(yl[i]), bool(b[i/4] & (1u << (2*(i%4) + 1))));
+        acc_lo += select(0.0f, float(yl[i]), bool(b[i/4] & (1u << (2*(i%4) + 0))));
+        acc_hi += select(0.0f, float(yl[i]), bool(b[i/4] & (1u << (2*(i%4) + 1))));
     }
-    return acc_lo + 2*acc_hi;
+    return d * (acc_lo + 2.0f*acc_hi - sumy);
 }
 
 // F32 accumulation; DT only changes the final store (see q8_0_impl_t).
@@ -2742,7 +2741,7 @@ void kernel_mul_mv_q2_0_impl_t(
     device const block_q2_0 * x = (device const block_q2_0 *) src0 + offset0;
     device const YT         * y = (device const YT         *) src1 + r1*ne10 + im*ne00*ne1;
 
-    char yl[SW_Q2_0];             // int8 activation cache: 1/4 of float's registers
+    half yl[SW_Q2_0];             // 16-bit activation cache: half the registers
     float sumf[nr] = {0.f};
 
     const short ix = tiisg/tpb;
@@ -2751,19 +2750,10 @@ void kernel_mul_mv_q2_0_impl_t(
     device const YT * yb = y + ix*QK2_0 + il;
 
     for (int ib = ix; ib < nb; ib += nw/NB_Q2_0) {
-        // Per-slice int8 quantization. Two passes over yb (L1-resident after the
-        // first) instead of a float scratch array, to keep the register win.
-        float amax = 0.0f;
+        float sumy = 0.f;
         for (short i = 0; i < SW; ++i) {
-            amax = fmax(amax, fabs((float) yb[i]));
-        }
-        const float s = amax * (1.0f / 127.0f);
-        const float inv = amax > 0.0f ? (127.0f / amax) : 0.0f;
-        int sumy_i8 = 0;
-        for (short i = 0; i < SW; ++i) {
-            int q = clamp(int(rint((float) yb[i] * inv)), -127, 127);
-            yl[i] = (char) q;
-            sumy_i8 += q;
+            yl[i] = (half) yb[i];
+            sumy += (float) yl[i];
         }
 
         for (int row = 0; row < nr; row++) {
@@ -2775,8 +2765,7 @@ void kernel_mul_mv_q2_0_impl_t(
             for (short i = 0; i < SW/4; ++i) {
                 b[i] = qs[i];
             }
-            // dot = d*s*(sum(code*yl_i8) - sum(yl_i8)) = d*sum((code-1)*y).
-            sumf[row] += (float) qb->d * s * float(q2_0_dot_y<SW_Q2_0>(b, yl) - sumy_i8);
+            sumf[row] += q2_0_dot_y<SW_Q2_0>(b, (float) qb->d, sumy, yl);
         }
 
         yb += QK2_0 * (nw/NB_Q2_0);

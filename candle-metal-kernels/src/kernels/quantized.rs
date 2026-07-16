@@ -793,6 +793,89 @@ pub fn call_quantized_matmul_mm2d_q2_0(
     Ok(())
 }
 
+/// Split-K variant of [`call_quantized_matmul_mm2d_q2_0`] for small-N shapes
+/// (o_proj/ffn_down: Npad/64 threadgroups under-occupy on a serial K loop).
+/// The K/128 slices are partitioned across `n_splits` threadgroup rows writing
+/// f32 partials into caller-provided scratch (`n_splits * 8 * n_pad` f32),
+/// reduced by a second dispatch into the bf16 dst. Exact — the ternary fold is
+/// linear over slices. `n_splits` must not exceed k/128.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm2d_q2_0_splitk(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, n_pad, k, n_splits): (usize, usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    codes: &Buffer,
+    d: &Buffer,
+    partials: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    debug_assert!(m <= 8 && k % 128 == 0 && k <= 17408 && n_pad % 64 == 0);
+    debug_assert!(n_splits >= 1 && n_splits <= k / 128);
+    let dims: [i32; 4] = [k as i32, n_pad as i32, n as i32, m as i32];
+    let ns = n_splits as i32;
+
+    let pipeline =
+        kernels.load_pipeline(device, Source::Mm2dQ2_0, "kernel_mul_mm2d_q2_0_splitk_t64_k128")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mm2d_q2_splitk M={m} K={k} N={n} S={n_splits}");
+    set_params!(
+        encoder,
+        (
+            (lhs, lhs_offset),
+            codes,
+            d,
+            Output::with_offset(partials, 0),
+            &dims[..],
+            ns
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: n_pad / 64,
+            height: n_splits,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    let reduce =
+        kernels.load_pipeline(device, Source::Mm2dQ2_0, "kernel_mm2d_q2_0_splitk_reduce")?;
+    encoder.set_compute_pipeline_state(&reduce);
+    debug_group!(encoder, "qmm_mm2d_q2_splitk_reduce N={n} M={m}");
+    set_params!(
+        encoder,
+        (
+            partials,
+            Output::with_offset(dst, dst_offset),
+            &dims[..],
+            ns
+        )
+    );
+    encoder.dispatch_threads(
+        MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        },
+        MTLSize {
+            width: 64.min(n),
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Split-K variant of [`call_quantized_matmul_mm2d_q4k`] for small-N shapes:
 /// the K/32 slices are partitioned across `n_splits` threadgroup rows
 /// writing f32 partials into caller-provided scratch (`n_splits * 8 * n_pad`

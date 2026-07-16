@@ -135,6 +135,120 @@ instantiate_mm2d_q2_0(32, 128, 1, 1, 8192, t32_k128_relaxed)
 // Deep-K instantiation for ffn_down ([5120, 17408]): 4.35 KB rs_tg.
 instantiate_mm2d_q2_0(64, 128, 4, 0, 17408, t64_k128_k17408)
 
+// Split-K pair for small-N shapes (o_proj/ffn_down: Npad/64 = 80 threadgroups
+// under-occupy the GPU on a serial K loop — bench-shapes measured 30-34 GB/s
+// vs 43 on well-fed shapes). Grid dim y partitions the K/BK slices across
+// nsplit groups writing f32 partials; the ternary fold d*(P - rowsum) is
+// linear over slices, so partial sums are exact. Mirrors the q4_K split-K
+// (its in-loop win: verify 13.36 -> 10.98 ms/round on that model).
+// Partial layout: part[(ks*8 + m) * Npad + n]; rows m >= Mreal never written.
+template <int TILE_N, int BK, int NSIMD, int KMAX>
+[[kernel]]
+void mm2d_q2_0_splitk(
+    device const bfloat * a_p    [[ buffer(0) ]],
+    device const uchar  * b_p    [[ buffer(1) ]],
+    device const half   * d_p    [[ buffer(2) ]],
+    device float        * part_p [[ buffer(3) ]],
+    constant int4       & dims   [[ buffer(4) ]],
+    constant int        & nsplit [[ buffer(5) ]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tidx [[thread_index_in_threadgroup]]) {
+  const int K = dims.x;
+  const int Npad = dims.y;
+  const int Mreal = dims.w;
+  const int NJ = K / BK;
+  constexpr int TG_THREADS = NSIMD * 32;
+  const int n0 = int(tgid.x) * TILE_N;
+  const int ks = int(tgid.y);
+  const int j0 = (NJ * ks) / nsplit;
+  const int j1 = (NJ * (ks + 1)) / nsplit;
+  const int span = j1 - j0;
+
+  tensor<device bfloat, dextents<int, 2>, tensor_inline>
+      a((device bfloat *)a_p, dextents<int, 2>(K, Mreal));
+  tensor<device uint2b_format, dextents<int, 2>, tensor_inline>
+      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
+
+  constexpr auto desc =
+      tensor_ops::matmul2d_descriptor(8, TILE_N, BK, false, false, false);
+  tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
+
+  // Row sums only for this group's K span (rs_tg[m * span + (j - j0)]).
+  threadgroup float rs_tg[8 * (KMAX / BK)];
+  const int entries = Mreal * span;
+  for (int e = int(tidx); e < entries; e += TG_THREADS) {
+    const int m = e / span;
+    const int j = j0 + e % span;
+    device const bfloat * row = a_p + m * K + BK * j;
+    float s = 0.0f;
+    for (int i = 0; i < BK; ++i) {
+      s += float(row[i]);
+    }
+    rs_tg[e] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  auto acc =
+      op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0.0f;
+  }
+
+  for (int j = j0; j < j1; ++j) {
+    auto mA = a.slice(BK * j, 0);
+    auto mB = b.slice(n0, BK * j);
+    auto p =
+        op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+    op.run(mA, mB, p);
+    const int blk = (j * BK) >> 7;
+    for (ushort i = 0; i < p.get_capacity(); ++i) {
+      auto mdi = p.get_multidimensional_index(i);
+      const int n = n0 + mdi[0];
+      const int m = mdi[1];
+      const float dd = float(d_p[blk * Npad + n]);
+      const float r = m < Mreal ? rs_tg[m * span + (j - j0)] : 0.0f;
+      acc[i] = fma(dd, p[i], fma(-dd, r, acc[i]));
+    }
+  }
+
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    auto mdi = acc.get_multidimensional_index(i);
+    const int n = n0 + mdi[0];
+    const int m = mdi[1];
+    if (m < Mreal) {
+      part_p[(ks * 8 + m) * Npad + n] = acc[i];
+    }
+  }
+}
+
+#define instantiate_mm2d_q2_0_splitk(tile_n, bk, nsimd, kmax, suffix)         \
+  template [[host_name("kernel_mul_mm2d_q2_0_splitk_" #suffix)]] [[kernel]]   \
+  decltype(mm2d_q2_0_splitk<tile_n, bk, nsimd, kmax>)                         \
+      mm2d_q2_0_splitk<tile_n, bk, nsimd, kmax>;
+
+// One instantiation covers every small-N shape (k up to 17408).
+instantiate_mm2d_q2_0_splitk(64, 128, 4, 17408, t64_k128)
+
+kernel void kernel_mm2d_q2_0_splitk_reduce(
+    device const float * part_p [[ buffer(0) ]],
+    device bfloat      * c_p    [[ buffer(1) ]],
+    constant int4      & dims   [[ buffer(2) ]],
+    constant int       & nsplit [[ buffer(3) ]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const int Npad = dims.y;
+  const int Nreal = dims.z;
+  const int n = int(tid.x);
+  const int m = int(tid.y);
+  if (n >= Nreal) {
+    return;
+  }
+  float s = 0.0f;
+  for (int ks = 0; ks < nsplit; ++ks) {
+    s += part_p[(ks * 8 + m) * Npad + n];
+  }
+  c_p[m * Nreal + n] = bfloat(s);
+}
+
 // PROBE (numerically WRONG — bandwidth/instruction diagnosis only). Identical
 // matmul structure (NJ op.run calls over the same B), but the per-tile scalar
 // fold epilogue is stripped to `acc += p` — no d load, no rs_tg rowsum, no

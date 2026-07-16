@@ -91,6 +91,7 @@ kernel void gated_delta_v2_prep_bf16(
     constant uint  &ksz        [[buffer(19)]],
     constant uint  &seq_len    [[buffer(20)]],
     constant float &l2_eps     [[buffer(21)]],
+    constant uint  &num_k_heads [[buffer(22)]],
     uint bh         [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -112,9 +113,13 @@ kernel void gated_delta_v2_prep_bf16(
 
     // Conv + silu for this thread's q, k and v channels across the chunk;
     // window semantics identical to v1 (state holds the last ksz inputs).
+    // GQA: q/k channels come from the group's shared k-head (h % num_k),
+    // matching the decode kernel and the tensor path's cat-repeat; sibling
+    // heads redo the shared conv and write identical conv_out bytes.
+    const uint kq = num_k_heads == heads ? h : h % num_k_heads;
     const uint chans[3] = {
-        h * dk + tid,
-        key_dim + h * dk + tid,
+        kq * dk + tid,
+        key_dim + kq * dk + tid,
         2 * key_dim + h * dv + tid,
     };
     for (uint c = 0; c < 3; c++) {
@@ -442,6 +447,7 @@ kernel void gated_delta_v2_prep_tree_bf16(
     constant uint  &alt_len      [[buffer(21)]],
     constant uint  &branch_after [[buffer(22)]],
     constant float &l2_eps       [[buffer(23)]],
+    constant uint  &num_k_heads  [[buffer(24)]],
     uint h          [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -455,9 +461,11 @@ kernel void gated_delta_v2_prep_tree_bf16(
     threadgroup float scratch[4];
     const uint n_simd_groups = dk / 32;
 
+    // GQA: same h % num_k_heads map as prep_bf16.
+    const uint kq = num_k_heads == heads ? h : h % num_k_heads;
     const uint chans[3] = {
-        h * dk + tid,
-        key_dim + h * dk + tid,
+        kq * dk + tid,
+        key_dim + kq * dk + tid,
         2 * key_dim + h * dv + tid,
     };
     for (uint c = 0; c < 3; c++) {

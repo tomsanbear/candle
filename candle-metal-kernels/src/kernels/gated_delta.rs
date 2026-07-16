@@ -269,7 +269,8 @@ pub fn call_gated_delta_v2(
             params.value_dim,
             params.ksz,
             l,
-            params.l2_eps
+            params.l2_eps,
+            params.num_k_heads
         )
     );
     encoder.dispatch_thread_groups(
@@ -548,7 +549,8 @@ pub fn call_gated_delta_v2_tree(
             seg1 as u32,
             alt_len as u32,
             branch_after as u32,
-            params.l2_eps
+            params.l2_eps,
+            params.num_k_heads
         )
     );
     encoder.dispatch_thread_groups(

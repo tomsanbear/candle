@@ -2681,7 +2681,7 @@ static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block 
 // tpb threads split one 128-code block; reuses the Q8_0 dispatch geometry.
 // tpb=8 keeps 4 blocks in flight per simdgroup (tpb=16 measured slower: too
 // few blocks in flight); yl is half to hold down registers.
-#define NB_Q2_0 8
+#define NB_Q2_0 4
 #define SW_Q2_0 (QK2_0 / NB_Q2_0)
 
 // With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).

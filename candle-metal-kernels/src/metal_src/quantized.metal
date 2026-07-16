@@ -2682,16 +2682,18 @@ static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block 
 #define NB_Q2_0 8
 #define SW_Q2_0 (QK2_0 / NB_Q2_0)
 
-// With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).
+// weight = (code - 1)*d, so sum((c-1)*d*y) = d*(sum(c*y) - sumy). Unpack each
+// 2-bit code to a float and FMA — fewer ALU ops than the select-form's two
+// conditional adds/element; two accumulators keep the ILP of the lo/hi split.
 template<short SW>
 static inline float q2_0_dot_y(thread const uint8_t * b, const float d, const float sumy, thread const float * yl) {
-    float acc_lo = 0.0f;
-    float acc_hi = 0.0f;
-    for (short i = 0; i < SW; i++) {
-        acc_lo += select(0.0f, yl[i], bool(b[i/4] & (1u << (2*(i%4) + 0))));
-        acc_hi += select(0.0f, yl[i], bool(b[i/4] & (1u << (2*(i%4) + 1))));
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (short i = 0; i < SW; i += 2) {
+        acc0 = fma(float((b[i/4] >> (2*(i%4))) & 3u), yl[i], acc0);
+        acc1 = fma(float((b[(i+1)/4] >> (2*((i+1)%4))) & 3u), yl[i+1], acc1);
     }
-    return d * (acc_lo + 2.0f*acc_hi - sumy);
+    return d * (acc0 + acc1 - sumy);
 }
 
 // F32 accumulation; DT only changes the final store (see q8_0_impl_t).

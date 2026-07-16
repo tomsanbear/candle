@@ -2682,18 +2682,19 @@ static_assert(sizeof(block_q2_0) == sizeof(half) + QK2_0 / 4, "wrong q2_0 block 
 #define NB_Q2_0 8
 #define SW_Q2_0 (QK2_0 / NB_Q2_0)
 
-// weight = (code - 1)*d, so sum((c-1)*d*y) = d*(sum(c*y) - sumy). Unpack each
-// 2-bit code to a float and FMA — fewer ALU ops than the select-form's two
-// conditional adds/element; two accumulators keep the ILP of the lo/hi split.
+// With code c = lo + 2*hi, sum((c-1)*d*y) = d*(sum_lo(y) + 2*sum_hi(y) - sumy).
+// select-form beats unpack+FMA here (measured): the conditional-move on the
+// pre-loaded activation avoids the int->float convert. yl is half (16-bit) to
+// cut register pressure and lift occupancy (Apple GPUs favour 16-bit).
 template<short SW>
-static inline float q2_0_dot_y(thread const uint8_t * b, const float d, const float sumy, thread const float * yl) {
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (short i = 0; i < SW; i += 2) {
-        acc0 = fma(float((b[i/4] >> (2*(i%4))) & 3u), yl[i], acc0);
-        acc1 = fma(float((b[(i+1)/4] >> (2*((i+1)%4))) & 3u), yl[i+1], acc1);
+static inline float q2_0_dot_y(thread const uint8_t * b, const float d, const float sumy, thread const half * yl) {
+    float acc_lo = 0.0f;
+    float acc_hi = 0.0f;
+    for (short i = 0; i < SW; i++) {
+        acc_lo += select(0.0f, float(yl[i]), bool(b[i/4] & (1u << (2*(i%4) + 0))));
+        acc_hi += select(0.0f, float(yl[i]), bool(b[i/4] & (1u << (2*(i%4) + 1))));
     }
-    return d * (acc0 + acc1 - sumy);
+    return d * (acc_lo + 2.0f*acc_hi - sumy);
 }
 
 // F32 accumulation; DT only changes the final store (see q8_0_impl_t).
@@ -2738,7 +2739,7 @@ void kernel_mul_mv_q2_0_impl_t(
     device const block_q2_0 * x = (device const block_q2_0 *) src0 + offset0;
     device const YT         * y = (device const YT         *) src1 + r1*ne10 + im*ne00*ne1;
 
-    float yl[SW_Q2_0];
+    half yl[SW_Q2_0];             // 16-bit activation cache: half the registers
     float sumf[nr] = {0.f};
 
     const short ix = tiisg/tpb;
@@ -2749,8 +2750,8 @@ void kernel_mul_mv_q2_0_impl_t(
     for (int ib = ix; ib < nb; ib += nw/NB_Q2_0) {
         float sumy = 0.f;
         for (short i = 0; i < SW; ++i) {
-            yl[i] = (float) yb[i];
-            sumy += yl[i];
+            yl[i] = (half) yb[i];
+            sumy += (float) yl[i];
         }
 
         for (int row = 0; row < nr; row++) {

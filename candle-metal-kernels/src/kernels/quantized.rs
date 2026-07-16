@@ -669,8 +669,16 @@ impl Mm2dQ2Variant {
         tile_n: 64,
         tg_threads: 128,
     };
+    /// Diagnostic probe (numerically WRONG): a single op.run over the full K
+    /// (dynamic_extent), no host K-loop — separates the op's MMA throughput from
+    /// the discrete-loop machinery. See mm2d_q2_0.metal.
+    pub const PROBE_FULLK_T64: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t64",
+        tile_n: 64,
+        tg_threads: 128,
+    };
     /// Every variant, for benchmark sweeps.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::T64_K32,
         Self::T64_K64,
         Self::T64_K128,
@@ -678,6 +686,7 @@ impl Mm2dQ2Variant {
         Self::T32_K128,
         Self::T32_K128_RELAXED,
         Self::PROBE_NOFOLD_T64_K128,
+        Self::PROBE_FULLK_T64,
     ];
     /// Production default (the sweep winner).
     pub const DEFAULT: Self = Self::T64_K128;

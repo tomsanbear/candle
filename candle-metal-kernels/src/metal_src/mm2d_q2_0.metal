@@ -196,3 +196,60 @@ void mm2d_q2_0_probe_nofold(
       mm2d_q2_0_probe_nofold<tile_n, bk, nsimd>;
 
 instantiate_mm2d_q2_0_probe(64, 128, 4, nofold_t64_k128)
+
+// PROBE (numerically WRONG): a SINGLE op.run over the FULL K (dynamic_extent K),
+// no host K-loop, no per-tile cooperative-tensor allocation, no fold. This lets
+// the matmul2d library pipeline the K-reduction internally. Comparing against
+// probe_nofold (40 discrete op.runs, same otherwise) separates the op's raw
+// MMA/load throughput from the discrete-loop machinery (40× op.run + 40× coop
+// alloc + 40× accumulate). If ~= probe_nofold, the op is the wall; if much
+// faster, the discrete loop was the cost and hardware block-scaling is worth it.
+template <int TILE_N, int NSIMD>
+[[kernel]]
+void mm2d_q2_0_probe_fullk(
+    device const bfloat * a_p  [[ buffer(0) ]],
+    device const uchar  * b_p  [[ buffer(1) ]],
+    device const half   * d_p  [[ buffer(2) ]],
+    device bfloat       * c_p  [[ buffer(3) ]],
+    constant int4       & dims [[ buffer(4) ]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tidx [[thread_index_in_threadgroup]]) {
+  const int K = dims.x;
+  const int Npad = dims.y;
+  const int Nreal = dims.z;
+  const int Mreal = dims.w;
+  const int n0 = int(tgid.x) * TILE_N;
+  (void)K;
+  (void)d_p;
+  (void)tidx;
+  tensor<device bfloat, dextents<int, 2>, tensor_inline>
+      a((device bfloat *)a_p, dextents<int, 2>(K, Mreal));
+  tensor<device uint2b_format, dextents<int, 2>, tensor_inline>
+      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
+  constexpr auto desc = tensor_ops::matmul2d_descriptor(
+      8, TILE_N, static_cast<int>(metal::dynamic_extent));
+  tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
+  auto acc =
+      op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0.0f;
+  }
+  auto mA = a.slice(0, 0);
+  auto mB = b.slice(n0, 0);
+  op.run(mA, mB, acc);
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    auto mdi = acc.get_multidimensional_index(i);
+    const int n = n0 + mdi[0];
+    const int m = mdi[1];
+    if (n < Nreal && m < Mreal) {
+      c_p[m * Nreal + n] = bfloat(acc[i]);
+    }
+  }
+}
+
+#define instantiate_mm2d_q2_0_probe_fullk(tile_n, nsimd, suffix)              \
+  template [[host_name("kernel_mul_mm2d_q2_0_probe_" #suffix)]] [[kernel]]     \
+  decltype(mm2d_q2_0_probe_fullk<tile_n, nsimd>)                               \
+      mm2d_q2_0_probe_fullk<tile_n, nsimd>;
+
+instantiate_mm2d_q2_0_probe_fullk(64, 4, fullk_t64)

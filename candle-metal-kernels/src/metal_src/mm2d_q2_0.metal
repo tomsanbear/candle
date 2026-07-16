@@ -257,3 +257,60 @@ instantiate_mm2d_q2_0_probe_fullk(64, 16, 4, fullk_t64_m16)
 instantiate_mm2d_q2_0_probe_fullk(64, 32, 4, fullk_t64_m32)
 instantiate_mm2d_q2_0_probe_fullk(32, 8, 1, fullk_t32)
 instantiate_mm2d_q2_0_probe_fullk(128, 8, 8, fullk_t128)
+
+// PROBE (throughput only): INTEGER tensor path — int8 A × int2b_format B →
+// int32 accumulate, single op.run over full K. Tests whether the M3 tensor unit
+// runs integer MMA faster than the bfloat path (the original goal's "int8
+// activation" lever). A data here is a raw int8 buffer (garbage — timing only);
+// a real kernel would quantize activations per-row to int8 and dequantize
+// out = sA[m]·d[n]·P. Ternary as signed int2 needs no rowsum (the code IS the
+// value). Same 5-buffer signature; buffer 0 reinterpreted as int8.
+template <int TILE_N, int NSIMD>
+[[kernel]]
+void mm2d_q2_0_probe_int8(
+    device const char   * a_p  [[ buffer(0) ]],
+    device const uchar  * b_p  [[ buffer(1) ]],
+    device const half   * d_p  [[ buffer(2) ]],
+    device bfloat       * c_p  [[ buffer(3) ]],
+    constant int4       & dims [[ buffer(4) ]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tidx [[thread_index_in_threadgroup]]) {
+  const int K = dims.x;
+  const int Npad = dims.y;
+  const int Nreal = dims.z;
+  const int Mreal = dims.w;
+  const int n0 = int(tgid.x) * TILE_N;
+  (void)K;
+  (void)d_p;
+  (void)tidx;
+  tensor<device char, dextents<int, 2>, tensor_inline>
+      a((device char *)a_p, dextents<int, 2>(K, Mreal));
+  tensor<device int2b_format, dextents<int, 2>, tensor_inline>
+      b((device uchar *)b_p, dextents<int, 2>(Npad, K));
+  constexpr auto desc = tensor_ops::matmul2d_descriptor(
+      8, TILE_N, static_cast<int>(metal::dynamic_extent));
+  tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
+  auto acc =
+      op.template get_destination_cooperative_tensor<decltype(a), decltype(b), int>();
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0;
+  }
+  auto mA = a.slice(0, 0);
+  auto mB = b.slice(n0, 0);
+  op.run(mA, mB, acc);
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    auto mdi = acc.get_multidimensional_index(i);
+    const int n = n0 + mdi[0];
+    const int m = mdi[1];
+    if (n < Nreal && m < Mreal) {
+      c_p[m * Nreal + n] = bfloat(float(acc[i]));
+    }
+  }
+}
+
+#define instantiate_mm2d_q2_0_probe_int8(tile_n, nsimd, suffix)              \
+  template [[host_name("kernel_mul_mm2d_q2_0_probe_" #suffix)]] [[kernel]]    \
+  decltype(mm2d_q2_0_probe_int8<tile_n, nsimd>)                               \
+      mm2d_q2_0_probe_int8<tile_n, nsimd>;
+
+instantiate_mm2d_q2_0_probe_int8(64, 4, int8_t64)

@@ -1292,6 +1292,20 @@ pub fn call_quantized_matmul_mv_mc(
         (GgmlDType::Q6K, true) => ("kernel_mul_mv_q6_K_bf16_mc", 2, 32, 2),
         _ => unreachable!("gated by quantized_matmul_mv_mc_columns"),
     };
+    // A/B toggle: LMBRRR_Q2_MC2=1 routes the Q2_0 verify GEMV to the ILP-fixed
+    // mc2 kernel (independent column accumulators) instead of the serial mc.
+    static MC2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_mc2 = *MC2.get_or_init(|| std::env::var("LMBRRR_Q2_MC2").is_ok());
+    let name: &str = if use_mc2 && matches!(dtype, GgmlDType::Q2_0) {
+        match name {
+            "kernel_mul_mv_q2_0_f32_mc" => "kernel_mul_mv_q2_0_f32_mc2",
+            "kernel_mul_mv_q2_0_bf16_mc" => "kernel_mul_mv_q2_0_bf16_mc2",
+            "kernel_mul_mv_q2_0_bf16_bf16_mc" => "kernel_mul_mv_q2_0_bf16_bf16_mc2",
+            other => other,
+        }
+    } else {
+        name
+    };
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
         height: divide(m, nc),

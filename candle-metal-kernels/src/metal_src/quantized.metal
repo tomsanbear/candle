@@ -7924,6 +7924,18 @@ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg
 }
 
 template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 *xb, short il, thread type4x4 & reg) {
+    // il in 0..NL-1 selects a contiguous 16-code sub-slice of the 128-code
+    // block (NL = QK2_0/16 = 8). Codes are 2 bits, 4 per byte; weight = (c-1)*d.
+    const half d = xb->d;
+    device const uint8_t * qs = xb->qs + il*4;
+    for (int i = 0; i < 16; ++i) {
+        const int c = (qs[i/4] >> (2*(i%4))) & 3;
+        reg[i/4][i%4] = (half)(c - 1) * d;
+    }
+}
+
+template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
     const float min = xb->dmin;
@@ -8738,6 +8750,7 @@ template [[host_name("kernel_mul_mm_q4_1_f32")]]    kernel mat_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_q5_0_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q5_0,    2,     dequantize_q5_0>;
 template [[host_name("kernel_mul_mm_q5_1_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q2_0,    8,     dequantize_q2_0>;
 template [[host_name("kernel_mul_mm_q2_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_mul_mm_q3_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K>;

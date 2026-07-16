@@ -1033,7 +1033,8 @@ pub fn quantized_matmul_mv_mc_columns(dtype: GgmlDType) -> Option<usize> {
         GgmlDType::Q8_0 => Some(8),
         GgmlDType::Q4K => Some(8),
         GgmlDType::Q6K => Some(8),
-        GgmlDType::Q2_0 => Some(8),
+        // Q2_0's mc kernel is compute-bound (the ternary unpack), so m>1 uses
+        // the weight-bound tile mm instead — no mc route.
         _ => None,
     }
 }
@@ -1200,6 +1201,7 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
         GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
+        GgmlDType::Q2_0 => "kernel_mul_mm_q2_0_f32",
         GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
         GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
@@ -1210,8 +1212,6 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
-        // No tile-mm kernel; m>1 (prefill) must route through the mv path.
-        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "qmatmul"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

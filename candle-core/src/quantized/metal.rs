@@ -652,9 +652,12 @@ impl QMetalStorage {
         if src_shape.dim(D::Minus2)? == 1 {
             return self.fwd_mv(self_shape, storage, layout);
         }
-        // Ternary Q1_0/Q2_0 have no tile-mm kernel; the mv kernel services m>1
-        // in one dispatch (each tgpig.y is a src1 row), so route prefill there.
-        if matches!(self.dtype, GgmlDType::Q1_0 | GgmlDType::Q2_0) {
+        // Q1_0 has no tile-mm kernel; the mv kernel services m>1 in one
+        // dispatch (each tgpig.y is a src1 row), so route it there. Q2_0 DOES
+        // have a tile-mm kernel (kernel_mul_mm_q2_0_f32) — weight-bound at m>1
+        // (its mv/mc is compute-bound for the ternary unpack), so it falls
+        // through to the tile path below (the DSpark verify win).
+        if matches!(self.dtype, GgmlDType::Q1_0) {
             return self.fwd_mv(self_shape, storage, layout);
         }
         // Small-m matmuls (speculative-verify chunks, small batches) are

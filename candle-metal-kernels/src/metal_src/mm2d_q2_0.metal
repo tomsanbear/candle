@@ -204,7 +204,7 @@ instantiate_mm2d_q2_0_probe(64, 128, 4, nofold_t64_k128)
 // MMA/load throughput from the discrete-loop machinery (40× op.run + 40× coop
 // alloc + 40× accumulate). If ~= probe_nofold, the op is the wall; if much
 // faster, the discrete loop was the cost and hardware block-scaling is worth it.
-template <int TILE_N, int NSIMD>
+template <int TILE_N, int MTILE, int NSIMD>
 [[kernel]]
 void mm2d_q2_0_probe_fullk(
     device const bfloat * a_p  [[ buffer(0) ]],
@@ -227,7 +227,7 @@ void mm2d_q2_0_probe_fullk(
   tensor<device uint2b_format, dextents<int, 2>, tensor_inline>
       b((device uchar *)b_p, dextents<int, 2>(Npad, K));
   constexpr auto desc = tensor_ops::matmul2d_descriptor(
-      8, TILE_N, static_cast<int>(metal::dynamic_extent));
+      MTILE, TILE_N, static_cast<int>(metal::dynamic_extent));
   tensor_ops::matmul2d<desc, execution_simdgroups<NSIMD>> op;
   auto acc =
       op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
@@ -247,9 +247,13 @@ void mm2d_q2_0_probe_fullk(
   }
 }
 
-#define instantiate_mm2d_q2_0_probe_fullk(tile_n, nsimd, suffix)              \
+#define instantiate_mm2d_q2_0_probe_fullk(tile_n, mtile, nsimd, suffix)       \
   template [[host_name("kernel_mul_mm2d_q2_0_probe_" #suffix)]] [[kernel]]     \
-  decltype(mm2d_q2_0_probe_fullk<tile_n, nsimd>)                               \
-      mm2d_q2_0_probe_fullk<tile_n, nsimd>;
+  decltype(mm2d_q2_0_probe_fullk<tile_n, mtile, nsimd>)                        \
+      mm2d_q2_0_probe_fullk<tile_n, mtile, nsimd>;
 
-instantiate_mm2d_q2_0_probe_fullk(64, 4, fullk_t64)
+instantiate_mm2d_q2_0_probe_fullk(64, 8, 4, fullk_t64)
+instantiate_mm2d_q2_0_probe_fullk(64, 16, 4, fullk_t64_m16)
+instantiate_mm2d_q2_0_probe_fullk(64, 32, 4, fullk_t64_m32)
+instantiate_mm2d_q2_0_probe_fullk(32, 8, 1, fullk_t32)
+instantiate_mm2d_q2_0_probe_fullk(128, 8, 8, fullk_t128)

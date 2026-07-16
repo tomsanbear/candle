@@ -677,8 +677,29 @@ impl Mm2dQ2Variant {
         tile_n: 64,
         tg_threads: 128,
     };
+    /// M-tile sweep probes (does a bigger tile amortize the weight read for free?).
+    pub const PROBE_FULLK_T64_M16: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t64_m16",
+        tile_n: 64,
+        tg_threads: 128,
+    };
+    pub const PROBE_FULLK_T64_M32: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t64_m32",
+        tile_n: 64,
+        tg_threads: 128,
+    };
+    pub const PROBE_FULLK_T32: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t32",
+        tile_n: 32,
+        tg_threads: 32,
+    };
+    pub const PROBE_FULLK_T128: Self = Self {
+        kernel: "kernel_mul_mm2d_q2_0_probe_fullk_t128",
+        tile_n: 128,
+        tg_threads: 256,
+    };
     /// Every variant, for benchmark sweeps.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::T64_K32,
         Self::T64_K64,
         Self::T64_K128,
@@ -687,6 +708,10 @@ impl Mm2dQ2Variant {
         Self::T32_K128_RELAXED,
         Self::PROBE_NOFOLD_T64_K128,
         Self::PROBE_FULLK_T64,
+        Self::PROBE_FULLK_T64_M16,
+        Self::PROBE_FULLK_T64_M32,
+        Self::PROBE_FULLK_T32,
+        Self::PROBE_FULLK_T128,
     ];
     /// Production default (the sweep winner).
     pub const DEFAULT: Self = Self::T64_K128;

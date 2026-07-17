@@ -45,9 +45,13 @@ pub fn call_gated_delta_chunk(
     cap_delta: &Buffer,
     cap_gcs: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    if params.dk != 128 || params.dv != 128 || seq_len == 0 || seq_len > 12 {
+    // NOTE: must match the kernel's GDC_MAX_L (gated_delta_chunk.metal). L=5
+    // for the occupancy experiment (width-4 verify, l=5) — l>5 would overflow
+    // the now-5-sized threadgroup arrays, so error loudly instead. RESTORE to
+    // 12 with the kernel #define.
+    if params.dk != 128 || params.dv != 128 || seq_len == 0 || seq_len > 5 {
         return Err(MetalKernelError::LoadLibraryError(format!(
-            "gated_delta_chunk requires dk == dv == 128 and 1 <= l <= 12; got dk={} dv={} l={seq_len}",
+            "gated_delta_chunk requires dk == dv == 128 and 1 <= l <= 5 (GDC_MAX_L); got dk={} dv={} l={seq_len}",
             params.dk, params.dv
         )));
     }

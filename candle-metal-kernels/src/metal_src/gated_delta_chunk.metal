@@ -22,11 +22,12 @@ using namespace metal;
 //   cap_delta f32  [heads, l, dv]   WY pseudo-values
 //   cap_gcs   f32  [heads, l]       inclusive log-decay cumsum
 
-// Threadgroup memory bounds the chunk: 4 arrays x GDC_MAX_L x GDC_DIM x 4B
-// must stay under the 32KB threadgroup budget, so GDC_MAX_L=12 with
-// GDC_DIM=128 uses ~24.6KB. Verify chunks are gamma+1 <= 9; prefill keeps
-// the tensor path. The host enforces l <= GDC_MAX_L and dk == dv == GDC_DIM.
-#define GDC_MAX_L 12
+// Threadgroup memory bounds the chunk: tgMem(L) ~= 2048*L + 8*L^2. L=12 ->
+// 25.9KB (1 threadgroup/core on M3's 32KB -> ~8% occupancy, latency-bound);
+// L=5 -> 10.5KB (3 tg/core, ~3x occupancy). EXPERIMENT (occupancy proof):
+// L=5 sized to the width-4 verify chunk (l=5). RESTORE to 12 before width-7
+// (l=8) or the tree path (l=7). The host enforces l <= GDC_MAX_L.
+#define GDC_MAX_L 5
 #define GDC_DIM 128
 #define GDC_MAX_KSZ 8
 

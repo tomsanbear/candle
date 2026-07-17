@@ -3,15 +3,18 @@ using namespace metal;
 
 // Streaming / persistent GatedDeltaNet prefill: ONE dispatch handles the whole
 // sequence (any l), one threadgroup per value head, dv threads. Walks the
-// sequence in fixed GDP_TILE-position tiles, carrying the recurrent state S as
-// a per-thread register column (S[:, tid], dk floats) and the depthwise-conv
-// window in registers across tiles — so S and the conv window are read once at
-// the start and written once at the end, instead of the per-dispatch round-trip
-// the host-looped chunk kernel pays (the CAP sweep showed that per-dispatch
-// repetition, not the recurrence math, dominates prefill: prefill = A + B/CAP,
-// A ~= 3.61s). No compile-time dependence on l; no rollback capture (prefill
-// never rolls back). Same algebra as gated_delta_chunk; gcs is relative to each
-// tile start, with the carried S0 holding the absolute decayed state.
+// sequence in fixed GDP_TILE-position tiles, carrying the depthwise-conv window
+// in registers across tiles. The recurrent state S (dk*dv*4 = 64KB/head) is too
+// big for threadgroup memory AND spills registers if held per-thread (a first
+// pass carrying S[:, tid] in a 128-float register array regressed to 4.11s vs
+// the chunk loop's 3.76s), so S stays DEVICE-resident: each thread owns column
+// tid, so its reads/writes are coalesced and need no barrier. The win over the
+// host-looped chunk kernel is one dispatch + the conv window carried in
+// registers, removing the per-dispatch LAUNCH + conv round-trip (the CAP sweep
+// attributes ~2/3 of the per-dispatch overhead to those, ~1/3 to S traffic).
+// No compile-time dependence on l; no rollback capture. Same algebra as
+// gated_delta_chunk; gcs is relative to each tile start, S holding the absolute
+// decayed state. S lives in state_out (seeded from state_in), updated in place.
 //
 // Layouts match gated_delta_chunk (minus the cap_* capture outputs):
 //   proj      bf16 [l, conv_dim + value_dim + 2*heads]
@@ -64,10 +67,13 @@ kernel void gated_delta_prefill_bf16(
   const uint kq = num_k_heads == heads ? h : h % num_k_heads;
   const uint n_simd_groups = dv / 32;
 
-  // S column S[:, tid] carried in registers across tiles.
-  float s_col[GDP_DIM];
+  // S stays device-resident (64KB/head won't fit on-chip; register-carry
+  // spills). Seed the working copy state_out[:, tid] from state_in; each thread
+  // owns column tid, so all S reads/writes below are per-thread and coalesced.
+  device float *s_dev = state_out + (ulong)h * dk * dv;
+  device const float *s_seed = state_in + (ulong)h * dk * dv;
   for (uint i = 0; i < dk; i++) {
-    s_col[i] = state_in[(ulong)h * dk * dv + i * dv + tid];
+    s_dev[i * dv + tid] = s_seed[i * dv + tid];
   }
 
   // Conv window (ksz slots, same layout as conv_in) for this thread's 3
@@ -174,7 +180,7 @@ kernel void gated_delta_prefill_bf16(
       qs0[t] = 0.0f;
     }
     for (uint i = 0; i < dk; i++) {
-      const float s0 = s_col[i];
+      const float s0 = s_dev[i * dv + tid];
       for (uint t = 0; t < c; t++) {
         ks0[t] = fma(k_sh[t * dk + i], s0, ks0[t]);
         qs0[t] = fma(q_sh[t * dk + i], s0, qs0[t]);
@@ -210,25 +216,22 @@ kernel void gated_delta_prefill_bf16(
       out[(base + t) * value_dim + h * dv + tid] = bfloat(o * inv_rms * norm_w[tid] * z_silu);
     }
 
-    // ---- Update S column (registers) to the tile-end state.
+    // ---- Update S column (device, in place) to the tile-end state.
     const float g_last = gcs_sh[c - 1];
     float decay_j[GDP_TILE];
     for (uint j = 0; j < c; j++) decay_j[j] = metal::precise::exp(g_last - gcs_sh[j]);
     const float g_last_exp = metal::precise::exp(g_last);
     for (uint i = 0; i < dk; i++) {
-      float s = g_last_exp * s_col[i];
+      float s = g_last_exp * s_dev[i * dv + tid];
       for (uint j = 0; j < c; j++) {
         s = fma(decay_j[j] * k_sh[j * dk + i], delta_sh[j * dv + tid], s);
       }
-      s_col[i] = s;
+      s_dev[i * dv + tid] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // Write final state + conv window back to device.
-  for (uint i = 0; i < dk; i++) {
-    state_out[(ulong)h * dk * dv + i * dv + tid] = s_col[i];
-  }
+  // S is already in state_out (updated in place). Write the conv window back.
   for (uint cc = 0; cc < 3; cc++) {
     const uint ch = chans[cc];
     for (uint t = 0; t < ksz; t++) {

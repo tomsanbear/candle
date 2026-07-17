@@ -51,8 +51,17 @@ pub fn call_gated_delta_chunk(
             params.dk, params.dv
         )));
     }
-    let pipeline =
-        kernels.load_pipeline(device, Source::GatedDeltaChunk, "gated_delta_chunk_bf16")?;
+    // Pick the smallest GDC_MAX_L instantiation >= the chunk width: smaller L =
+    // less threadgroup memory = more threadgroups/core = higher occupancy on the
+    // latency-bound recurrence (l5 measured +4.5% spec at the width-4 l=5 verify).
+    let kernel_name = if seq_len <= 5 {
+        "gated_delta_chunk_bf16_l5"
+    } else if seq_len <= 8 {
+        "gated_delta_chunk_bf16_l8"
+    } else {
+        "gated_delta_chunk_bf16_l12"
+    };
+    let pipeline = kernels.load_pipeline(device, Source::GatedDeltaChunk, kernel_name)?;
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();

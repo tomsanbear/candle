@@ -22,11 +22,13 @@ using namespace metal;
 //   cap_delta f32  [heads, l, dv]   WY pseudo-values
 //   cap_gcs   f32  [heads, l]       inclusive log-decay cumsum
 
-// Threadgroup memory bounds the chunk: 4 arrays x GDC_MAX_L x GDC_DIM x 4B
-// must stay under the 32KB threadgroup budget, so GDC_MAX_L=12 with
-// GDC_DIM=128 uses ~24.6KB. Verify chunks are gamma+1 <= 9; prefill keeps
-// the tensor path. The host enforces l <= GDC_MAX_L and dk == dv == GDC_DIM.
-#define GDC_MAX_L 12
+// Threadgroup memory bounds the chunk: tgMem(L) ~= 2048*L + 8*L^2. On the M3's
+// 32KB/core, L=12 -> 25.9KB (1 threadgroup/core, ~8% occupancy, latency-bound);
+// L=5 -> 10.5KB (3 tg/core, ~3x occupancy, MEASURED +4.5% spec at the width-4
+// l=5 verify). So the kernel is TEMPLATED on GDC_MAX_L and instantiated at
+// {5,8,12}; the host picks the smallest >= the chunk width (l5 for width-4
+// verify, l7->l8 for the tree, l8 for width-7 verify, l12 for the prefill
+// chunk-loop). GDC_DIM/KSZ stay #defines.
 #define GDC_DIM 128
 #define GDC_MAX_KSZ 8
 
@@ -47,7 +49,8 @@ static inline float tg_sum_gdc(float x,
     return total;
 }
 
-kernel void gated_delta_chunk_bf16(
+template <int GDC_MAX_L>
+[[kernel]] void gated_delta_chunk_impl(
     device const bfloat *proj      [[buffer(0)]],
     device const bfloat *conv_in   [[buffer(1)]],
     device const float  *state_in  [[buffer(2)]],
@@ -270,3 +273,12 @@ kernel void gated_delta_chunk_bf16(
         }
     }
 }
+
+// Explicit instantiations; host picks gated_delta_chunk_bf16_l<L> by the
+// smallest L >= the chunk width (see call_gated_delta_chunk).
+#define instantiate_gdc(L)                                                     \
+    template [[host_name("gated_delta_chunk_bf16_l" #L)]] [[kernel]]           \
+    decltype(gated_delta_chunk_impl<L>) gated_delta_chunk_impl<L>;
+instantiate_gdc(5)
+instantiate_gdc(8)
+instantiate_gdc(12)

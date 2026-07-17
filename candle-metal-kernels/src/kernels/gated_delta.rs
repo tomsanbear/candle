@@ -125,6 +125,7 @@ pub fn call_gated_delta_prefill(
     out: &Buffer,
     conv_out: &Buffer,
     state_out: &Buffer,
+    state_scratch: &Buffer,
 ) -> Result<(), MetalKernelError> {
     if params.dk != 128 || params.dv != 128 || seq_len == 0 {
         return Err(MetalKernelError::LoadLibraryError(format!(
@@ -163,7 +164,8 @@ pub fn call_gated_delta_prefill(
             seq_len as u32,
             params.l2_eps,
             params.norm_eps,
-            params.num_k_heads
+            params.num_k_heads,
+            Output::new(state_scratch)
         )
     );
 

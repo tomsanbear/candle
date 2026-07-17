@@ -58,6 +58,7 @@ kernel void gated_delta_prefill_bf16(
     constant float &l2_eps      [[buffer(18)]],
     constant float &norm_eps    [[buffer(19)]],
     constant uint  &num_k_heads [[buffer(20)]],
+    device float        *state_scratch [[buffer(21)]],
     uint h          [[threadgroup_position_in_grid]],
     uint tid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -68,13 +69,16 @@ kernel void gated_delta_prefill_bf16(
   const uint n_simd_groups = dv / 32;
 
   // S stays device-resident (64KB/head won't fit on-chip; register-carry
-  // spills). Seed the working copy state_out[:, tid] from state_in; each thread
-  // owns column tid, so all S reads/writes below are per-thread and coalesced.
-  device float *s_dev = state_out + (ulong)h * dk * dv;
-  device const float *s_seed = state_in + (ulong)h * dk * dv;
-  for (uint i = 0; i < dk; i++) {
-    s_dev[i * dv + tid] = s_seed[i * dv + tid];
-  }
+  // spills). PING-PONG between state_out and state_scratch so each tile reads a
+  // READ-ONLY source and writes a WRITE-ONLY target — clean lines evict for
+  // free, unlike an in-place read-write buffer which dirties S and thrashes L1
+  // (measured l1_eviction 0.55 in-place vs 0.01 separate-buffers). Tile 0 reads
+  // state_in directly (no seed copy). Each thread owns column tid -> coalesced,
+  // no barrier needed for the per-thread S carry.
+  const ulong soff = (ulong)h * dk * dv;
+  device float *bufA = state_out + soff;
+  device float *bufB = state_scratch + soff;
+  device const float *s_in = state_in + soff;
 
   // Conv window (ksz slots, same layout as conv_in) for this thread's 3
   // channels, carried in registers. Reads use slots [1..ksz-1] as the retained
@@ -98,8 +102,15 @@ kernel void gated_delta_prefill_bf16(
   threadgroup float beta_sh[GDP_TILE];
   threadgroup float scratch[8];
 
-  for (uint base = 0; base < l; base += GDP_TILE) {
+  uint tile = 0;
+  for (uint base = 0; base < l; base += GDP_TILE, tile++) {
     const uint c = min((uint)GDP_TILE, l - base);
+    // Ping-pong: tile 0 reads state_in; even tiles read bufB write bufA, odd
+    // tiles read bufA write bufB. Read source is never written this tile.
+    const bool even = (tile & 1u) == 0u;
+    device const float *rb =
+        (tile == 0u) ? s_in : (even ? (device const float *)bufB : (device const float *)bufA);
+    device float *wb = even ? bufA : bufB;
 
     // ---- Phase 1: conv + silu across the tile for this head's channels.
     for (uint cc = 0; cc < 3; cc++) {
@@ -180,7 +191,7 @@ kernel void gated_delta_prefill_bf16(
       qs0[t] = 0.0f;
     }
     for (uint i = 0; i < dk; i++) {
-      const float s0 = s_dev[i * dv + tid];
+      const float s0 = rb[i * dv + tid];
       for (uint t = 0; t < c; t++) {
         ks0[t] = fma(k_sh[t * dk + i], s0, ks0[t]);
         qs0[t] = fma(q_sh[t * dk + i], s0, qs0[t]);
@@ -216,22 +227,29 @@ kernel void gated_delta_prefill_bf16(
       out[(base + t) * value_dim + h * dv + tid] = bfloat(o * inv_rms * norm_w[tid] * z_silu);
     }
 
-    // ---- Update S column (device, in place) to the tile-end state.
+    // ---- Update S: read the tile's S0 (rb), write the new state (wb).
     const float g_last = gcs_sh[c - 1];
     float decay_j[GDP_TILE];
     for (uint j = 0; j < c; j++) decay_j[j] = metal::precise::exp(g_last - gcs_sh[j]);
     const float g_last_exp = metal::precise::exp(g_last);
     for (uint i = 0; i < dk; i++) {
-      float s = g_last_exp * s_dev[i * dv + tid];
+      float s = g_last_exp * rb[i * dv + tid];
       for (uint j = 0; j < c; j++) {
         s = fma(decay_j[j] * k_sh[j * dk + i], delta_sh[j * dv + tid], s);
       }
-      s_dev[i * dv + tid] = s;
+      wb[i * dv + tid] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // S is already in state_out (updated in place). Write the conv window back.
+  // Final S is in the last tile's write target: bufA if the last tile index
+  // (tile-1) was even, else bufB. Ensure it lands in state_out (bufA).
+  const bool last_even = (((tile - 1u) & 1u) == 0u);
+  if (!last_even) {
+    for (uint i = 0; i < dk; i++) bufA[i * dv + tid] = bufB[i * dv + tid];
+  }
+
+  // Write the conv window back.
   for (uint cc = 0; cc < 3; cc++) {
     const uint ch = chans[cc];
     for (uint t = 0; t < ksz; t++) {

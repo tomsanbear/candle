@@ -29,7 +29,7 @@ pub use convolution::*;
 pub use dspark::{call_markov_chain, MarkovChainArgs, MARKOV_FUSED_MAX_VD, MARKOV_NTG, MARKOV_TPG};
 pub use fill::*;
 pub use gated_delta::{
-    call_gated_delta_chunk, call_gated_delta_decode, call_gated_delta_v2,
+    call_gated_delta_chunk, call_gated_delta_decode, call_gated_delta_prefill, call_gated_delta_v2,
     call_gated_delta_v2_decode, call_gated_delta_v2_reconstruct, call_gated_delta_v2_tree,
     GdnReconstructOut,
     GatedDeltaParams, GatedDeltaV2Stages,

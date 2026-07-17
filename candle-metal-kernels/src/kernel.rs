@@ -1,6 +1,6 @@
 use crate::source::{
     AFFINE, ATTN_PREP, BINARY, CAST, CONV, DSPARK, FILL, GATED_DELTA, GATED_DELTA_CHUNK,
-    GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, MM2D_Q2_0_LIB, MM2D_Q4K_LIB, QUANTIZED,
+    GATED_DELTA_PREFILL, GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, MM2D_Q2_0_LIB, MM2D_Q4K_LIB, QUANTIZED,
     BITPLANE, QUANTIZED_UNPK, RANDOM, REDUCE, SDPA, SKINNY_GEMM, SORT, TERNARY, UNARY,
 };
 
@@ -136,6 +136,7 @@ impl Kernels {
             Source::Sdpa => SDPA,
             Source::GatedDelta => GATED_DELTA,
             Source::GatedDeltaChunk => GATED_DELTA_CHUNK,
+            Source::GatedDeltaPrefill => GATED_DELTA_PREFILL,
             Source::GatedDeltaV2 => GATED_DELTA_V2,
             Source::SkinnyGemm => SKINNY_GEMM,
             Source::Dspark => DSPARK,

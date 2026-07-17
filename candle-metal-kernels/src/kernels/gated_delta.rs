@@ -104,6 +104,84 @@ pub fn call_gated_delta_chunk(
     Ok(())
 }
 
+/// Streaming GatedDeltaNet prefill: ONE dispatch over the WHOLE sequence (any
+/// seq_len), one threadgroup per head x dv threads, internal fixed-tile loop
+/// carrying S + the conv window in registers. No rollback capture. See
+/// gated_delta_prefill.metal.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gated_delta_prefill(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    params: GatedDeltaParams,
+    seq_len: usize,
+    proj: &Buffer,
+    conv_in: &Buffer,
+    state_in: &Buffer,
+    conv_w: &Buffer,
+    dt_bias: &Buffer,
+    a_log_exp: &Buffer,
+    norm_w: &Buffer,
+    out: &Buffer,
+    conv_out: &Buffer,
+    state_out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if params.dk != 128 || params.dv != 128 || seq_len == 0 {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "gated_delta_prefill requires dk == dv == 128 and l >= 1; got dk={} dv={} l={seq_len}",
+            params.dk, params.dv
+        )));
+    }
+    let pipeline =
+        kernels.load_pipeline(device, Source::GatedDeltaPrefill, "gated_delta_prefill_bf16")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gated_delta_prefill l={seq_len}");
+
+    set_params!(
+        encoder,
+        (
+            proj,
+            conv_in,
+            state_in,
+            conv_w,
+            dt_bias,
+            a_log_exp,
+            norm_w,
+            Output::new(out),
+            Output::new(conv_out),
+            Output::new(state_out),
+            params.heads,
+            params.dk,
+            params.dv,
+            params.conv_dim,
+            params.key_dim,
+            params.value_dim,
+            params.ksz,
+            seq_len as u32,
+            params.l2_eps,
+            params.norm_eps,
+            params.num_k_heads
+        )
+    );
+
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: params.heads as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: params.dv as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Fused GatedDeltaNet single-token decode step; see gated_delta.metal for
 /// layouts and semantics. BF16 activations, F32 state, one dispatch of
 /// `heads` threadgroups x `dv` threads.

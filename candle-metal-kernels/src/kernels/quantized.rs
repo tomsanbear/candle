@@ -270,19 +270,6 @@ pub fn call_quantized_matmul_mv_t(
         (GgmlDType::BF16, _) => "kernel_mul_mv_bf16_f32",
         (GgmlDType::F32, _) => "kernel_mul_mv_f32_f32",
     };
-    // A/B toggle: LMBRRR_Q2_MV_XC=1 routes the Q2_0 decode mv to the extract-c
-    // map variant (gpudebug counters on m=1: the select-form map is
-    // conditional/f32-pipe bound; extract-c rebalances onto the idle int pipe).
-    static MV_XC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let name = if *MV_XC.get_or_init(|| std::env::var("LMBRRR_Q2_MV_XC").is_ok()) {
-        match name {
-            "kernel_mul_mv_q2_0_bf16" => "kernel_mul_mv_q2_0_bf16_xc",
-            "kernel_mul_mv_q2_0_bf16_bf16" => "kernel_mul_mv_q2_0_bf16_bf16_xc",
-            other => other,
-        }
-    } else {
-        name
-    };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
     let encoder = ep.encoder();

@@ -2699,8 +2699,26 @@ static inline float q2_0_dot_y(thread const uint8_t * b, const float d, const fl
     return d * (acc_lo + 2.0f*acc_hi - sumy);
 }
 
+// EXTRACT-c variant (LMBRRR_Q2_MV_XC A/B). sum((c-1)*d*y) = d*(sum c*y - sumy),
+// c in {0,1,2,3}. Trades the select-form's two select()s + two fadds/weight for
+// one shift+mask+convert + one fmadd. gpudebug counters on the m=1 decode mv
+// (2026-07-17, M3 Pro) show the select form is instruction-bound with
+// integer_and_conditional the top limiter (45.68%) and f32 40.96%, while the
+// shift/mask pipe (integer_and_complex) is only 14.79% -> this rebalances the
+// map off the saturated conditional/f32 pipes onto the idle integer pipe.
+template<short SW>
+static inline float q2_0_dot_y_xc(thread const uint8_t * b, const float d, const float sumy, thread const half * yl) {
+    float acc = 0.0f;
+    for (short i = 0; i < SW; i++) {
+        const int c = (b[i/4] >> (2*(i%4))) & 3;
+        acc += float(c) * float(yl[i]);
+    }
+    return d * (acc - sumy);
+}
+
 // F32 accumulation; DT only changes the final store (see q8_0_impl_t).
-template <typename YT, typename DT = float>
+// XC=true swaps the select-form map for the extract-c map (A/B, compile-time).
+template <typename YT, typename DT = float, bool XC = false>
 void kernel_mul_mv_q2_0_impl_t(
         device const  void * src0,
         device const    YT * src1,
@@ -2765,7 +2783,8 @@ void kernel_mul_mv_q2_0_impl_t(
             for (short i = 0; i < SW/4; ++i) {
                 b[i] = qs[i];
             }
-            sumf[row] += q2_0_dot_y<SW_Q2_0>(b, (float) qb->d, sumy, yl);
+            sumf[row] += XC ? q2_0_dot_y_xc<SW_Q2_0>(b, (float) qb->d, sumy, yl)
+                            : q2_0_dot_y<SW_Q2_0>(b, (float) qb->d, sumy, yl);
         }
 
         yb += QK2_0 * (nw/NB_Q2_0);
@@ -2861,6 +2880,62 @@ kernel void kernel_mul_mv_q2_0_bf16_bf16(
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q2_0_impl_t<bfloat, bfloat>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+// EXTRACT-c map A/B twins of the two bf16 decode-mv kernels (XC=true). Same
+// dispatch/shape; only the per-weight map differs (see q2_0_dot_y_xc).
+[[host_name("kernel_mul_mv_q2_0_bf16_xc")]]
+kernel void kernel_mul_mv_q2_0_bf16_xc(
+        device const   void * src0,
+        device const bfloat * src1,
+        device        float * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q2_0_impl_t<bfloat, float, true>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+
+[[host_name("kernel_mul_mv_q2_0_bf16_bf16_xc")]]
+kernel void kernel_mul_mv_q2_0_bf16_bf16_xc(
+        device const   void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant    int64_t & ne00,
+        constant    int64_t & ne01,
+        constant    int64_t & ne02,
+        constant   uint64_t & nb00,
+        constant   uint64_t & nb01,
+        constant   uint64_t & nb02,
+        constant    int64_t & ne10,
+        constant    int64_t & ne11,
+        constant    int64_t & ne12,
+        constant   uint64_t & nb10,
+        constant   uint64_t & nb11,
+        constant   uint64_t & nb12,
+        constant    int64_t & ne0,
+        constant    int64_t & ne1,
+        constant    uint    & r2,
+        constant    uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q2_0_impl_t<bfloat, bfloat, true>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 #endif
 

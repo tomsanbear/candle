@@ -22,11 +22,13 @@ using namespace metal;
 //   cap_delta f32  [heads, l, dv]   WY pseudo-values
 //   cap_gcs   f32  [heads, l]       inclusive log-decay cumsum
 
-// Threadgroup memory bounds the chunk: 4 arrays x GDC_MAX_L x GDC_DIM x 4B
-// must stay under the 32KB threadgroup budget, so GDC_MAX_L=12 with
-// GDC_DIM=128 uses ~24.6KB. Verify chunks are gamma+1 <= 9; prefill keeps
-// the tensor path. The host enforces l <= GDC_MAX_L and dk == dv == GDC_DIM.
-#define GDC_MAX_L 12
+// Threadgroup memory bounds the chunk: budget ~= 8*L^2 + 2056*L + 32 B (the
+// 4 [L x GDC_DIM] f32 stages dominate, plus the 2 [L x L] f32 kk/qk stages).
+// GDC_MAX_L=15 uses ~32.7KB, just under the 32KB-ish threadgroup budget (16
+// overflows at ~35KB). Verify chunks are gamma+1 <= 9 (masked, l < GDC_MAX_L);
+// long prefill loops the kernel over GDC_MAX_L-token sub-chunks. The host
+// enforces l <= GDC_MAX_L and dk == dv == GDC_DIM.
+#define GDC_MAX_L 15
 #define GDC_DIM 128
 #define GDC_MAX_KSZ 8
 

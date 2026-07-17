@@ -1,7 +1,7 @@
 use crate::source::{
     AFFINE, ATTN_PREP, BINARY, CAST, CONV, DSPARK, FILL, GATED_DELTA, GATED_DELTA_CHUNK,
     GATED_DELTA_V2, GEMV, INDEXING, MLX_GEMM, MLX_SORT, MM2D_Q2_0_LIB, MM2D_Q4K_LIB, QUANTIZED,
-    QUANTIZED_UNPK, RANDOM, REDUCE, SDPA, SKINNY_GEMM, SORT, TERNARY, UNARY,
+    BITPLANE, QUANTIZED_UNPK, RANDOM, REDUCE, SDPA, SKINNY_GEMM, SORT, TERNARY, UNARY,
 };
 
 /// MTLLanguageVersion raw value for MSL 4.1 ((4 << 16) | 1). The SDK enum
@@ -141,6 +141,7 @@ impl Kernels {
             Source::Dspark => DSPARK,
             Source::AttnPrep => ATTN_PREP,
             Source::QuantizedUnpk => QUANTIZED_UNPK,
+            Source::Bitplane => BITPLANE,
             Source::Mm2dQ4k => unreachable!("Mm2dQ4k loads from a prebuilt metallib"),
             Source::Mm2dQ2_0 => unreachable!("Mm2dQ2_0 loads from a prebuilt metallib"),
         }

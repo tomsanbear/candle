@@ -1524,6 +1524,49 @@ pub fn call_quantized_matmul_mv_q2_0_mct(
     Ok(())
 }
 
+/// Bit-plane popcount ternary GEMV (B3 spike): wpos/wneg `[n][k/32]` u32 sign
+/// planes, dscale `[n][k/128]` f16, aplane `[m][4][k/32]` u32 (int4 offset-8
+/// activation slices), ascale `[m]` f32, dst `[m][n]` f32. One simdgroup per
+/// output column, two per threadgroup; k must be a multiple of 128, m <= 8.
+#[allow(clippy::too_many_arguments)]
+pub fn call_ternary_bitplane_qmv(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (m, n, k): (usize, usize, usize),
+    wpos: &Buffer,
+    wneg: &Buffer,
+    dscale: &Buffer,
+    aplane: &Buffer,
+    ascale: &Buffer,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    assert!(k % 128 == 0 && m <= 8);
+    let pipeline =
+        kernels.load_pipeline(device, Source::Bitplane, "kernel_ternary_bitplane_qmv")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "bitplane_qmv M={m} K={k} N={n}");
+    let dims: [i32; 4] = [m as i32, n as i32, k as i32, 0];
+    set_params!(
+        encoder,
+        (wpos, wneg, dscale, aplane, ascale, Output::new(dst), &dims[..])
+    );
+    let thread_groups_count = MTLSize {
+        width: divide(n, 2),
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Parameterized verify GEMV (mcx) dispatch for the knob sweep. `act` is the
 /// NON-transposed activation `[M][K]` bf16 (mc layout). `(nr, nc, nsg)` must
 /// match the kernel's template params. dst f32 `[m, n]`.

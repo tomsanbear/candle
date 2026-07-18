@@ -88,20 +88,7 @@ void mm2d_q2_0(
 
   auto acc =
       op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-  // Hoist the per-element (n,m) index OUT of the K-loop. The cooperative-tensor
-  // index->(n,m) map is fixed by the op descriptor, so get_multidimensional_index
-  // returns the SAME (n,m) for a given i across all NJ K-tiles — but p is a fresh
-  // tensor each tile so the compiler cannot CSE it. gpudebug (m=5, M3 Pro):
-  // address_generation was a 37%-limiter at 13% util (redundant per-tile index
-  // recompute starving the FMA); precompute once. Byte-exact (same arithmetic).
-  constexpr int CAP = (8 * TILE_N + NSIMD * 32 - 1) / (NSIMD * 32);
-  int nn[CAP];
-  int mm_[CAP];
-  const ushort cap = acc.get_capacity();
-  for (ushort i = 0; i < cap; ++i) {
-    auto mdi = acc.get_multidimensional_index(i);
-    nn[i] = n0 + mdi[0];
-    mm_[i] = mdi[1];
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
     acc[i] = 0.0f;
   }
 
@@ -111,17 +98,23 @@ void mm2d_q2_0(
     auto p =
         op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
     op.run(mA, mB, p);
-    const int blkNpad = ((j * BK) >> 7) * Npad; // 128-block index * Npad, per-j
-    for (ushort i = 0; i < cap; ++i) {
-      const float dd = float(d_p[blkNpad + nn[i]]);
-      const float r = mm_[i] < Mreal ? rs_tg[mm_[i] * NJ + j] : 0.0f;
+    const int blk = (j * BK) >> 7; // 128-block index of this K-tile
+    for (ushort i = 0; i < p.get_capacity(); ++i) {
+      auto mdi = p.get_multidimensional_index(i);
+      const int n = n0 + mdi[0];
+      const int m = mdi[1];
+      const float dd = float(d_p[blk * Npad + n]);
+      const float r = m < Mreal ? rs_tg[m * NJ + j] : 0.0f;
       acc[i] = fma(dd, p[i], fma(-dd, r, acc[i]));
     }
   }
 
-  for (ushort i = 0; i < cap; ++i) {
-    if (nn[i] < Nreal && mm_[i] < Mreal) {
-      c_p[mm_[i] * Nreal + nn[i]] = bfloat(acc[i]);
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    auto mdi = acc.get_multidimensional_index(i);
+    const int n = n0 + mdi[0];
+    const int m = mdi[1];
+    if (n < Nreal && m < Mreal) {
+      c_p[m * Nreal + n] = bfloat(acc[i]);
     }
   }
 }

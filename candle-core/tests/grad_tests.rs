@@ -1,6 +1,9 @@
 #![allow(clippy::approx_constant)]
 use anyhow::{Context, Result};
-use candle_core::{op::BinaryOp, test_device, test_utils, DType, Device, Shape, Tensor, Var};
+use candle_core::{
+    backprop::GradStore, op::BinaryOp, test_device, test_utils, DType, Device, Shape, Tensor,
+    Var,
+};
 
 fn simple_grad(device: &Device) -> Result<()> {
     let x = Var::new(&[3f32, 1., 4.], device)?;
@@ -130,6 +133,16 @@ fn apply_broadcast_binary_op(
 fn assert_zero_grad(grads: &candle_core::backprop::GradStore, var: &Var) -> Result<()> {
     let grad = grads.get(var).context("no gradient for variable")?;
     assert_eq!(grad.dims(), var.dims());
+    assert_eq!(
+        grad.flatten_all()?.to_vec1::<f32>()?,
+        vec![0.; grad.elem_count()]
+    );
+    Ok(())
+}
+
+fn assert_zero_grad_shaped(grads: &GradStore, var: &Var, shape: &[usize]) -> Result<()> {
+    let grad = grads.get(var).context("no gradient for variable")?;
+    assert_eq!(grad.dims(), shape);
     assert_eq!(
         grad.flatten_all()?.to_vec1::<f32>()?,
         vec![0.; grad.elem_count()]
@@ -290,6 +303,39 @@ fn empty_binary_validation(device: &Device) -> Result<()> {
                 "unexpected error: {err}"
             );
         }
+    }
+    Ok(())
+}
+
+fn assert_zero_matmul_grads(
+    device: &Device,
+    lhs_shape: &[usize],
+    rhs_shape: &[usize],
+    output_shape: &[usize],
+) -> Result<()> {
+    let lhs = Var::zeros(lhs_shape, DType::F32, device)?;
+    let rhs = Var::zeros(rhs_shape, DType::F32, device)?;
+    let output = lhs.matmul(&rhs)?;
+    assert_eq!(output.dims(), output_shape);
+    assert_eq!(
+        output.flatten_all()?.to_vec1::<f32>()?,
+        vec![0.; output.elem_count()]
+    );
+    let grads = output.sum_all()?.backward()?;
+    assert_zero_grad_shaped(&grads, &lhs, lhs_shape)?;
+    assert_zero_grad_shaped(&grads, &rhs, rhs_shape)
+}
+
+fn zero_matmul_grad(device: &Device) -> Result<()> {
+    let cases: &[(&[usize], &[usize], &[usize])] = &[
+        (&[2, 0], &[0, 3], &[2, 3]),
+        (&[0, 2], &[2, 3], &[0, 3]),
+        (&[2, 3], &[3, 0], &[2, 0]),
+        (&[0, 2, 3], &[0, 3, 4], &[0, 2, 4]),
+        (&[2, 3, 0], &[2, 0, 4], &[2, 3, 4]),
+    ];
+    for &(lhs_shape, rhs_shape, output_shape) in cases {
+        assert_zero_matmul_grads(device, lhs_shape, rhs_shape, output_shape)?;
     }
     Ok(())
 }
@@ -801,6 +847,12 @@ test_device!(
     empty_binary_validation_cpu,
     empty_binary_validation_gpu,
     empty_binary_validation_metal
+);
+test_device!(
+    zero_matmul_grad,
+    zero_matmul_grad_cpu,
+    zero_matmul_grad_gpu,
+    zero_matmul_grad_metal
 );
 test_device!(
     grad_descent,

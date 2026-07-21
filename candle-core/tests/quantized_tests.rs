@@ -53,6 +53,54 @@ fn test_matmul(
     Ok(())
 }
 
+fn assert_mv_close(res: &Tensor, reference: &Tensor, dtype: GgmlDType, n: usize) -> Result<()> {
+    let res = res.flatten_all()?.to_vec1::<f32>()?;
+    let reference = reference.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(res.len(), reference.len());
+    for (i, (r, e)) in res.iter().zip(reference.iter()).enumerate() {
+        // The CPU backend quantizes the activations on the fly, so even
+        // against dequantized weights the error is not tiny.
+        assert!(
+            (r - e).abs() <= 2e-2 * e.abs().max(1.0),
+            "n={n} {dtype:?}: value {i} got {r} expected {e}"
+        );
+    }
+    Ok(())
+}
+
+fn test_matmul_mv(device: &Device, dtype: GgmlDType) -> Result<()> {
+    // m == 1 routes the Metal backend through the matvec kernels, which cover
+    // a fixed number of output rows per threadgroup (8, 4 or 2 depending on
+    // the format); n values around each tile boundary exercise the tail
+    // threadgroups. Compared against the dequantized weights. Positive values
+    // only: with zero-mean data the products cancel and the CPU backend's
+    // activation-quantization noise dominates the near-zero results.
+    let k = 512;
+    for n in [1, 3, 5, 7, 8, 9, 15, 16, 17, 35, 4099] {
+        let weight = (0..(n * k))
+            .map(|v| ((v * 7919 + 4297) % 251) as f32 / 25.1)
+            .collect::<Vec<_>>();
+        let weight = Tensor::from_vec(weight, (n, k), device)?;
+        let qtensor = quantized::QTensor::quantize(&weight, dtype)?;
+        let deq = qtensor.dequantize(device)?;
+        let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+
+        let lhs = (0..(3 * k))
+            .map(|v| ((v * 101 + 8837) % 239) as f32 / 23.9)
+            .collect::<Vec<_>>();
+        let lhs = Tensor::from_vec(lhs, (3, k), device)?;
+        let reference = lhs.matmul(&deq.t()?)?;
+
+        // A single row with a nonzero storage offset, then the rank-3 batched
+        // shape that dispatches one matvec per batch entry.
+        let row1 = matmul.forward(&lhs.narrow(0, 1, 1)?)?;
+        assert_mv_close(&row1, &reference.narrow(0, 1, 1)?, dtype, n)?;
+        let rows = matmul.forward(&lhs.reshape((3, 1, k))?)?;
+        assert_mv_close(&rows, &reference.reshape((3, 1, n))?, dtype, n)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "metal")]
 #[test]
 fn test_matmul_mm() -> Result<()> {
@@ -1325,6 +1373,88 @@ quantized_matmul!(
     quantized_matmul_q8k_cuda,
     quantized_matmul_q8k_metal,
     GgmlDType::Q8K
+);
+
+#[macro_export]
+macro_rules! quantized_matmul_mv {
+    ($fn_name: ident, $fn_name_cpu: ident, $fn_name_cuda: ident, $fn_name_metal: ident, $dtype: expr) => {
+        fn $fn_name(device: &Device) -> Result<()> {
+            test_matmul_mv(device, $dtype)
+        }
+
+        test_device!($fn_name, $fn_name_cpu, $fn_name_cuda, $fn_name_metal);
+    };
+}
+
+quantized_matmul_mv!(
+    quantized_matmul_mv_q4_0,
+    quantized_matmul_mv_q4_0_cpu,
+    quantized_matmul_mv_q4_0_cuda,
+    quantized_matmul_mv_q4_0_metal,
+    GgmlDType::Q4_0
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q4_1,
+    quantized_matmul_mv_q4_1_cpu,
+    quantized_matmul_mv_q4_1_cuda,
+    quantized_matmul_mv_q4_1_metal,
+    GgmlDType::Q4_1
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q5_0,
+    quantized_matmul_mv_q5_0_cpu,
+    quantized_matmul_mv_q5_0_cuda,
+    quantized_matmul_mv_q5_0_metal,
+    GgmlDType::Q5_0
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q5_1,
+    quantized_matmul_mv_q5_1_cpu,
+    quantized_matmul_mv_q5_1_cuda,
+    quantized_matmul_mv_q5_1_metal,
+    GgmlDType::Q5_1
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q8_0,
+    quantized_matmul_mv_q8_0_cpu,
+    quantized_matmul_mv_q8_0_cuda,
+    quantized_matmul_mv_q8_0_metal,
+    GgmlDType::Q8_0
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q2k,
+    quantized_matmul_mv_q2k_cpu,
+    quantized_matmul_mv_q2k_cuda,
+    quantized_matmul_mv_q2k_metal,
+    GgmlDType::Q2K
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q3k,
+    quantized_matmul_mv_q3k_cpu,
+    quantized_matmul_mv_q3k_cuda,
+    quantized_matmul_mv_q3k_metal,
+    GgmlDType::Q3K
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q4k,
+    quantized_matmul_mv_q4k_cpu,
+    quantized_matmul_mv_q4k_cuda,
+    quantized_matmul_mv_q4k_metal,
+    GgmlDType::Q4K
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q5k,
+    quantized_matmul_mv_q5k_cpu,
+    quantized_matmul_mv_q5k_cuda,
+    quantized_matmul_mv_q5k_metal,
+    GgmlDType::Q5K
+);
+quantized_matmul_mv!(
+    quantized_matmul_mv_q6k,
+    quantized_matmul_mv_q6k_cpu,
+    quantized_matmul_mv_q6k_cuda,
+    quantized_matmul_mv_q6k_metal,
+    GgmlDType::Q6K
 );
 
 #[test]

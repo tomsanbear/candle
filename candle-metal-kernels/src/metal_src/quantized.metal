@@ -2306,10 +2306,14 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
 #define N_DST 4        // each SIMD group works on 4 rows
 #define N_SIMDGROUP 2  // number of SIMD groups in a thread group
 //Note: This is a template, but strictly speaking it only applies to
-//      quantizations where the block size is 32. It also does not
-//      guard against the number of rows not being divisible by
-//      N_DST, so this is another explicit assumption of the implementation.
-template<typename block_q_type, int nr, int nsg, int nw>
+//      quantizations where the block size is 32. Each threadgroup covers
+//      nr*nsg dst rows and the host ceil-divides the grid over ne01, so the
+//      last threadgroup may have tail rows past ne01. The host dispatches
+//      the GUARDED variant only when such a tail exists: it clamps tail-row
+//      reads to the last valid row (keeping the row loops' trip counts
+//      compile-time constant so they unroll and sumf stays in registers)
+//      and the store discards them.
+template<typename block_q_type, int nr, int nsg, int nw, bool GUARDED = true>
 void mul_vec_q_n_f32_impl(
         device const void  * src0,
         device const float * src1,
@@ -2344,6 +2348,13 @@ void mul_vec_q_n_f32_impl(
     float yl[16]; // src1 vector cache
     float sumf[nr] = {0.f};
 
+    // Block offset of each row; when guarded, tail rows clamp to the last
+    // valid row.
+    int rd[nr];
+    for (int row = 0; row < nr; ++row) {
+        rd[row] = GUARDED ? (min(first_row + row, (int)ne01 - 1) - first_row) * nb : row * nb;
+    }
+
     const int ix = (tiisg/2);
     const int il = (tiisg%2)*8;
 
@@ -2363,7 +2374,7 @@ void mul_vec_q_n_f32_impl(
         }
 
         for (int row = 0; row < nr; row++) {
-            sumf[row] += block_q_n_dot_y(x+ib+row*nb, sumy, yl, il);
+            sumf[row] += block_q_n_dot_y(x+ib+rd[row], sumy, yl, il);
         }
 
         yb += QK4_0 * 16;
@@ -2377,7 +2388,8 @@ void mul_vec_q_n_f32_impl(
     }
 }
 
-kernel void kernel_mul_mv_q4_0_f32(
+template<typename block_q_type, bool GUARDED>
+kernel void kernel_mul_mv_q_n_f32(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -2400,91 +2412,25 @@ kernel void kernel_mul_mv_q4_0_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
-    mul_vec_q_n_f32_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+    mul_vec_q_n_f32_impl<block_q_type, N_DST, N_SIMDGROUP, N_SIMDWIDTH, GUARDED>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
 
-kernel void kernel_mul_mv_q4_1_f32(
-        device const  void * src0,
-        device const float * src1,
-        device       float * dst,
-        constant   int64_t & ne00,
-        constant   int64_t & ne01,
-        constant   int64_t & ne02,
-        constant  uint64_t & nb00,
-        constant  uint64_t & nb01,
-        constant  uint64_t & nb02,
-        constant   int64_t & ne10,
-        constant   int64_t & ne11,
-        constant   int64_t & ne12,
-        constant  uint64_t & nb10,
-        constant  uint64_t & nb11,
-        constant  uint64_t & nb12,
-        constant   int64_t & ne0,
-        constant   int64_t & ne1,
-        constant   uint    & r2,
-        constant   uint    & r3,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint tiisg[[thread_index_in_simdgroup]],
-        uint sgitg[[simdgroup_index_in_threadgroup]]) {
-     mul_vec_q_n_f32_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
-}
+typedef decltype(kernel_mul_mv_q_n_f32<block_q4_0, true>) mul_mv_q_n_f32_t;
 
-kernel void kernel_mul_mv_q5_0_f32(
-        device const  void * src0,
-        device const float * src1,
-        device       float * dst,
-        constant   int64_t & ne00,
-        constant   int64_t & ne01,
-        constant   int64_t & ne02,
-        constant  uint64_t & nb00,
-        constant  uint64_t & nb01,
-        constant  uint64_t & nb02,
-        constant   int64_t & ne10,
-        constant   int64_t & ne11,
-        constant   int64_t & ne12,
-        constant  uint64_t & nb10,
-        constant  uint64_t & nb11,
-        constant  uint64_t & nb12,
-        constant   int64_t & ne0,
-        constant   int64_t & ne1,
-        constant   uint    & r2,
-        constant   uint    & r3,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
-    mul_vec_q_n_f32_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
-}
-
-kernel void kernel_mul_mv_q5_1_f32(
-        device const  void * src0,
-        device const float * src1,
-        device       float * dst,
-        constant   int64_t & ne00,
-        constant   int64_t & ne01,
-        constant   int64_t & ne02,
-        constant  uint64_t & nb00,
-        constant  uint64_t & nb01,
-        constant  uint64_t & nb02,
-        constant   int64_t & ne10,
-        constant   int64_t & ne11,
-        constant   int64_t & ne12,
-        constant  uint64_t & nb10,
-        constant  uint64_t & nb11,
-        constant  uint64_t & nb12,
-        constant   int64_t & ne0,
-        constant   int64_t & ne1,
-        constant   uint    & r2,
-        constant   uint    & r3,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint  tiisg[[thread_index_in_simdgroup]],
-        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
-    mul_vec_q_n_f32_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
-}
+template [[host_name("kernel_mul_mv_q4_0_f32")]]         kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q4_0, false>;
+template [[host_name("kernel_mul_mv_q4_0_f32_guarded")]] kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q4_0, true>;
+template [[host_name("kernel_mul_mv_q4_1_f32")]]         kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q4_1, false>;
+template [[host_name("kernel_mul_mv_q4_1_f32_guarded")]] kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q4_1, true>;
+template [[host_name("kernel_mul_mv_q5_0_f32")]]         kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q5_0, false>;
+template [[host_name("kernel_mul_mv_q5_0_f32_guarded")]] kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q5_0, true>;
+template [[host_name("kernel_mul_mv_q5_1_f32")]]         kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q5_1, false>;
+template [[host_name("kernel_mul_mv_q5_1_f32_guarded")]] kernel mul_mv_q_n_f32_t kernel_mul_mv_q_n_f32<block_q5_1, true>;
 
 
 #define NB_Q8_0 8
 
-void kernel_mul_mv_q8_0_f32_impl(
+template <bool GUARDED>
+void kernel_mul_mv_q8_0_f32_impl_t(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -2523,6 +2469,13 @@ void kernel_mul_mv_q8_0_f32_impl(
     float yl[NB_Q8_0];
     float sumf[nr]={0.f};
 
+    // Block offset of each row; when guarded, tail rows clamp to the last
+    // valid row.
+    int rd[nr];
+    for (int row = 0; row < nr; ++row) {
+        rd[row] = GUARDED ? (min(first_row + row, (int)ne01 - 1) - first_row) * nb : row * nb;
+    }
+
     const int ix = tiisg/4;
     const int il = tiisg%4;
 
@@ -2535,12 +2488,12 @@ void kernel_mul_mv_q8_0_f32_impl(
         }
 
         for (int row = 0; row < nr; row++) {
-            device const int8_t * qs = x[ib+row*nb].qs + NB_Q8_0*il;
+            device const int8_t * qs = x[ib+rd[row]].qs + NB_Q8_0*il;
             float sumq = 0.f;
             for (int iq = 0; iq < NB_Q8_0; ++iq) {
                 sumq += qs[iq] * yl[iq];
             }
-            sumf[row] += sumq*x[ib+row*nb].d;
+            sumf[row] += sumq*x[ib+rd[row]].d;
         }
 
         yb += NB_Q8_0 * nw;
@@ -2554,7 +2507,27 @@ void kernel_mul_mv_q8_0_f32_impl(
     }
 }
 
-[[host_name("kernel_mul_mv_q8_0_f32")]]
+void kernel_mul_mv_q8_0_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q8_0_f32_impl_t<true>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,shared_values,tgpig,tiisg,sgitg);
+}
+
+template <bool GUARDED>
 kernel void kernel_mul_mv_q8_0_f32(
         device const  void * src0,
         device const float * src1,
@@ -2578,8 +2551,13 @@ kernel void kernel_mul_mv_q8_0_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+    kernel_mul_mv_q8_0_f32_impl_t<GUARDED>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
 }
+
+typedef decltype(kernel_mul_mv_q8_0_f32<true>) mul_mv_q8_0_f32_t;
+
+template [[host_name("kernel_mul_mv_q8_0_f32")]]         kernel mul_mv_q8_0_f32_t kernel_mul_mv_q8_0_f32<false>;
+template [[host_name("kernel_mul_mv_q8_0_f32_guarded")]] kernel mul_mv_q8_0_f32_t kernel_mul_mv_q8_0_f32<true>;
 
 #define N_MV_T_T 4
 
@@ -4570,7 +4548,8 @@ kernel void kernel_concat(
     }
 }
 
-void kernel_mul_mv_q2_K_f32_impl(
+template <bool GUARDED>
+void kernel_mul_mv_q2_K_f32_impl_t(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -4609,6 +4588,15 @@ void kernel_mul_mv_q2_K_f32_impl(
 
     const int step = sizeof(block_q2_K) * nb;
 
+    // Element offset of each row; when guarded, tail rows clamp to the last
+    // valid row. Computed once here so the row loops only add.
+    int rs1[N_DST], rs2[N_DST];
+    for (int row = 0; row < N_DST; ++row) {
+        const int rc = GUARDED ? min(first_row + row, (int)ne01 - 1) - first_row : row;
+        rs1[row] = rc*step;
+        rs2[row] = rc*(step/2);
+    }
+
     const int ix = tiisg/8;  // 0...3
     const int it = tiisg%8;  // 0...7
     const int iq = it/4;     // 0 or 1
@@ -4627,11 +4615,14 @@ void kernel_mul_mv_q2_K_f32_impl(
             yl[i+24] = y4[i+96]; sumy[3] += yl[i+24];
         }
 
-        device const uint8_t  * sc = (device const uint8_t  *)x[ib].scales + 8*iq + is;
-        device const uint16_t * qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
-        device const half     * dh = &x[ib].d;
+        device const uint8_t  * sc_b = (device const uint8_t  *)x[ib].scales + 8*iq + is;
+        device const uint16_t * qs_b = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh_b = &x[ib].d;
 
         for (int row = 0; row < N_DST; row++) {
+            device const uint8_t  * sc = sc_b + rs1[row];
+            device const uint16_t * qs = qs_b + rs2[row];
+            device const half     * dh = dh_b + rs2[row];
 
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
@@ -4652,10 +4643,6 @@ void kernel_mul_mv_q2_K_f32_impl(
                                  (acc1[2] + 1.f/256.f * acc2[2]) * (sc[4] & 0xF) * 1.f/16.f +
                                  (acc1[3] + 1.f/256.f * acc2[3]) * (sc[6] & 0xF) * 1.f/64.f) -
                          dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) + sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
-
-            qs += step/2;
-            sc += step;
-            dh += step/2;
         }
 
         y4 += 4 * QK_K;
@@ -4663,13 +4650,33 @@ void kernel_mul_mv_q2_K_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && (!GUARDED || first_row + row < ne01)) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
 }
 
-[[host_name("kernel_mul_mv_q2_K_f32")]]
+void kernel_mul_mv_q2_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q2_K_f32_impl_t<true>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+template <bool GUARDED>
 kernel void kernel_mul_mv_q2_K_f32(
         device const  void * src0,
         device const float * src1,
@@ -4694,10 +4701,16 @@ kernel void kernel_mul_mv_q2_K_f32(
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q2_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q2_K_f32_impl_t<GUARDED>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q3_K_f32_impl(
+typedef decltype(kernel_mul_mv_q2_K_f32<true>) mul_mv_q2_K_f32_t;
+
+template [[host_name("kernel_mul_mv_q2_K_f32")]]         kernel mul_mv_q2_K_f32_t kernel_mul_mv_q2_K_f32<false>;
+template [[host_name("kernel_mul_mv_q2_K_f32_guarded")]] kernel mul_mv_q2_K_f32_t kernel_mul_mv_q2_K_f32<true>;
+
+template <bool GUARDED>
+void kernel_mul_mv_q3_K_f32_impl_t(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -4722,13 +4735,17 @@ void kernel_mul_mv_q3_K_f32_impl(
     const int64_t im = tgpig.z;
 
     const int first_row = (r0 * N_SIMDGROUP + sgitg) * 2;
+    // Tail rows clamp onto the last valid row (base and per-row march stay
+    // in bounds); the guarded store discards their duplicate sums.
+    const int first_row_c = GUARDED ? min(first_row, (int)ne01 - 1) : first_row;
+    const int row_adv = GUARDED ? min(first_row + 1, (int)ne01 - 1) - first_row_c : 1;
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
-    device const block_q3_K * x = (device const block_q3_K *) src0 + first_row*nb + offset0;
+    device const block_q3_K * x = (device const block_q3_K *) src0 + first_row_c*nb + offset0;
     device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
@@ -4769,7 +4786,7 @@ void kernel_mul_mv_q3_K_f32_impl(
     const int q_offset = 32*ip + l0;
     const int y_offset = 128*ip + 32*il + l0;
 
-    const int step = sizeof(block_q3_K) * nb / 2;
+    const int step = row_adv * (int)(sizeof(block_q3_K) * nb / 2);
 
     device const float * y1 = yy + ix*QK_K + y_offset;
 
@@ -4851,13 +4868,72 @@ void kernel_mul_mv_q3_K_f32_impl(
     }
     if (tiisg == 0) {
         for (int row = 0; row < 2; ++row) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = sumf1[row];
+            if (!GUARDED || first_row + row < ne01) {
+                dst[r1*ne0 + im*ne0*ne1 + first_row + row] = sumf1[row];
+            }
         }
     }
 }
 
+// See kernel_mul_mv_q5_K_f32_impl: only the tail simdgroup pays for the
+// clamping.
+void kernel_mul_mv_q3_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    const int first_row = ((int)tgpig.x * N_SIMDGROUP + (int)sgitg) * 2;
+    if (first_row + 2 <= ne01) {
+        kernel_mul_mv_q3_K_f32_impl_t<false>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_q3_K_f32_impl_t<true>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+    }
+}
+
+// The unguarded pipeline skips even the per-simdgroup dispatch; the guarded
+// one keeps it so a tail dispatch only pays in its tail simdgroup.
 [[host_name("kernel_mul_mv_q3_K_f32")]]
 kernel void kernel_mul_mv_q3_K_f32(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q3_K_f32_impl_t<false>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q3_K_f32_guarded")]]
+kernel void kernel_mul_mv_q3_K_f32_guarded(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -4884,7 +4960,8 @@ kernel void kernel_mul_mv_q3_K_f32(
     kernel_mul_mv_q3_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q4_K_f32_impl(
+template <bool GUARDED>
+void kernel_mul_mv_q4_K_f32_impl_t(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -4938,6 +5015,13 @@ void kernel_mul_mv_q4_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
+    // Element offset of each row; when guarded, tail rows clamp to the last
+    // valid row. Computed once here so the row loop only adds.
+    int rs[N_DST];
+    for (int row = 0; row < N_DST; ++row) {
+        rs[row] = GUARDED ? (min(first_row + row, (int)ne01 - 1) - first_row) * step : row * step;
+    }
+
     for (int ib = ix; ib < nb; ib += 4) {
 
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
@@ -4948,11 +5032,14 @@ void kernel_mul_mv_q4_K_f32_impl(
             yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
         }
 
-        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
-        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
-        device const half     * dh = &x[ib].d;
+        device const uint16_t * sc_b = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t * q1_b = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh_b = &x[ib].d;
 
         for (int row = 0; row < N_DST; row++) {
+            device const uint16_t * sc = sc_b + rs[row];
+            device const uint16_t * q1 = q1_b + rs[row];
+            device const half     * dh = dh_b + rs[row];
 
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
@@ -4981,10 +5068,6 @@ void kernel_mul_mv_q4_K_f32_impl(
                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
                          dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-
-            q1 += step;
-            sc += step;
-            dh += step;
         }
 
         y4 += 4 * QK_K;
@@ -4992,13 +5075,33 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && (!GUARDED || first_row + row < ne01)) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
 }
 
-[[host_name("kernel_mul_mv_q4_K_f32")]]
+void kernel_mul_mv_q4_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q4_K_f32_impl_t<true>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+template <bool GUARDED>
 kernel void kernel_mul_mv_q4_K_f32(
         device const  void * src0,
         device const float * src1,
@@ -5023,10 +5126,16 @@ kernel void kernel_mul_mv_q4_K_f32(
         uint tiisg[[thread_index_in_simdgroup]],
         uint sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q4_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_K_f32_impl_t<GUARDED>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q5_K_f32_impl(
+typedef decltype(kernel_mul_mv_q4_K_f32<true>) mul_mv_q4_K_f32_t;
+
+template [[host_name("kernel_mul_mv_q4_K_f32")]]         kernel mul_mv_q4_K_f32_t kernel_mul_mv_q4_K_f32<false>;
+template [[host_name("kernel_mul_mv_q4_K_f32_guarded")]] kernel mul_mv_q4_K_f32_t kernel_mul_mv_q4_K_f32<true>;
+
+template <bool GUARDED>
+void kernel_mul_mv_q5_K_f32_impl_t(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -5051,18 +5160,22 @@ void kernel_mul_mv_q5_K_f32_impl(
     const int im = tgpig.z;
 
     const int first_row = (r0 * N_SIMDGROUP + sgitg) * 2;
+    // Tail rows clamp onto the last valid row (base and per-row march stay
+    // in bounds); the guarded store discards their duplicate sums.
+    const int first_row_c = GUARDED ? min(first_row, (int)ne01 - 1) : first_row;
+    const int row_adv = GUARDED ? min(first_row + 1, (int)ne01 - 1) - first_row_c : 1;
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
-    device const block_q5_K * x = (device const block_q5_K *) src0 + first_row*nb + offset0;
+    device const block_q5_K * x = (device const block_q5_K *) src0 + first_row_c*nb + offset0;
     device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float sumf[2]={0.f};
 
-    const int step = sizeof(block_q5_K) * nb;
+    const int step = row_adv * (int)(sizeof(block_q5_K) * nb);
 
     float yl[16], yh[16];
 
@@ -5149,9 +5262,37 @@ void kernel_mul_mv_q5_K_f32_impl(
 
     for (int row = 0; row < 2; ++row) {
         const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && (!GUARDED || first_row + row < ne01)) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = tot;
         }
+    }
+}
+
+// Simdgroups whose rows all fit take the unguarded specialization; only the
+// tail simdgroup pays for the clamping (the guarded march stride is not
+// uniform across threadgroups, so full simdgroups must avoid it).
+void kernel_mul_mv_q5_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    const int first_row = ((int)tgpig.x * N_SIMDGROUP + (int)sgitg) * 2;
+    if (first_row + 2 <= ne01) {
+        kernel_mul_mv_q5_K_f32_impl_t<false>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_q5_K_f32_impl_t<true>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
     }
 }
 
@@ -5183,7 +5324,11 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q6_K_f32_impl(
+// The clamp sits in the address path of every weight load (one row per
+// simdgroup), so the host dispatches the unguarded specialization whenever
+// ne01 is even (no tail simdgroup exists).
+template <bool GUARDED>
+void kernel_mul_mv_q6_K_f32_impl_t(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
@@ -5213,13 +5358,16 @@ void kernel_mul_mv_q6_K_f32_impl(
     const int     im = tgpig.z;
 
     const int row = 2 * r0 + sgitg;
+    // Tail rows clamp their reads onto the last valid row; the guarded store
+    // discards the duplicate sum.
+    const int row_c = GUARDED ? min(row, (int)ne01 - 1) : row;
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
-    device const block_q6_K * x = (device const block_q6_K *) src0 + row * nb + offset0;
+    device const block_q6_K * x = (device const block_q6_K *) src0 + row_c * nb + offset0;
     device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float sumf = 0;
@@ -5260,9 +5408,29 @@ void kernel_mul_mv_q6_K_f32_impl(
     }
 
     const float tot = simd_sum(sumf);
-    if (tiisg == 0) {
+    if (tiisg == 0 && (!GUARDED || row < ne01)) {
         dst[r1*ne0 + im*ne0*ne1 + row] = tot;
     }
+}
+
+void kernel_mul_mv_q6_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q6_K_f32_impl_t<true>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q6_K_f32")]]
@@ -5290,7 +5458,35 @@ kernel void kernel_mul_mv_q6_K_f32(
         uint  tiisg[[thread_index_in_simdgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q6_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q6_K_f32_impl_t<false>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q6_K_f32_guarded")]]
+kernel void kernel_mul_mv_q6_K_f32_guarded(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q6_K_f32_impl_t<true>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
 // ======================= "True" 2-bit
@@ -5363,7 +5559,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         device const uint16_t * q2 = xr->qs + 4 * ib;
         device const half * dh = &xr->d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
 
             const float db = dh[0];
             device const uint8_t * aux8 = (device const uint8_t *)q2;
@@ -5387,7 +5583,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
@@ -5493,7 +5689,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         device const uint8_t  * sc = xr->scales + ib;
         device const half * dh = &xr->d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
 
             const float db = dh[0];
             const uint8_t ls1 = sc[0] & 0xf;
@@ -5526,7 +5722,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
@@ -5632,7 +5828,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
         device const uint16_t * gas = (device const uint16_t *)(xr->qs + QK_K/4) + 2 * ib;
         device const half * dh = &xr->d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
 
             const float db = dh[0];
             const uint32_t aux32 = gas[0] | (gas[1] << 16);
@@ -5658,7 +5854,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.5f;
@@ -5762,7 +5958,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
         device const uint8_t * signs = xr->signs + 4 * ib;
         device const half * dh = &xr->d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
 
             const float db = dh[0];
             const float d = db * (1 + 2*((sc[0] >> 4*(ib%2)) & 0xf));
@@ -5790,7 +5986,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
@@ -5894,7 +6090,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
         device const uint8_t * signs = qs + QK_K/8;
         device const half * dh = &xr->d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
 
             const float db = dh[0];
             const float d1 = db * (0.5f + (sc[0] & 0xf));
@@ -5923,7 +6119,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
@@ -6018,7 +6214,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
         device const uint16_t * qh = xr->qh + ib;
         device const half     * dh = &xr->d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
 
             constant uint8_t * grid1 = (constant uint8_t *)(iq1s_grid_gpu + (qs[0] | ((qh[0] << 8) & 0x700)));
             constant uint8_t * grid2 = (constant uint8_t *)(iq1s_grid_gpu + (qs[1] | ((qh[0] << 5) & 0x700)));
@@ -6042,7 +6238,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
@@ -6112,7 +6308,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
         device const uint8_t  * qh = xr->qh + 2 * ib;
         device const uint16_t * sc = (device const uint16_t *)xr->scales;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
             scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
 
             constant uint8_t * grid1 = (constant uint8_t *)(iq1s_grid_gpu + (qs[0] | ((qh[0] << 8) & 0x700)));
@@ -6141,7 +6337,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
         y4 += 32 * 32;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
@@ -6299,7 +6495,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
         device const float4 * y4 = (device const float4 *)yb;
         yl[0] = y4[0]; yl[1] = y4[4]; yl[2] = y4[1]; yl[3] = y4[5];
 
-        for (int row = 0; row < 2; ++row) {
+        for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
 
             device const block_iq4_xs & xb = x[row*nb + ibl];
             device const uint32_t * q4 = (device const uint32_t *)(xb.qs + 16*ib + 8*il);
@@ -6330,7 +6526,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
         yb += 2 * QK_K;
     }
 
-    for (int row = 0; row < 2; ++row) {
+    for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;

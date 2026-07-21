@@ -43,102 +43,68 @@ pub fn call_quantized_matmul_mv_t(
     let ne02 = b as i64;
     let ne03 = 1i64;
 
-    let nb00 = 0i64;
-    let nb01 = 0i64;
-    let nb02 = 0i64;
-
     let ne10 = k as i64;
     let ne11 = m as i64;
     let ne12 = b as i64;
     let ne13 = 1i64;
-
-    let nb10 = 0i64;
-    let nb11 = 0i64;
-    let nb12 = 0i64;
 
     let ne0 = n as i64;
     let ne1 = m as i64;
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
 
-    let (nth0, nth1, align) = match dtype {
-        GgmlDType::Q4_0
-        | GgmlDType::Q4_1
-        | GgmlDType::Q5_0
-        | GgmlDType::Q5_1
-        | GgmlDType::Q8_0
-        | GgmlDType::Q8_1 => {
-            let nth0 = 8;
-            let nth1 = 8;
-            let align = 8;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q2K => {
-            // Fixing a bug in Metal for GGML
-            // https://github.com/ggerganov/llama.cpp/blob/b8109bc0139f15a5b321909f47510b89dca47ffc/ggml-metal.m#L1576
-            let nth0 = 2;
-            let nth1 = 32;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q4K => {
-            let nth0 = 4;
-            let nth1 = 8;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q3K | GgmlDType::Q5K => {
-            let nth0 = 2;
-            let nth1 = 32;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q6K => {
-            let nth0 = 2;
-            let nth1 = 32;
-            let align = 2;
-            (nth0, nth1, align)
-        }
-        GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => {
-            // Original implem uses rows
-            let nth0 = 32;
-            let nth1 = 1;
-            let align = 8;
-            (nth0, nth1, align)
-        }
-        GgmlDType::F32 => {
-            let nth0 = 32;
-            let nth1 = 1;
-            let align = 8;
-            (nth0, nth1, align)
-        }
+    // `align` must equal the number of dst rows each threadgroup of the
+    // kernel covers: the grid is ceil-divided over ne01, so a non-divisible
+    // row count leaves a tail threadgroup that must not touch rows past ne01.
+    // The unguarded kernels assume no such tail exists; the `_guarded`
+    // variants clamp tail-row reads and guard tail stores. The dense f16/f32
+    // kernel covers one row per threadgroup so it has no tail. `ny` is the
+    // number of src1 rows the kernel covers per threadgroup in grid y.
+    let (name, guarded_name, nth0, nth1, align, ny) = match dtype {
+        GgmlDType::Q4_0 => ("kernel_mul_mv_q4_0_f32", "kernel_mul_mv_q4_0_f32_guarded", 8, 8, 8, 1),
+        GgmlDType::Q4_1 => ("kernel_mul_mv_q4_1_f32", "kernel_mul_mv_q4_1_f32_guarded", 8, 8, 8, 1),
+        GgmlDType::Q5_0 => ("kernel_mul_mv_q5_0_f32", "kernel_mul_mv_q5_0_f32_guarded", 8, 8, 8, 1),
+        GgmlDType::Q5_1 => ("kernel_mul_mv_q5_1_f32", "kernel_mul_mv_q5_1_f32_guarded", 8, 8, 8, 1),
+        GgmlDType::Q8_0 => ("kernel_mul_mv_q8_0_f32", "kernel_mul_mv_q8_0_f32_guarded", 8, 8, 8, 1),
+        GgmlDType::Q2K => ("kernel_mul_mv_q2_K_f32", "kernel_mul_mv_q2_K_f32_guarded", 2, 32, 8, 1),
+        GgmlDType::Q3K => ("kernel_mul_mv_q3_K_f32", "kernel_mul_mv_q3_K_f32_guarded", 2, 32, 4, 1),
+        GgmlDType::Q4K => ("kernel_mul_mv_q4_K_f32", "kernel_mul_mv_q4_K_f32_guarded", 4, 8, 4, 1),
+        // q5_K guards per simdgroup in-kernel, so one pipeline serves both.
+        GgmlDType::Q5K => ("kernel_mul_mv_q5_K_f32", "kernel_mul_mv_q5_K_f32", 2, 32, 4, 1),
+        GgmlDType::Q6K => ("kernel_mul_mv_q6_K_f32", "kernel_mul_mv_q6_K_f32_guarded", 2, 32, 2, 1),
+        GgmlDType::F16 => ("kernel_mul_mv_f16_f32", "kernel_mul_mv_f16_f32", 32, 1, 1, 4),
+        GgmlDType::F32 => ("kernel_mul_mv_f32_f32", "kernel_mul_mv_f32_f32", 32, 1, 1, 4),
+        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul_mv"))?,
+        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul_mv"))?,
+        GgmlDType::BF16 => Err(MetalKernelError::UnsupportedDTypeForOp("BF16", "qmatmul_mv"))?,
     };
+    let name = if n % align == 0 { name } else { guarded_name };
+
+    // The dense f16/f32 kernel addresses src0/src1 through these byte
+    // strides; the quantized kernels derive theirs from ne00/ne01 and
+    // ignore nb00..nb02.
+    let src0_elem_size = match dtype {
+        GgmlDType::F32 => 4i64,
+        GgmlDType::F16 => 2i64,
+        _ => 0i64,
+    };
+    let nb00 = src0_elem_size;
+    let nb01 = src0_elem_size * ne00;
+    let nb02 = src0_elem_size * ne00 * ne01;
+
+    let nb10 = 4i64;
+    let nb11 = nb10 * ne10;
+    let nb12 = nb11 * ne11;
+
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
-        height: ne11 as usize,
+        height: divide(ne11 as usize, ny),
         depth: (ne12 * ne13) as usize,
     };
     let threads_per_threadgroup = MTLSize {
         width: nth0,
         height: nth1,
         depth: 1,
-    };
-    let name = match dtype {
-        GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f32",
-        GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
-        GgmlDType::Q2K => "kernel_mul_mv_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mv_q3_K_f32",
-        GgmlDType::Q4K => "kernel_mul_mv_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mv_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
-        GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
-        GgmlDType::F16 => "kernel_mul_mv_f16_f32",
-        GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
-        GgmlDType::F32 => "kernel_mul_mv_f32_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

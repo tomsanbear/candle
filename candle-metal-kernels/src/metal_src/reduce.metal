@@ -1557,3 +1557,87 @@ impl_rms_norm(rmsnorm_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 #endif
+
+// Cumulative sum (inclusive scan) along the last dimension of a contiguous
+// tensor. One threadgroup owns one row and walks it in BLOCKSIZE tiles with
+// a running carry; within a tile the scan is two-level: a simd_shuffle_up
+// prefix scan per simdgroup, then a scan of the simdgroup totals.
+// Half-precision variants are deliberately absent, mirroring the CUDA
+// kernels: a running sum in f16/bf16 accumulates unacceptable error over
+// long rows.
+
+#if __METAL_VERSION__ >= 220
+METAL_FUNC int64_t simd_shuffle_up(int64_t data, uint16_t delta) {
+  return as_type<int64_t>(simd_shuffle_up(as_type<uint2>(data), delta));
+}
+#endif
+
+template<typename T, ushort BLOCKSIZE>
+METAL_FUNC void cumsum_last_dim(
+    constant size_t &last_dim,
+    device const T *src,
+    device T *dst,
+    threadgroup T shared[BLOCKSIZE / 32],
+    uint row,
+    ushort tid,
+    ushort simd_lane,
+    ushort simd_group
+) {
+    constexpr ushort NSIMD = BLOCKSIZE / 32;
+    const size_t base = size_t(row) * last_dim;
+    T carry = T(0);
+    for (size_t tile = 0; tile < last_dim; tile += BLOCKSIZE) {
+        const size_t i = tile + tid;
+        T v = i < last_dim ? src[base + i] : T(0);
+        #pragma clang loop unroll(full)
+        for (ushort d = 1; d < 32; d <<= 1) {
+            T other = simd_shuffle_up(v, d);
+            if (simd_lane >= d) v += other;
+        }
+        if (simd_lane == 31) {
+            shared[simd_group] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            T sv = simd_lane < NSIMD ? shared[simd_lane] : T(0);
+            #pragma clang loop unroll(full)
+            for (ushort d = 1; d < NSIMD; d <<= 1) {
+                T other = simd_shuffle_up(sv, d);
+                if (simd_lane >= d) sv += other;
+            }
+            if (simd_lane < NSIMD) {
+                shared[simd_lane] = sv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        v += carry + (simd_group > 0 ? shared[simd_group - 1] : T(0));
+        if (i < last_dim) {
+            dst[base + i] = v;
+        }
+        // Every thread reads the same full-tile total, keeping `carry`
+        // uniform across the threadgroup.
+        carry += shared[NSIMD - 1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+#define impl_cumsum(NAME, T)                                    \
+kernel void NAME(                                               \
+    constant size_t &last_dim,                                  \
+    device const T *src,                                        \
+    device T *dst,                                              \
+    uint row [[ threadgroup_position_in_grid ]],                \
+    ushort tid [[ thread_index_in_threadgroup ]],               \
+    ushort simd_lane [[ thread_index_in_simdgroup ]],           \
+    ushort simd_group [[ simdgroup_index_in_threadgroup ]]      \
+) {                                                             \
+    threadgroup T shared[32];                                   \
+    cumsum_last_dim<T, 1024>(                                   \
+        last_dim, src, dst, shared, row, tid, simd_lane, simd_group); \
+}
+
+impl_cumsum(cumsum_f32, float)
+impl_cumsum(cumsum_u32, uint)
+#if __METAL_VERSION__ >= 220
+impl_cumsum(cumsum_i64, int64_t)
+#endif

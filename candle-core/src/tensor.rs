@@ -2857,6 +2857,20 @@ impl Tensor {
             let t = t.apply_op1(crate::cumsum::Cumsum::new(last))?;
             return t.transpose(dim, last);
         }
+        #[cfg(feature = "metal")]
+        if matches!(&*self.storage(), Storage::Metal(_))
+            && crate::cumsum::Cumsum::is_metal_dtype_supported(self.dtype())
+        {
+            let last = rank - 1;
+            if dim == last {
+                return self
+                    .contiguous()?
+                    .apply_op1(crate::cumsum::Cumsum::new(dim));
+            }
+            let t = self.transpose(dim, last)?.contiguous()?;
+            let t = t.apply_op1(crate::cumsum::Cumsum::new(last))?;
+            return t.transpose(dim, last);
+        }
         let n_axis = self.dim(dim)?;
         let triu = Tensor::triu2(n_axis, self.dtype(), self.device())?;
         if rank == 1 {

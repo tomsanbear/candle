@@ -16,6 +16,14 @@ impl Cumsum {
         matches!(dtype, DType::F32 | DType::F64 | DType::U32 | DType::I64)
     }
 
+    // Mirrors the CUDA set minus f64 (no double on Metal); half precision is
+    // deliberately excluded on both backends since a running sum in f16/bf16
+    // accumulates unacceptable error over long rows.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    pub(crate) fn is_metal_dtype_supported(dtype: DType) -> bool {
+        matches!(dtype, DType::F32 | DType::U32 | DType::I64)
+    }
+
     pub(crate) fn is_supported(t: &Tensor, dim: usize) -> bool {
         #[cfg(not(feature = "cuda"))]
         let _ = dim;
@@ -39,6 +47,16 @@ impl Cumsum {
             }
             #[cfg(not(feature = "cuda"))]
             Storage::Cuda(_) => false,
+            // Same contract as the CUDA kernels: contiguous, last dim.
+            #[cfg(feature = "metal")]
+            Storage::Metal(_) => {
+                Self::is_metal_dtype_supported(t.dtype())
+                    && t.is_contiguous()
+                    && dim + 1 == t.rank()
+                    && t.shape().elem_count() > 0
+                    && t.dims().last().copied().unwrap_or(0) > 0
+            }
+            #[cfg(not(feature = "metal"))]
             Storage::Metal(_) => false,
         }
     }
@@ -300,6 +318,55 @@ impl crate::CustomOp1 for Cumsum {
             slice,
             device: dev.clone(),
         };
+        Ok((dst, layout.shape().clone()))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        storage: &crate::MetalStorage,
+        layout: &Layout,
+    ) -> Result<(crate::MetalStorage, Shape)> {
+        use crate::backend::BackendStorage;
+
+        if !layout.is_contiguous() {
+            return Err(crate::Error::RequiresContiguous { op: "cumsum" }.bt());
+        }
+        if self.dim + 1 != layout.dims().len() {
+            crate::bail!("metal cumsum only supports the last dimension")
+        }
+        let kernel_name = match storage.dtype() {
+            DType::F32 => "cumsum_f32",
+            DType::U32 => "cumsum_u32",
+            DType::I64 => "cumsum_i64",
+            dtype => return Err(crate::Error::UnsupportedDTypeForOp(dtype, "cumsum").bt()),
+        };
+        let device = storage.device();
+        let elem_count = layout.shape().elem_count();
+        let last_dim = layout.dims().last().copied().unwrap_or(1);
+        let rows = elem_count / last_dim;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, storage.dtype())
+            .with_label("cumsum")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        let src = candle_metal_kernels::BufferOffset {
+            buffer: storage.buffer(),
+            offset_in_bytes: layout.start_offset() * storage.dtype().size_in_bytes(),
+        };
+        candle_metal_kernels::call_cumsum(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            kernel_name,
+            rows,
+            last_dim,
+            src,
+            &output,
+        )
+        .map_err(crate::Error::wrap)?;
+        let dst = crate::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((dst, layout.shape().clone()))
     }
 

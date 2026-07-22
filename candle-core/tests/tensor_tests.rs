@@ -2324,6 +2324,89 @@ fn cumsum_cuda_multi_block_large_last_dim() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "metal")]
+#[test]
+fn cumsum_metal_adapts_layouts() -> Result<()> {
+    let device = Device::new_metal(0)?;
+
+    let t = Tensor::arange(0f32, 12f32, &device)?.reshape((3, 4))?;
+    assert_eq!(
+        t.cumsum(0)?.to_vec2::<f32>()?,
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [4.0, 6.0, 8.0, 10.0],
+            [12.0, 15.0, 18.0, 21.0]
+        ]
+    );
+
+    let t = t.t()?;
+    assert_eq!(
+        t.cumsum(1)?.to_vec2::<f32>()?,
+        [
+            [0.0, 4.0, 12.0],
+            [1.0, 6.0, 15.0],
+            [2.0, 8.0, 18.0],
+            [3.0, 10.0, 21.0]
+        ]
+    );
+
+    let t = Tensor::arange(0f32, 20f32, &device)?.reshape((4, 5))?;
+    let t = t.narrow(1, 1, 3)?;
+    assert_eq!(
+        t.cumsum(1)?.to_vec2::<f32>()?,
+        [
+            [1.0, 3.0, 6.0],
+            [6.0, 13.0, 21.0],
+            [11.0, 23.0, 36.0],
+            [16.0, 33.0, 51.0]
+        ]
+    );
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn cumsum_metal_supported_dtypes() -> Result<()> {
+    let device = Device::new_metal(0)?;
+
+    let t = Tensor::new(&[[1u32, 2, 3], [4, 5, 6]], &device)?;
+    assert_eq!(t.cumsum(1)?.to_vec2::<u32>()?, [[1u32, 3, 6], [4, 9, 15]]);
+
+    let t = Tensor::new(&[[-3i64, 1, 4], [2, -5, 7]], &device)?;
+    assert_eq!(t.cumsum(1)?.to_vec2::<i64>()?, [[-3, -2, 2], [2, -3, 4]]);
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn cumsum_metal_large_last_dim() -> Result<()> {
+    let device = Device::new_metal(0)?;
+
+    // The motivating length: the triangular-matmul fallback would need a
+    // 102720^2 matrix (~42 GB as f32) and cannot even allocate on Metal.
+    let n = 102_720usize;
+    let t = Tensor::ones((2, n), DType::F32, &device)?;
+    let c = t.cumsum(1)?;
+    assert_eq!(c.i((0, 0))?.to_scalar::<f32>()?, 1.0);
+    assert_eq!(c.i((0, n - 1))?.to_scalar::<f32>()?, n as f32);
+    assert_eq!(c.i((1, n - 1))?.to_scalar::<f32>()?, n as f32);
+
+    // Non-uniform values across several 1024-wide tiles; the arange sum stays
+    // below 2^24 so f32 accumulation is exact.
+    let n = 5000usize;
+    let t = Tensor::arange(0f32, n as f32, &device)?;
+    let c = t.cumsum(0)?;
+    assert_eq!(
+        c.i(n - 1)?.to_scalar::<f32>()?,
+        (n * (n - 1) / 2) as f32
+    );
+
+    let t = Tensor::ones((3, 4097), DType::I64, &device)?;
+    let c = t.cumsum(1)?;
+    assert_eq!(c.i((2, 4096))?.to_scalar::<i64>()?, 4097);
+    Ok(())
+}
+
 /// A helper function for floating point comparison. Both a and b must be 1D Tensor and contains the same amount of data.
 /// Assertion passes if the difference of all pairs of a and b is smaller than epsilon.
 fn assert_close(a: &Tensor, b: &Tensor, epsilon: f64) -> Result<()> {

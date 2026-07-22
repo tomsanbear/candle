@@ -425,3 +425,40 @@ pub fn call_rope(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Inclusive scan along the last dimension of a contiguous `rows x last_dim`
+/// view. One threadgroup of 1024 threads walks each row (the kernel's
+/// BLOCKSIZE is fixed at 1024).
+#[allow(clippy::too_many_arguments)]
+pub fn call_cumsum(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    rows: usize,
+    last_dim: usize,
+    input: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "{kernel_name} rows={rows} n={last_dim}");
+
+    set_params!(encoder, (last_dim, &input, Output::new(output)));
+
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}

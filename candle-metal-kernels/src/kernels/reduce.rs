@@ -183,6 +183,18 @@ pub fn call_last_softmax(
 /// per-row kernels stay in place below it.
 const NORM_BATCHED_MIN_ROWS: usize = 32;
 
+/// Threadgroup geometry for the batched norm kernels: (threadgroups,
+/// threads per group). One simdgroup handles one row, so a group covers
+/// threads/32 rows. Wide rows use smaller groups: 32-row groups pack the
+/// cores too coarsely to hide the longer per-lane load chains (M3 Pro at
+/// 1024x1024 f32 measured 45% occupancy vs an 86% manager target — FORK.md
+/// batched-norm row has the receipts). Public so the norm_probe example
+/// dispatches exactly what production does.
+pub fn norm_batched_geometry(rows: usize, cols: usize) -> (usize, usize) {
+    let threads = if cols >= 1024 { 256 } else { 1024 };
+    (rows.div_ceil(threads / 32), threads)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_rms_norm(
     device: &Device,
@@ -226,14 +238,15 @@ pub fn call_rms_norm(
                     (alpha, alpha_offset)
                 )
             );
+            let (tgs, threads) = norm_batched_geometry(rows, elements_to_sum);
             encoder.dispatch_thread_groups(
                 MTLSize {
-                    width: rows.div_ceil(32),
+                    width: tgs,
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 1024,
+                    width: threads,
                     height: 1,
                     depth: 1,
                 },
@@ -334,14 +347,15 @@ pub fn call_layer_norm(
                 Some((beta, beta_offset)) => encoder.set_input_buffer(6, Some(beta), beta_offset),
                 None => encoder.set_input_buffer(6, None, 0),
             }
+            let (tgs, threads) = norm_batched_geometry(rows, elements_to_sum);
             encoder.dispatch_thread_groups(
                 MTLSize {
-                    width: rows.div_ceil(32),
+                    width: tgs,
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 1024,
+                    width: threads,
                     height: 1,
                     depth: 1,
                 },

@@ -87,14 +87,16 @@ impl Probe {
                 encoder.set_input_buffer(3, Some(&self.input), 0);
                 encoder.set_output_buffer(4, Some(&self.output), 0);
                 encoder.set_input_buffer(5, Some(&self.alpha), 0);
+                let (tgs, threads) =
+                    candle_metal_kernels::kernels::reduce::norm_batched_geometry(rows, cols);
                 encoder.dispatch_thread_groups(
                     MTLSize {
-                        width: rows.div_ceil(32),
+                        width: tgs,
                         height: 1,
                         depth: 1,
                     },
                     MTLSize {
-                        width: 1024,
+                        width: threads,
                         height: 1,
                         depth: 1,
                     },

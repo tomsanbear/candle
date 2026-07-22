@@ -1582,6 +1582,35 @@ METAL_FUNC void layer_norm_batched(
     device T *o = dst + (ulong)row * n_cols;
     float sum = 0.0f;
     float sumsq = 0.0f;
+    // See rms_norm_batched below for why the vectorized body exists.
+    if (n_cols % 4 == 0) {
+        const uint n4 = n_cols / 4;
+        device const vec<T, 4> *r4 = (device const vec<T, 4> *)r;
+        device const vec<T, 4> *a4 = (device const vec<T, 4> *)alpha;
+        device vec<T, 4> *o4 = (device vec<T, 4> *)o;
+        for (uint i = lane; i < n4; i += 32) {
+            float4 v = float4(r4[i]);
+            sum += (v.x + v.y) + (v.z + v.w);
+            sumsq += dot(v, v);
+        }
+        sum = simd_sum(sum);
+        sumsq = simd_sum(sumsq);
+        float mean = sum / float(n_cols);
+        float rstd = rsqrt(max(sumsq / float(n_cols) - mean * mean, 0.0f) + eps);
+        if (beta == nullptr) {
+            for (uint i = lane; i < n4; i += 32) {
+                float4 v = (float4(r4[i]) - mean) * rstd;
+                o4[i] = vec<T, 4>(v * float4(a4[i]));
+            }
+        } else {
+            device const vec<T, 4> *b4 = (device const vec<T, 4> *)beta;
+            for (uint i = lane; i < n4; i += 32) {
+                float4 v = (float4(r4[i]) - mean) * rstd;
+                o4[i] = vec<T, 4>(fma(v, float4(a4[i]), float4(b4[i])));
+            }
+        }
+        return;
+    }
     for (uint i = lane; i < n_cols; i += 32) {
         float v = float(r[i]);
         sum += v;
@@ -1619,6 +1648,26 @@ METAL_FUNC void rms_norm_batched(
     device const T *r = src + (ulong)row * n_cols;
     device T *o = dst + (ulong)row * n_cols;
     float sumsq = 0.0f;
+    // Vectorized body when rows are vec4-aligned (n_cols % 4 == 0 makes
+    // every contiguous row base so). The wide loads shorten each lane's
+    // serial load+fma chain 4x — wide rows leave too few threadgroups for
+    // occupancy to hide the latency of scalar chains (receipts in FORK.md).
+    if (n_cols % 4 == 0) {
+        const uint n4 = n_cols / 4;
+        device const vec<T, 4> *r4 = (device const vec<T, 4> *)r;
+        device const vec<T, 4> *a4 = (device const vec<T, 4> *)alpha;
+        device vec<T, 4> *o4 = (device vec<T, 4> *)o;
+        for (uint i = lane; i < n4; i += 32) {
+            float4 v = float4(r4[i]);
+            sumsq += dot(v, v);
+        }
+        sumsq = simd_sum(sumsq);
+        float total = rsqrt(sumsq / float(n_cols) + eps);
+        for (uint i = lane; i < n4; i += 32) {
+            o4[i] = vec<T, 4>(float4(r4[i]) * total * float4(a4[i]));
+        }
+        return;
+    }
     for (uint i = lane; i < n_cols; i += 32) {
         float v = float(r[i]);
         sumsq += v * v;
@@ -1640,12 +1689,13 @@ kernel void NAME(                                               \
     device const T *alpha,                                      \
     device const T *beta,                                       \
     uint tg_id [[ threadgroup_position_in_grid ]],              \
+    ushort sgs [[ simdgroups_per_threadgroup ]],                \
     ushort simd_group [[ simdgroup_index_in_threadgroup ]],     \
     ushort lane [[ thread_index_in_simdgroup ]]                 \
 ) {                                                             \
     layer_norm_batched<T>(                                      \
         n_rows, n_cols, eps, src, dst, alpha, beta,             \
-        tg_id * 32 + simd_group, lane);                         \
+        tg_id * sgs + simd_group, lane);                        \
 }
 
 #define impl_rms_norm_batched(NAME, T)                          \
@@ -1657,12 +1707,13 @@ kernel void NAME(                                               \
     device T *dst,                                              \
     device const T *alpha,                                      \
     uint tg_id [[ threadgroup_position_in_grid ]],              \
+    ushort sgs [[ simdgroups_per_threadgroup ]],                \
     ushort simd_group [[ simdgroup_index_in_threadgroup ]],     \
     ushort lane [[ thread_index_in_simdgroup ]]                 \
 ) {                                                             \
     rms_norm_batched<T>(                                        \
         n_rows, n_cols, eps, src, dst, alpha,                   \
-        tg_id * 32 + simd_group, lane);                         \
+        tg_id * sgs + simd_group, lane);                        \
 }
 
 impl_layer_norm_batched(layernorm_batched_f32, float)

@@ -55,7 +55,7 @@ All five 2026 PRs below are also carried on `tomsanbear-dev` (cherry-picked
 | cumsum: CustomOp CPU/CUDA (carried from open upstream #3700, authorship preserved) + Metal scan kernels | core/metal-kernels | 199e57b6 + metal arm | Incubating | tested (incl. 102720-length case that needed a ~42 GB triu alloc before; layout adaptation; u32/i64; autograd) | Metal arm: two-level simd_shuffle_up scan, one TG per row, tile loop with carry; f32/u32/i64 (halfs excluded like CUDA); if #3700 lands modified upstream, reconcile at next merge |
 | Fused no-bias layer-norm on all backends | candle-nn | phase-3 | Incubating | tested (parity vs slow path, cpu/cuda/metal) | the gate was `bias.is_some()` even though both GPU kernels already branch on a null beta — `layer_norm_no_bias` never reached a fused kernel; `call_layer_norm` beta is now `Option` |
 | Batched simdgroup-per-row layernorm/rmsnorm + rows>=32 heuristic | metal-kernels | phase-3 | **proven: m3 bench** — layer_norm 1024×512: 2.5–2.7× (43.9→17.6 µs f32); rms 1024×512: 1.5–1.6×; 1024×1024: 1.3–2.3×; rows=1 flat (heuristic keeps stock kernels) | ported from wolfrpsiw metal_fused.rs. **Known issue**: rms f32 at wide rows (1024 cols) measures −11% vs stock — accepted for now; to be fixed IN KERNEL (e.g. vectorized/multi-simdgroup loads for wide f32 rows), not by dispatch gating. Upstream posture: #3150 territory — take the receipts to an issue before PRing |
-| Fused GEMM/GEMV bias epilogue + `candle_nn::ops::matmul_bias` | metal-kernels/candle-nn | phase-4 | tested (steel batched, gemv axpby1, bf16 vs composed references; cross-device parity) | pure Rust wiring — the MLX kernels already ship `_axpby1` gemv variants and the steel `use_out_source`/`do_axpby` epilogue; gotcha: buffer-7 batch strides grow a third C segment when use_out_source is set. `Linear::forward` unchanged (explicit opt-in API); no activation epilogue exists in the MSL — that routes through the ug decision |
+| Fused GEMM/GEMV bias epilogue + `candle_nn::ops::matmul_bias` | metal-kernels/candle-nn | phase-4 | **proven: m3 bench** — prefill 355×512×512: 2.0× (139.9→69.7 µs f32, 158.6→79.3 bf16); decode 1×1024×4096: ~1–3% (weight-bandwidth bound) | pure Rust wiring — the MLX kernels already ship `_axpby1` gemv variants and the steel `use_out_source`/`do_axpby` epilogue; gotcha: buffer-7 batch strides grow a third C segment when use_out_source is set. `Linear::forward` unchanged (explicit opt-in API); no activation epilogue exists in the MSL — that routes through the ug decision |
 | Runtime-tunable `compute_per_buffer` (+ buffer `label()` reader) | metal-core | 169e7e80, re-grafted in 23b9460e | Incubating | experimental | now an `AtomicUsize` on the fence-based `Commands`; wolfrpsiw's cadence probe (GPU busy 97.1%) says default is fine there; knob still useful for other workloads |
 | `truncate_to` on RotatingCache/RotatingKvCache | candle-nn | 587590d7 + cursor-rewind fix | Incubating | tested | offset now rewinds relative to the previous cursor (the old `new_len % max` mapping broke after a bulk `seq_len >= max_seq_len` append); regression-tested in candle-nn/tests/kv_cache.rs; wolfrpsiw has its own truncate pattern — converge when adopting KvCache |
 | Completion hook + `addCompletedHandler`/kernel timestamps for programmatic profiling | metal-profile | fe62c4e3, 22839282, re-grafted in 23b9460e | Incubating | tested | re-ported onto the post-#3511 fence architecture at the 0.11 merge: hook installs in `commit_swap_locked` before commit; `command_encoder_with_buffer` re-expressed against `CommandsGuard`. Foundation for the profiling framework branch, which predates the merge and needs the same re-port |
@@ -110,13 +110,14 @@ scatter-add f16/bf16.
 
 ## Branch hygiene notes
 
-- `feat/metal-i16-i32-copy` is a stale pre-split integration branch (its
-  content shipped via #3477–#3479 and tomsanbear-dev) — delete after checking.
-- `backup/*` branches are pre-rebase snapshots of the label work — delete
-  once #3542 follow-ups land. The label prototype itself is now Superseded
-  (see above), so these are candidates for deletion outright.
-- `fix/metal-private-buffer-pool-sweep` and the thread-local-pool history are
-  Superseded as of the 0.11 merge — deletable after verification.
-- Local topic branches are behind their `tomsanbear` remotes (review pushed
+- Cleaned 2026-07-22: deleted 13 local branches whose content is Merged
+  (#3477/#3478/#3479/#3481/#3493 — verified against upstream before
+  deleting), Rejected with receipts (BQ=8 tiles), or Superseded (label
+  prototype + backups, private-pool sweep, pre-0.11 qmv branch). Remote
+  copies remain on `tomsanbear`. Worktrees pruned.
+- Remaining locals: the 5 in-flight PR branches (#3756–#3761),
+  `fix/metal-qmv-tail` (ready to submit), `feat/metal-profile-comprehensive`
+  (needs the post-#3511 re-port), `lmbrrr`, `pr-3700` (reference), `main`,
+  `tomsanbear-dev`.
+- In-flight PR branches are behind their `tomsanbear` remotes (review pushed
   from elsewhere); `git fetch tomsanbear` + fast-forward before touching.
-- 7 registered worktrees are prunable (`git worktree prune`).

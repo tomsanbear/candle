@@ -89,6 +89,7 @@ scatter-add f16/bf16.
 
 | Item | Status | Receipt |
 |---|---|---|
+| ug-JIT elementwise-chain fusion (candle-ug 0.5 via `UgIOp1`, default lowering) | Refuted | m3 spike (`feat/ug-fusion-spike`, ug_fusion_spike example): fused cos-chain 55.4 ms vs 27.7 µs composed at 356k f32 (~2000× slower — default lowering appears to serialize the whole tensor per thread), and max\|diff\| 1.6e-1 vs candle's cos. Also found+fixed: the ug+metal feature combo didn't compile at 0.11 (d2acdcd0). Caveat: only `lower_op::Opts::default()` was tried; revisit if ug's Metal codegen matures. Until then activation/elementwise fusion is steel-epilogue-shaped or hand-written MSL |
 | SDPA BQ=8 full-kernel tiles for q_seq 2–8 | Rejected (#3480) + Refuted | measured 30× slowdown on M3 (revert 336b5800); do not resubmit without a new mechanism |
 | mm2d_q2_0 index-hoist | Refuted | byte-exact, +0.08% tok/s — address-gen limiter unmoved (lmbrrr cd2499cc) |
 | where_cond Metal perf (#1876), bytemuck refactor (#2053), Metal CI (#2095), Metal random seed (#1959) | Closed 2024 | historical; see PRs |
@@ -97,8 +98,7 @@ scatter-add f16/bf16.
 
 | Item | Area | Motivating project + receipt | Suggested shape |
 |---|---|---|---|
-| GEMM **activation** epilogue (GELU etc. — the bias half landed in phase-4) | metal-kernels | wolfrpsiw decode: separate activation dispatches after every GEMM; the MSL has no activation epilogue (axpby only) | decide after the ug fusion spike: ug-shaped or steel-epilogue-shaped |
-| Elementwise-chain fusion (investigate `ug` JIT first) | metal-core | wolfrpsiw flow: diffuse glue ~half the stage; candle 0.11 ships a `ug` codegen path — experiment before writing kernels | experiment, then decide |
+| GEMM **activation** epilogue (GELU etc. — the bias half landed in phase-4) | metal-kernels | wolfrpsiw decode: separate activation dispatches after every GEMM; the MSL has no activation epilogue (axpby only) | steel-epilogue-shaped or hand-written MSL — the ug spike refuted the JIT route (see Refuted) |
 
 ## Open investigations
 

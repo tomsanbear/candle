@@ -540,6 +540,105 @@ fn cast_i64() {
     assert_eq!(results, v_u8);
 }
 
+#[test]
+fn cast_i32() {
+    let v_f64 = [1.0f64, 2.0, 3.0];
+    let v_f32: Vec<f32> = v_f64.iter().map(|&v| v as f32).collect();
+    let v_f16: Vec<f16> = v_f64.iter().map(|&v| f16::from_f32(v as f32)).collect();
+    let v_bf16: Vec<bf16> = v_f64.iter().map(|&v| bf16::from_f32(v as f32)).collect();
+    let v_u32: Vec<u32> = v_f64.iter().map(|&v| v as u32).collect();
+    let v_u8: Vec<u8> = v_f64.iter().map(|&v| v as u8).collect();
+    let v_i64: Vec<i64> = v_f64.iter().map(|&v| v as i64).collect();
+    let v_i32: Vec<i32> = v_f64.iter().map(|&v| v as i32).collect();
+
+    // i32 -> everything
+    let results: Vec<f32> = run_cast(&v_i32, "cast_i32_f32");
+    assert_eq!(results, v_f32);
+    let results: Vec<f16> = run_cast(&v_i32, "cast_i32_f16");
+    assert_eq!(results, v_f16);
+    let results: Vec<bf16> = run_cast(&v_i32, "cast_i32_bf16");
+    assert_eq!(results, v_bf16);
+    let results: Vec<i64> = run_cast(&v_i32, "cast_i32_i64");
+    assert_eq!(results, v_i64);
+    let results: Vec<u32> = run_cast(&v_i32, "cast_i32_u32");
+    assert_eq!(results, v_u32);
+    let results: Vec<u8> = run_cast(&v_i32, "cast_i32_u8");
+    assert_eq!(results, v_u8);
+
+    // everything -> i32
+    let results: Vec<i32> = run_cast(&v_f32, "cast_f32_i32");
+    assert_eq!(results, v_i32);
+    let results: Vec<i32> = run_cast(&v_f16, "cast_f16_i32");
+    assert_eq!(results, v_i32);
+    let results: Vec<i32> = run_cast(&v_bf16, "cast_bf16_i32");
+    assert_eq!(results, v_i32);
+    let results: Vec<i32> = run_cast(&v_i64, "cast_i64_i32");
+    assert_eq!(results, v_i32);
+    let results: Vec<i32> = run_cast(&v_u32, "cast_u32_i32");
+    assert_eq!(results, v_i32);
+    let results: Vec<i32> = run_cast(&v_u8, "cast_u8_i32");
+    assert_eq!(results, v_i32);
+
+    // Negative values survive the signed/float paths.
+    let v_neg_i32 = [-1i32, -40000, 3];
+    let results: Vec<i64> = run_cast(&v_neg_i32, "cast_i32_i64");
+    assert_eq!(results, [-1i64, -40000, 3]);
+    let results: Vec<f32> = run_cast(&v_neg_i32, "cast_i32_f32");
+    assert_eq!(results, [-1f32, -40000.0, 3.0]);
+}
+
+#[test]
+fn cast_i16() {
+    let v_f64 = [1.0f64, 2.0, 3.0];
+    let v_f32: Vec<f32> = v_f64.iter().map(|&v| v as f32).collect();
+    let v_f16: Vec<f16> = v_f64.iter().map(|&v| f16::from_f32(v as f32)).collect();
+    let v_bf16: Vec<bf16> = v_f64.iter().map(|&v| bf16::from_f32(v as f32)).collect();
+    let v_u32: Vec<u32> = v_f64.iter().map(|&v| v as u32).collect();
+    let v_u8: Vec<u8> = v_f64.iter().map(|&v| v as u8).collect();
+    let v_i64: Vec<i64> = v_f64.iter().map(|&v| v as i64).collect();
+    let v_i32: Vec<i32> = v_f64.iter().map(|&v| v as i32).collect();
+    let v_i16: Vec<i16> = v_f64.iter().map(|&v| v as i16).collect();
+
+    // i16 -> everything
+    let results: Vec<f32> = run_cast(&v_i16, "cast_i16_f32");
+    assert_eq!(results, v_f32);
+    let results: Vec<f16> = run_cast(&v_i16, "cast_i16_f16");
+    assert_eq!(results, v_f16);
+    let results: Vec<bf16> = run_cast(&v_i16, "cast_i16_bf16");
+    assert_eq!(results, v_bf16);
+    let results: Vec<i64> = run_cast(&v_i16, "cast_i16_i64");
+    assert_eq!(results, v_i64);
+    let results: Vec<i32> = run_cast(&v_i16, "cast_i16_i32");
+    assert_eq!(results, v_i32);
+    let results: Vec<u32> = run_cast(&v_i16, "cast_i16_u32");
+    assert_eq!(results, v_u32);
+    let results: Vec<u8> = run_cast(&v_i16, "cast_i16_u8");
+    assert_eq!(results, v_u8);
+
+    // everything -> i16
+    let results: Vec<i16> = run_cast(&v_f32, "cast_f32_i16");
+    assert_eq!(results, v_i16);
+    let results: Vec<i16> = run_cast(&v_f16, "cast_f16_i16");
+    assert_eq!(results, v_i16);
+    let results: Vec<i16> = run_cast(&v_bf16, "cast_bf16_i16");
+    assert_eq!(results, v_i16);
+    let results: Vec<i16> = run_cast(&v_i64, "cast_i64_i16");
+    assert_eq!(results, v_i16);
+    let results: Vec<i16> = run_cast(&v_i32, "cast_i32_i16");
+    assert_eq!(results, v_i16);
+    let results: Vec<i16> = run_cast(&v_u32, "cast_u32_i16");
+    assert_eq!(results, v_i16);
+    let results: Vec<i16> = run_cast(&v_u8, "cast_u8_i16");
+    assert_eq!(results, v_i16);
+
+    // Negative values survive the signed/float paths.
+    let v_neg_i16 = [-1i16, -300, 3];
+    let results: Vec<i32> = run_cast(&v_neg_i16, "cast_i16_i32");
+    assert_eq!(results, [-1i32, -300, 3]);
+    let results: Vec<f32> = run_cast(&v_neg_i16, "cast_i16_f32");
+    assert_eq!(results, [-1f32, -300.0, 3.0]);
+}
+
 fn run_affine<T: Clone>(v: &[T], mul: f64, add: f64) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();

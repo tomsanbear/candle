@@ -1920,7 +1920,71 @@ fn zero_dim(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Exhaustive dtype-pair sweep: every supported (src, dst) cast must
+/// round-trip values that are exactly representable on both sides, for
+/// both contiguous and strided (transposed) inputs. Sources are built on
+/// CPU so the device cast under test is the only device operation.
+fn to_dtype(dev: &Device) -> Result<()> {
+    /// Largest integer magnitude exactly representable in the dtype (or a
+    /// value comfortably below it) so casts through it are lossless.
+    fn max_exact(dt: DType) -> f64 {
+        match dt {
+            DType::U8 => 200.,
+            // bf16 has an 8-bit mantissa: integers up to 256 are exact.
+            DType::BF16 => 250.,
+            // f16 has a 10-bit mantissa: integers up to 2048 are exact.
+            DType::F16 => 2000.,
+            DType::I16 => 30000.,
+            _ => 40000.,
+        }
+    }
+    fn is_signed(dt: DType) -> bool {
+        !matches!(dt, DType::U8 | DType::U32)
+    }
+    let mut dtypes = vec![
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::I64,
+        DType::U32,
+        DType::U8,
+    ];
+    if !dev.is_cuda() {
+        // The CUDA cast kernels do not cover i16/i32 yet.
+        dtypes.push(DType::I32);
+        dtypes.push(DType::I16);
+    }
+    if dev.is_cpu() {
+        dtypes.push(DType::F64);
+    }
+    let cpu = Device::Cpu;
+    for &src in dtypes.iter() {
+        for &dst in dtypes.iter() {
+            let v = max_exact(src).min(max_exact(dst));
+            let v2 = if is_signed(src) && is_signed(dst) { -v } else { 2. };
+
+            let vals = [v, v2, 3.];
+            let t = Tensor::new(&vals, &cpu)?.to_dtype(src)?.to_device(dev)?;
+            let back = t.to_dtype(dst)?.to_device(&cpu)?.to_dtype(DType::F64)?;
+            assert_eq!(back.to_vec1::<f64>()?, vals, "{src:?} -> {dst:?}");
+
+            let t = Tensor::new(&[[v, 3.], [v2, 4.]], &cpu)?
+                .to_dtype(src)?
+                .to_device(dev)?
+                .t()?;
+            let back = t.to_dtype(dst)?.to_device(&cpu)?.to_dtype(DType::F64)?;
+            assert_eq!(
+                back.to_vec2::<f64>()?,
+                [[v, v2], [3., 4.]],
+                "strided {src:?} -> {dst:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 test_device!(zeros, zeros_cpu, zeros_gpu, zeros_metal);
+test_device!(to_dtype, to_dtype_cpu, to_dtype_gpu, to_dtype_metal);
 test_device!(ones, ones_cpu, ones_gpu, ones_metal);
 test_device!(full, full_cpu, full_gpu, full_metal);
 test_device!(const_set, cs_cpu, cs_gpu, cs_metal);

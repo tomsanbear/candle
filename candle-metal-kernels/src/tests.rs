@@ -841,6 +841,90 @@ fn run_mlx_sort<T: Clone>(v: &[T], ncols: usize) -> Vec<u32> {
     read_to_vec(&output, v.len())
 }
 
+fn run_topk(v: &[f32], ncols: usize, k: usize) -> Vec<u32> {
+    let nrows = v.len() / ncols;
+    let kpad = k.next_power_of_two();
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let input = new_buffer(&device, v);
+    let output = new_buffer(&device, &vec![0u32; nrows * kpad]);
+
+    call_topk(
+        &device,
+        &encoder,
+        &kernels,
+        "topk_f32",
+        nrows,
+        ncols,
+        k,
+        BufferOffset::zero_offset(&input),
+        &output,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    let padded: Vec<u32> = read_to_vec(&output, nrows * kpad);
+    // The caller-side narrow: first k of each kpad-wide row.
+    padded
+        .chunks(kpad)
+        .flat_map(|row| row[..k].iter().copied())
+        .collect()
+}
+
+#[test]
+fn topk() {
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+
+    let reference = |v: &[f32], k: usize| -> Vec<u32> {
+        let mut perm: Vec<usize> = (0..v.len()).collect();
+        perm.sort_by(|a, b| v[*b].total_cmp(&v[*a]));
+        perm[..k].iter().map(|&i| i as u32).collect()
+    };
+
+    // Small rows, k a non-power-of-two (exercises the pad + narrow).
+    let input: Vec<f32> = vec![3.0, -1.0, 7.0, 0.5, 2.0, 9.0, -4.0, 1.0];
+    let result = run_topk(&input, 8, 3);
+    assert_eq!(result, reference(&input, 3));
+
+    // k == ncols degenerates to a full descending argsort.
+    let input: Vec<f32> = (0..16).map(|v| ((v * 7) % 16) as f32).collect();
+    let result = run_topk(&input, 16, 16);
+    assert_eq!(result, reference(&input, 16));
+
+    // RT-DETR-like: wide rows far beyond the argsort threadgroup cap.
+    let (nrows, ncols, k) = (4, 24000, 300);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(299792458);
+    let normal = rand_distr::Normal::new(0.0f32, 1.0).unwrap();
+    let input: Vec<f32> = (0..nrows * ncols).map(|_| normal.sample(&mut rng)).collect();
+    let result = run_topk(&input, ncols, k);
+    for row in 0..nrows {
+        let slice = &input[row * ncols..(row + 1) * ncols];
+        let expected = reference(slice, k);
+        let got: Vec<u32> = result[row * k..(row + 1) * k]
+            .iter()
+            .map(|&i| i - 0) // row-local indices
+            .collect();
+        // Values must match exactly; indices may differ on exact ties, so
+        // compare the selected values.
+        let got_vals: Vec<f32> = got.iter().map(|&i| slice[i as usize]).collect();
+        let exp_vals: Vec<f32> = expected.iter().map(|&i| slice[i as usize]).collect();
+        assert_eq!(got_vals, exp_vals, "row {row}");
+    }
+
+    // A non-tile-multiple width with the maximum in the ragged tail.
+    let (ncols, k) = (2500, 4);
+    let mut input: Vec<f32> = (0..ncols).map(|v| (v % 97) as f32 * 0.25).collect();
+    input[2499] = 1000.0;
+    input[1024] = 999.0;
+    let result = run_topk(&input, ncols, k);
+    assert_eq!(result[0], 2499);
+    assert_eq!(result[1], 1024);
+}
+
 #[test]
 fn mlx_sort() {
     use rand::SeedableRng;

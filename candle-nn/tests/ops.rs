@@ -508,6 +508,32 @@ fn matmul_bias_act(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn topk(device: &Device) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(299792458);
+
+    // Small case with a known answer.
+    let xs = Tensor::new(&[[3f32, -1., 7., 0.5], [2., 9., -4., 1.]], device)?;
+    let (values, indices) = candle_nn::ops::topk(&xs, 2)?;
+    assert_eq!(values.to_vec2::<f32>()?, [[7.0, 3.0], [9.0, 2.0]]);
+    assert_eq!(indices.to_vec2::<u32>()?, [[2, 0], [1, 0]]);
+
+    // Wide rows (beyond the 1024-column bitonic argsort), batched, k a
+    // non-power-of-two. Values must match a host reference exactly; indices
+    // can differ on exact ties so the values are the comparison.
+    let (b, rows, ncols, k) = (2, 3, 4096, 300);
+    let data: Vec<f32> = (0..b * rows * ncols).map(|_| rng.random::<f32>()).collect();
+    let xs = Tensor::from_vec(data.clone(), (b, rows, ncols), device)?;
+    let (values, _indices) = candle_nn::ops::topk(&xs, k)?;
+    let values = values.flatten_all()?.to_vec1::<f32>()?;
+    for r in 0..b * rows {
+        let mut row: Vec<f32> = data[r * ncols..(r + 1) * ncols].to_vec();
+        row.sort_by(|a, b| b.total_cmp(a));
+        assert_eq!(&values[r * k..(r + 1) * k], &row[..k], "row {r}");
+    }
+    Ok(())
+}
+
 fn sigmoid(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
@@ -542,3 +568,4 @@ test_device!(
 );
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+test_device!(topk, topk_cpu, topk_gpu, topk_metal);

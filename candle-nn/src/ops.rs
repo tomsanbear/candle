@@ -1275,6 +1275,98 @@ impl candle::CustomOp3 for MatmulBias {
     }
 }
 
+struct TopK {
+    k_pad: usize,
+}
+
+impl candle::CustomOp1 for TopK {
+    fn name(&self) -> &'static str {
+        "topk"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("topk is fused on Metal only; the public fn composes elsewhere")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        storage: &candle::MetalStorage,
+        layout: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+
+        if !layout.is_contiguous() {
+            candle::bail!("topk requires a contiguous input")
+        }
+        let dims = layout.dims();
+        let ncols = *dims.last().unwrap();
+        let nrows: usize = dims[..dims.len() - 1].iter().product();
+        let name = match storage.dtype() {
+            DType::F32 => "topk_f32",
+            DType::F16 => "topk_f16",
+            DType::BF16 => "topk_bf16",
+            dtype => candle::bail!("topk does not support {dtype:?} on Metal"),
+        };
+        let device = storage.device();
+        let elem_count = nrows * self.k_pad;
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, DType::U32)
+            .with_label("topk")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        let src = candle_metal_kernels::BufferOffset {
+            buffer: storage.buffer(),
+            offset_in_bytes: layout.start_offset() * storage.dtype().size_in_bytes(),
+        };
+        candle_metal_kernels::call_topk(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            name,
+            nrows,
+            ncols,
+            self.k_pad,
+            src,
+            &dst,
+        )
+        .map_err(candle::Error::wrap)?;
+        let mut out_dims = dims.to_vec();
+        *out_dims.last_mut().unwrap() = self.k_pad;
+        let storage = candle::MetalStorage::new(dst, device.clone(), elem_count, DType::U32);
+        Ok((storage, Shape::from_dims(&out_dims)))
+    }
+}
+
+/// The `k` largest values along the last dimension and their indices, both
+/// descending by value — `torch.topk` semantics (ties break arbitrarily).
+/// Runs a dedicated kernel on Metal (any row width, unlike
+/// `arg_sort_last_dim`'s 1024-column bitonic); other backends compose a
+/// descending arg-sort with a narrow.
+pub fn topk(xs: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    let last = xs.dim(D::Minus1)?;
+    if k == 0 || k > last {
+        candle::bail!("topk k={k} out of range for last dim {last}");
+    }
+    let xs = xs.contiguous()?;
+    let k_pad = k.next_power_of_two();
+    let fused = xs.device().is_metal()
+        && k_pad <= 1024
+        && matches!(xs.dtype(), DType::F32 | DType::F16 | DType::BF16);
+    let indices = if fused {
+        xs.apply_op1_no_bwd(&TopK { k_pad })?
+            .narrow(D::Minus1, 0, k)?
+            .contiguous()?
+    } else {
+        xs.arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, k)?
+            .contiguous()?
+    };
+    let values = xs.gather(&indices, D::Minus1)?;
+    Ok((values, indices))
+}
+
 /// `lhs.matmul(rhs) + bias`, with the bias add fused into the GEMM epilogue
 /// on Metal. `bias` is an `n`-element vector broadcast over rows and batch;
 /// `rhs` may be 2d (broadcast over the batch) or share `lhs`'s batch shape.

@@ -29,6 +29,6 @@ pub use quantized::{
 pub use random::*;
 pub use reduce::*;
 pub use sdpa::{call_sdpa_full, call_sdpa_vector, call_sdpa_vector_2pass, SdpaDType};
-pub use sort::{call_arg_sort, call_mlx_arg_sort};
+pub use sort::{call_arg_sort, call_mlx_arg_sort, call_topk};
 pub use ternary::call_where_cond;
 pub use unary::*;

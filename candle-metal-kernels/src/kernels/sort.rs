@@ -43,6 +43,50 @@ pub fn call_arg_sort(
     Ok(())
 }
 
+/// Per-row top-k indices (descending by value) for arbitrary row widths —
+/// the bitonic `call_arg_sort` above cannot exceed one threadgroup's width.
+/// `k` is padded to the next power of two internally (the merge network
+/// needs it), so `dst` must hold `nrows * k.next_power_of_two()` u32 entries
+/// and the caller narrows each row to its first `k`. Requires
+/// `k.next_power_of_two() <= 1024`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_topk(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    nrows: usize,
+    ncols: usize,
+    k: usize,
+    src: BufferOffset,
+    dst: &Buffer,
+) -> Result<(), crate::MetalKernelError> {
+    let kpad = k.next_power_of_two();
+    assert!(kpad <= 1024, "topk requires k.next_power_of_two() <= 1024");
+    let pipeline = kernels.load_pipeline(device, Source::Sort, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "topk {name} nrows={nrows} ncols={ncols} k={k}");
+
+    set_params!(encoder, (&src, Output::new(dst), ncols as i64, kpad as i64));
+
+    let thread_group_count = MTLSize {
+        width: nrows,
+        height: 1,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 1024,
+        height: 1,
+        depth: 1,
+    };
+    encoder.set_threadgroup_memory_length(0, (1024 + 2 * kpad) * 4);
+    encoder.set_threadgroup_memory_length(1, (1024 + 2 * kpad) * 4);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 fn mlx_dtype_str(dtype: DType) -> &'static str {
     match dtype {
         DType::U8 => "uint8",

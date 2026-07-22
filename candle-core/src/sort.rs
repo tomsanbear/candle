@@ -229,18 +229,49 @@ impl crate::CustomOp1 for ArgSort {
         while ncols_pad < ncols {
             ncols_pad *= 2;
         }
-        candle_metal_kernels::call_arg_sort(
-            device.metal_device(),
-            &command_encoder,
-            kernels,
-            name,
-            nrows,
-            ncols,
-            ncols_pad,
-            src,
-            &dst,
-        )
-        .map_err(crate::Error::wrap)?;
+        if ncols_pad > 1024 {
+            // The bitonic kernel runs one thread per padded column in a
+            // single threadgroup, so it cannot exceed the threadgroup width;
+            // wide rows route to the MLX multi-block sort (ascending only).
+            if !self.asc {
+                crate::bail!(
+                    "Metal descending arg_sort is limited to 1024 columns (got {ncols}); sort the negated values ascending instead"
+                )
+            }
+            let dtype = match storage.dtype() {
+                DType::F32 => candle_metal_kernels::DType::F32,
+                DType::F16 => candle_metal_kernels::DType::F16,
+                DType::BF16 => candle_metal_kernels::DType::BF16,
+                DType::I64 => candle_metal_kernels::DType::I64,
+                DType::U32 => candle_metal_kernels::DType::U32,
+                DType::U8 => candle_metal_kernels::DType::U8,
+                dtype => crate::bail!("Metal arg_sort beyond 1024 columns does not support {dtype:?}"),
+            };
+            candle_metal_kernels::call_mlx_arg_sort(
+                device.metal_device(),
+                &command_encoder,
+                kernels,
+                dtype,
+                nrows,
+                ncols,
+                src,
+                &dst,
+            )
+            .map_err(crate::Error::wrap)?;
+        } else {
+            candle_metal_kernels::call_arg_sort(
+                device.metal_device(),
+                &command_encoder,
+                kernels,
+                name,
+                nrows,
+                ncols,
+                ncols_pad,
+                src,
+                &dst,
+            )
+            .map_err(crate::Error::wrap)?;
+        }
         let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
         Ok((dst, layout.shape().clone()))
     }

@@ -32,6 +32,49 @@ fn kv_cache() -> Result<()> {
 }
 
 #[test]
+fn rotating_kv_cache_truncate() -> Result<()> {
+    // Incremental regime: rolling back a rejected draft then re-appending
+    // must be indistinguishable from a straight-line history.
+    let mut cache = candle_nn::kv_cache::RotatingCache::new(0, 8);
+    let t = Tensor::new(&[0., 1., 2., 3., 4.], &Device::Cpu)?;
+    cache.append(&t)?;
+    let draft = Tensor::new(&[5., 6., 7.], &Device::Cpu)?;
+    cache.append(&draft)?;
+    cache.truncate_to(5);
+    assert_eq!(cache.current_seq_len(), 5);
+    assert_eq!(cache.offset(), 5);
+    let data = cache.current_data()?.unwrap();
+    assert_eq!(data.to_vec1::<f64>()?, [0., 1., 2., 3., 4.]);
+    let t = Tensor::new(&[50., 60.], &Device::Cpu)?;
+    let data = cache.append(&t)?;
+    assert_eq!(data.to_vec1::<f64>()?, [0., 1., 2., 3., 4., 50., 60.]);
+    assert_eq!(cache.positions(0), &[0, 1, 2, 3, 4, 5, 6]);
+
+    // No-op when new_len >= current_seq_len.
+    cache.truncate_to(100);
+    assert_eq!(cache.current_seq_len(), 7);
+    assert_eq!(cache.offset(), 7);
+
+    // Bulk-append regime: a `seq_len >= max_seq_len` append shifts the
+    // ring's slot/position mapping (slot 0 holds the oldest retained
+    // position, not position 0 mod max), so the cursor must rewind
+    // relative to the previous offset. Here slots hold positions 3..9
+    // and truncating to 7 must land the cursor on position 7's slot (4).
+    let mut cache = candle_nn::kv_cache::RotatingCache::new(0, 6);
+    let t = Tensor::new(&[0., 1., 2., 3., 4., 5., 6., 7., 8.], &Device::Cpu)?;
+    cache.append(&t)?;
+    assert_eq!(cache.current_seq_len(), 9);
+    assert_eq!(cache.offset(), 0);
+    cache.truncate_to(7);
+    assert_eq!(cache.current_seq_len(), 7);
+    assert_eq!(cache.offset(), 4);
+    let t = Tensor::new(&[70.], &Device::Cpu)?;
+    let data = cache.append(&t)?;
+    assert_eq!(data.to_vec1::<f64>()?, [3., 4., 5., 6., 70., 8.]);
+    Ok(())
+}
+
+#[test]
 fn rotating_kv_cache() -> Result<()> {
     let mut cache = candle_nn::kv_cache::RotatingCache::new(0, 6);
     for _ in [0, 1] {

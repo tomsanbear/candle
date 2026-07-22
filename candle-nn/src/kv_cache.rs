@@ -217,23 +217,30 @@ impl RotatingCache {
     /// Rewind the cache to the first `new_len` positions.
     ///
     /// The underlying pre-allocated buffer is left untouched; only the
-    /// cursor (`current_seq_len` + `offset`) is updated so future reads
-    /// via `current_data()` see only positions `[0, new_len)` and the
-    /// next append overwrites starting at position `new_len`.
+    /// cursor (`current_seq_len` + `offset`) rewinds by the number of
+    /// dropped positions, so the next append overwrites the slot that
+    /// held position `new_len`. No-op if `new_len >= current_seq_len`.
+    /// Used by speculative decoding to drop rejected drafts' KV without
+    /// re-allocating or memcpying the cache tensor.
     ///
-    /// No-op if `new_len >= current_seq_len`. Used by speculative
-    /// decoding to drop rejected drafts' KV without re-allocating or
-    /// memcpying the cache tensor.
+    /// Truncation is lossless only while no position `< new_len` has been
+    /// overwritten by the dropped tail: callers rolling back drafts should
+    /// size `max_seq_len` so the accepted history plus in-flight drafts
+    /// fit in the ring, otherwise the reclaimed slots still hold the
+    /// dropped tail's data.
     pub fn truncate_to(&mut self, new_len: usize) {
         if new_len >= self.current_seq_len {
             return;
         }
+        if self.max_seq_len > 0 {
+            // Anchor on the previous cursor rather than recomputing
+            // `new_len % max_seq_len`: a bulk append (`seq_len >=
+            // max_seq_len`) shifts the ring's slot/position mapping, and
+            // only a cursor-relative rewind stays consistent with it.
+            let dropped = (self.current_seq_len - new_len) % self.max_seq_len;
+            self.offset = (self.offset + self.max_seq_len - dropped) % self.max_seq_len;
+        }
         self.current_seq_len = new_len;
-        self.offset = if self.max_seq_len == 0 {
-            0
-        } else {
-            new_len % self.max_seq_len
-        };
     }
 
     pub fn append(&mut self, src: &Tensor) -> Result<Tensor> {

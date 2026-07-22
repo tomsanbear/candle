@@ -185,19 +185,17 @@ mod metal_sdpa_tests {
         Ok(())
     }
 
-    /// Regression guard for the dispatcher's `supports_sdpa_vector` rule:
-    /// `q_seq <= 8` routes to the vector kernel, but the vector kernel in
-    /// `scaled_dot_product_attention.metal` has no q-axis and only computes
-    /// one output position per `(bs, qhead)` threadgroup. For `q_seq` in
-    /// `[2, 8]` the non-zero positions are left uninitialised (garbage from
-    /// the pooled Metal buffer), which silently corrupts any caller that
-    /// expects per-position logits — notably speculative-decoding verify
-    /// batches and short prefills.
+    /// Regression guard for the dispatcher's `supports_sdpa_vector` rule
+    /// (fixed upstream in #3479 to require `q_seq == 1`): the vector kernel
+    /// in `scaled_dot_product_attention.metal` has no q-axis and only
+    /// computes one output position per `(bs, qhead)` threadgroup. If
+    /// `q_seq` in `[2, 8]` ever routes there again, the non-zero positions
+    /// are left uninitialised (garbage from the pooled Metal buffer), which
+    /// silently corrupts any caller that expects per-position logits —
+    /// notably speculative-decoding verify batches and short prefills.
     ///
     /// Compares sdpa vs a manual matmul→softmax→matmul reference for every
-    /// R ∈ [2, 8]. Expected to FAIL on the current kernel; passes once the
-    /// dispatch is fixed to route multi-query through the full kernel or the
-    /// vector kernel is extended to loop over q_seq.
+    /// R ∈ [2, 8].
     #[test]
     fn sdpa_vector_q_seq_2_to_8_matches_reference() -> Result<()> {
         // Real-world verify batch shape: one sequence, GQA heads, cross-attention

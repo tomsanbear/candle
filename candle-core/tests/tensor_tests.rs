@@ -320,9 +320,9 @@ fn unary_op(device: &Device) -> Result<()> {
 
 /// Minimal regression: run the BF16 → F32 → abs/mean/clamp/broadcast_div/
 /// round/clamp quantise pipeline on `device`, and assert the final values
-/// are exactly in {-1, 0, 1}. This is the downstream (bitnet-rs) sequence
-/// that was producing garbage values on Metal when run concurrently
-/// across multiple threads.
+/// are exactly in {-1, 0, 1}. This ternary (BitNet-style) quantisation
+/// sequence produced garbage values on Metal when run concurrently across
+/// multiple threads.
 fn bitnet_quantize_pipeline(device: &Device) -> Result<()> {
     if !device.is_metal() {
         return Ok(());
@@ -465,9 +465,8 @@ fn bitnet_quantize_pipeline(device: &Device) -> Result<()> {
 /// this one fires when candle's Metal backend has a race on the shared
 /// MetalDevice resource pool.
 ///
-/// Failure symptom observed in downstream bitnet-rs: a handful of
-/// [0, 0] elements emerge as arbitrary large floats (e.g. -328125.0)
-/// instead of one of {-1, 0, 1}.
+/// Failure symptom: a handful of [0, 0] elements emerge as arbitrary
+/// large floats (e.g. -328125.0) instead of one of {-1, 0, 1}.
 fn bitnet_quantize_pipeline_concurrent(device: &Device) -> Result<()> {
     if !device.is_metal() {
         return Ok(());

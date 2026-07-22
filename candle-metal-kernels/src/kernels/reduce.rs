@@ -178,6 +178,11 @@ pub fn call_last_softmax(
     Ok(())
 }
 
+/// Rows-per-simdgroup threshold above which the batched norm kernels win:
+/// they regress single-row (decode) shapes, so the stock one-threadgroup-
+/// per-row kernels stay in place below it.
+const NORM_BATCHED_MIN_ROWS: usize = 32;
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_rms_norm(
     device: &Device,
@@ -193,6 +198,49 @@ pub fn call_rms_norm(
     alpha_offset: usize,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    let rows = length / elements_to_sum.max(1);
+    if rows >= NORM_BATCHED_MIN_ROWS {
+        let batched = match kernel_name {
+            "rmsnorm_f32" => Some("rmsnorm_batched_f32"),
+            "rmsnorm_f16" => Some("rmsnorm_batched_f16"),
+            "rmsnorm_bf16" => Some("rmsnorm_batched_bf16"),
+            _ => None,
+        };
+        if let Some(kernel_name) = batched {
+            let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+            let encoder = ep.encoder();
+            let encoder: &ComputeCommandEncoder = encoder.as_ref();
+            encoder.set_compute_pipeline_state(&pipeline);
+            debug_group!(
+                encoder,
+                "rms_norm {kernel_name} rows={rows} cols={elements_to_sum}"
+            );
+            set_params!(
+                encoder,
+                (
+                    rows as u32,
+                    elements_to_sum as u32,
+                    eps,
+                    (input, input_offset),
+                    Output::new(output),
+                    (alpha, alpha_offset)
+                )
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: rows.div_ceil(32),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return Ok(());
+        }
+    }
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -254,6 +302,53 @@ pub fn call_layer_norm(
     beta: Option<(&Buffer, usize)>,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    let rows = length / elements_to_sum.max(1);
+    if rows >= NORM_BATCHED_MIN_ROWS {
+        let batched = match kernel_name {
+            "layernorm_f32" => Some("layernorm_batched_f32"),
+            "layernorm_f16" => Some("layernorm_batched_f16"),
+            "layernorm_bf16" => Some("layernorm_batched_bf16"),
+            _ => None,
+        };
+        if let Some(kernel_name) = batched {
+            let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+            let encoder = ep.encoder();
+            let encoder: &ComputeCommandEncoder = encoder.as_ref();
+            encoder.set_compute_pipeline_state(&pipeline);
+            debug_group!(
+                encoder,
+                "layer_norm {kernel_name} rows={rows} cols={elements_to_sum}"
+            );
+            set_params!(
+                encoder,
+                (
+                    rows as u32,
+                    elements_to_sum as u32,
+                    eps,
+                    (input, input_offset),
+                    Output::new(output),
+                    (alpha, alpha_offset)
+                )
+            );
+            match beta {
+                Some((beta, beta_offset)) => encoder.set_input_buffer(6, Some(beta), beta_offset),
+                None => encoder.set_input_buffer(6, None, 0),
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: rows.div_ceil(32),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return Ok(());
+        }
+    }
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();

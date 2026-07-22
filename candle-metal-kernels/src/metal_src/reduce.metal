@@ -1558,6 +1558,122 @@ impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 #endif
 
+// Batched norm variants: one simdgroup per row, 32 rows per threadgroup.
+// The stock kernels above spend a whole threadgroup (up to 1024 threads plus
+// block-reduction barriers) per row — pure launch/barrier overhead on
+// many-small-rows shapes. Here each row is reduced with simd_sum only. The
+// Rust wrappers dispatch these when rows >= 32; single-row shapes regress on
+// this layout and stay on the stock kernels.
+
+template <typename T>
+METAL_FUNC void layer_norm_batched(
+    constant uint &n_rows,
+    constant uint &n_cols,
+    constant float &eps,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *beta,
+    uint row,
+    ushort lane
+) {
+    if (row >= n_rows) return;
+    device const T *r = src + (ulong)row * n_cols;
+    device T *o = dst + (ulong)row * n_cols;
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (uint i = lane; i < n_cols; i += 32) {
+        float v = float(r[i]);
+        sum += v;
+        sumsq += v * v;
+    }
+    sum = simd_sum(sum);
+    sumsq = simd_sum(sumsq);
+    float mean = sum / float(n_cols);
+    float rstd = rsqrt(max(sumsq / float(n_cols) - mean * mean, 0.0f) + eps);
+    if (beta == nullptr) {
+        for (uint i = lane; i < n_cols; i += 32) {
+            float v = (float(r[i]) - mean) * rstd;
+            o[i] = static_cast<T>(v * float(alpha[i]));
+        }
+    } else {
+        for (uint i = lane; i < n_cols; i += 32) {
+            float v = (float(r[i]) - mean) * rstd;
+            o[i] = static_cast<T>(fma(v, float(alpha[i]), float(beta[i])));
+        }
+    }
+}
+
+template <typename T>
+METAL_FUNC void rms_norm_batched(
+    constant uint &n_rows,
+    constant uint &n_cols,
+    constant float &eps,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    uint row,
+    ushort lane
+) {
+    if (row >= n_rows) return;
+    device const T *r = src + (ulong)row * n_cols;
+    device T *o = dst + (ulong)row * n_cols;
+    float sumsq = 0.0f;
+    for (uint i = lane; i < n_cols; i += 32) {
+        float v = float(r[i]);
+        sumsq += v * v;
+    }
+    sumsq = simd_sum(sumsq);
+    float total = rsqrt(sumsq / float(n_cols) + eps);
+    for (uint i = lane; i < n_cols; i += 32) {
+        o[i] = static_cast<T>(float(r[i]) * total * float(alpha[i]));
+    }
+}
+
+#define impl_layer_norm_batched(NAME, T)                        \
+kernel void NAME(                                               \
+    constant uint &n_rows,                                      \
+    constant uint &n_cols,                                      \
+    constant float &eps,                                        \
+    device const T *src,                                        \
+    device T *dst,                                              \
+    device const T *alpha,                                      \
+    device const T *beta,                                       \
+    uint tg_id [[ threadgroup_position_in_grid ]],              \
+    ushort simd_group [[ simdgroup_index_in_threadgroup ]],     \
+    ushort lane [[ thread_index_in_simdgroup ]]                 \
+) {                                                             \
+    layer_norm_batched<T>(                                      \
+        n_rows, n_cols, eps, src, dst, alpha, beta,             \
+        tg_id * 32 + simd_group, lane);                         \
+}
+
+#define impl_rms_norm_batched(NAME, T)                          \
+kernel void NAME(                                               \
+    constant uint &n_rows,                                      \
+    constant uint &n_cols,                                      \
+    constant float &eps,                                        \
+    device const T *src,                                        \
+    device T *dst,                                              \
+    device const T *alpha,                                      \
+    uint tg_id [[ threadgroup_position_in_grid ]],              \
+    ushort simd_group [[ simdgroup_index_in_threadgroup ]],     \
+    ushort lane [[ thread_index_in_simdgroup ]]                 \
+) {                                                             \
+    rms_norm_batched<T>(                                        \
+        n_rows, n_cols, eps, src, dst, alpha,                   \
+        tg_id * 32 + simd_group, lane);                         \
+}
+
+impl_layer_norm_batched(layernorm_batched_f32, float)
+impl_layer_norm_batched(layernorm_batched_f16, half)
+impl_rms_norm_batched(rmsnorm_batched_f32, float)
+impl_rms_norm_batched(rmsnorm_batched_f16, half)
+#if defined(__HAVE_BFLOAT__)
+impl_layer_norm_batched(layernorm_batched_bf16, bfloat)
+impl_rms_norm_batched(rmsnorm_batched_bf16, bfloat)
+#endif
+
 // Cumulative sum (inclusive scan) along the last dimension of a contiguous
 // tensor. One threadgroup owns one row and walks it in BLOCKSIZE tiles with
 // a running carry; within a tile the scan is two-level: a simd_shuffle_up

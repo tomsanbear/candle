@@ -3,6 +3,7 @@ pub(crate) mod linear;
 pub(crate) mod norm;
 pub(crate) mod softmax;
 pub(crate) mod topk;
+pub(crate) mod msda;
 
 use candle::{Device, Result};
 

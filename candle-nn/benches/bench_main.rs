@@ -6,5 +6,6 @@ criterion_main!(
     benchmarks::linear::benches,
     benchmarks::softmax::benches,
     benchmarks::conv::benches,
-    benchmarks::topk::benches
+    benchmarks::topk::benches,
+    benchmarks::msda::benches
 );

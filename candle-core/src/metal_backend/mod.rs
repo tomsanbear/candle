@@ -621,6 +621,25 @@ impl BackendStorage for MetalStorage {
                 (DType::BF16, DType::U32) => "cast_bf16_u32",
                 (DType::BF16, DType::U8) => "cast_bf16_u8",
 
+                // MSL has no double type; these kernels convert f64 bit
+                // patterns in software (see cast.metal).
+                (DType::F64, DType::F32) => "cast_f64_f32",
+                (DType::F64, DType::F16) => "cast_f64_f16",
+                (DType::F64, DType::BF16) => "cast_f64_bf16",
+                (DType::F64, DType::I64) => "cast_f64_i64",
+                (DType::F64, DType::I32) => "cast_f64_i32",
+                (DType::F64, DType::I16) => "cast_f64_i16",
+                (DType::F64, DType::U32) => "cast_f64_u32",
+                (DType::F64, DType::U8) => "cast_f64_u8",
+                (DType::F32, DType::F64) => "cast_f32_f64",
+                (DType::F16, DType::F64) => "cast_f16_f64",
+                (DType::BF16, DType::F64) => "cast_bf16_f64",
+                (DType::I64, DType::F64) => "cast_i64_f64",
+                (DType::I32, DType::F64) => "cast_i32_f64",
+                (DType::I16, DType::F64) => "cast_i16_f64",
+                (DType::U32, DType::F64) => "cast_u32_f64",
+                (DType::U8, DType::F64) => "cast_u8_f64",
+
                 (left, right) => {
                     crate::bail!("Metal contiguous to_dtype {left:?} {right:?} not implemented")
                 }
@@ -701,6 +720,25 @@ impl BackendStorage for MetalStorage {
                 (DType::U8, DType::I32) => "cast_u8_i32_strided",
                 (DType::U8, DType::I16) => "cast_u8_i16_strided",
                 (DType::U8, DType::U32) => "cast_u8_u32_strided",
+
+                // MSL has no double type; these kernels convert f64 bit
+                // patterns in software (see cast.metal).
+                (DType::F64, DType::F32) => "cast_f64_f32_strided",
+                (DType::F64, DType::F16) => "cast_f64_f16_strided",
+                (DType::F64, DType::BF16) => "cast_f64_bf16_strided",
+                (DType::F64, DType::I64) => "cast_f64_i64_strided",
+                (DType::F64, DType::I32) => "cast_f64_i32_strided",
+                (DType::F64, DType::I16) => "cast_f64_i16_strided",
+                (DType::F64, DType::U32) => "cast_f64_u32_strided",
+                (DType::F64, DType::U8) => "cast_f64_u8_strided",
+                (DType::F32, DType::F64) => "cast_f32_f64_strided",
+                (DType::F16, DType::F64) => "cast_f16_f64_strided",
+                (DType::BF16, DType::F64) => "cast_bf16_f64_strided",
+                (DType::I64, DType::F64) => "cast_i64_f64_strided",
+                (DType::I32, DType::F64) => "cast_i32_f64_strided",
+                (DType::I16, DType::F64) => "cast_i16_f64_strided",
+                (DType::U32, DType::F64) => "cast_u32_f64_strided",
+                (DType::U8, DType::F64) => "cast_u8_f64_strided",
 
                 (left, right) => {
                     crate::bail!("Metal strided to_dtype {left:?} {right:?} not implemented")

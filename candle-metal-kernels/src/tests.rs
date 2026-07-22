@@ -541,6 +541,89 @@ fn cast_i64() {
 }
 
 #[test]
+fn cast_f64() {
+    // The f64 kernels convert bit patterns in software (MSL has no double);
+    // the CPU reference is Rust's `as`, which candle's CPU casts use.
+    let v_f64 = [1.0f64, -2.5, 3.0];
+
+    // f64 -> everything
+    let results: Vec<f32> = run_cast(&v_f64, "cast_f64_f32");
+    assert_eq!(results, [1.0f32, -2.5, 3.0]);
+    let results: Vec<f16> = run_cast(&v_f64, "cast_f64_f16");
+    assert_eq!(results, v_f64.map(f16::from_f64));
+    let results: Vec<bf16> = run_cast(&v_f64, "cast_f64_bf16");
+    assert_eq!(results, v_f64.map(bf16::from_f64));
+    let results: Vec<i64> = run_cast(&v_f64, "cast_f64_i64");
+    assert_eq!(results, v_f64.map(|v| v as i64));
+    let results: Vec<i32> = run_cast(&v_f64, "cast_f64_i32");
+    assert_eq!(results, v_f64.map(|v| v as i32));
+    let results: Vec<i16> = run_cast(&v_f64, "cast_f64_i16");
+    assert_eq!(results, v_f64.map(|v| v as i16));
+    let results: Vec<u32> = run_cast(&v_f64, "cast_f64_u32");
+    assert_eq!(results, v_f64.map(|v| v as u32));
+    let results: Vec<u8> = run_cast(&v_f64, "cast_f64_u8");
+    assert_eq!(results, v_f64.map(|v| v as u8));
+
+    // everything -> f64
+    let results: Vec<f64> = run_cast(&[1.5f32, -3.25, 65504.0], "cast_f32_f64");
+    assert_eq!(results, [1.5f64, -3.25, 65504.0]);
+    let results: Vec<f64> = run_cast(&[1.5f32, -3.25, 4.0].map(f16::from_f32), "cast_f16_f64");
+    assert_eq!(results, [1.5f64, -3.25, 4.0]);
+    let results: Vec<f64> = run_cast(&[1.5f32, -3.0, 4.0].map(bf16::from_f32), "cast_bf16_f64");
+    assert_eq!(results, [1.5f64, -3.0, 4.0]);
+    let results: Vec<f64> = run_cast(&[1i64, -40000, 3], "cast_i64_f64");
+    assert_eq!(results, [1.0f64, -40000.0, 3.0]);
+    let results: Vec<f64> = run_cast(&[1i32, -40000, 3], "cast_i32_f64");
+    assert_eq!(results, [1.0f64, -40000.0, 3.0]);
+    let results: Vec<f64> = run_cast(&[1i16, -30000, 3], "cast_i16_f64");
+    assert_eq!(results, [1.0f64, -30000.0, 3.0]);
+    let results: Vec<f64> = run_cast(&[1u32, 40000, 3], "cast_u32_f64");
+    assert_eq!(results, [1.0f64, 40000.0, 3.0]);
+    let results: Vec<f64> = run_cast(&[1u8, 200, 3], "cast_u8_f64");
+    assert_eq!(results, [1.0f64, 200.0, 3.0]);
+
+    // Round-to-nearest-even and specials through the f64 -> f32 software path.
+    let specials = [
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -0.0,
+        1e-310, // f64 denormal, below the f32 range
+        1e39,   // above the f32 range
+        -1e39,
+        16777217.0, // 2^24 + 1: RNE ties to even -> 2^24
+        16777219.0, // 2^24 + 3: rounds up -> 2^24 + 4
+    ];
+    let results: Vec<f32> = run_cast(&specials, "cast_f64_f32");
+    assert_eq!(results[0], f32::INFINITY);
+    assert_eq!(results[1], f32::NEG_INFINITY);
+    assert_eq!(results[2], 0.0);
+    assert!(results[2].is_sign_negative());
+    assert_eq!(results[3], 0.0);
+    assert_eq!(results[4], f32::INFINITY);
+    assert_eq!(results[5], f32::NEG_INFINITY);
+    assert_eq!(results[6], 16777216.0);
+    assert_eq!(results[7], 16777220.0);
+    let results: Vec<f32> = run_cast(&[f64::NAN], "cast_f64_f32");
+    assert!(results[0].is_nan());
+
+    // Integer <-> f64 exactness beyond the f32-mediated range, and the
+    // saturating behaviour of Rust `as` on out-of-range floats.
+    let big = [(1i64 << 40) + 3, -(1i64 << 40) - 3, i64::MAX, i64::MIN];
+    let results: Vec<f64> = run_cast(&big, "cast_i64_f64");
+    assert_eq!(results, big.map(|v| v as f64));
+    let results: Vec<f64> = run_cast(&[4_000_000_000u32, u32::MAX, 7], "cast_u32_f64");
+    assert_eq!(results, [4.0e9f64, u32::MAX as f64, 7.0]);
+    let exact = ((1i64 << 40) + 3) as f64;
+    let saturating = [exact, -exact, 1e300, -1e300];
+    let results: Vec<i64> = run_cast(&saturating, "cast_f64_i64");
+    assert_eq!(results, saturating.map(|v| v as i64));
+    let results: Vec<u32> = run_cast(&[5e9f64, -1.0, 7.0], "cast_f64_u32");
+    assert_eq!(results, [u32::MAX, 0, 7]);
+    let results: Vec<i16> = run_cast(&[5e9f64, -5e9, 7.0], "cast_f64_i16");
+    assert_eq!(results, [i16::MAX, i16::MIN, 7]);
+}
+
+#[test]
 fn cast_i32() {
     let v_f64 = [1.0f64, 2.0, 3.0];
     let v_f32: Vec<f32> = v_f64.iter().map(|&v| v as f32).collect();

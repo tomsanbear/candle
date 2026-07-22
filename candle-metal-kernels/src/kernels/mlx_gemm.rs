@@ -257,6 +257,10 @@ fn should_use_split_k(b: usize, m: usize, n: usize, k: usize) -> bool {
 
 /// M=1 -> gemv_t (vec[K] x mat[K,N] -> vec[N])
 /// N=1 -> gemv   (mat[M,K] x vec[K] -> vec[M])
+///
+/// `bias` fuses `out += bias` into the kernel epilogue (the `_axpby1`
+/// variants with alpha = beta = 1). The bias vector has `out_vec_size`
+/// elements and broadcasts across the batch.
 #[allow(clippy::too_many_arguments)]
 pub fn call_mlx_gemv(
     device: &Device,
@@ -270,6 +274,7 @@ pub fn call_mlx_gemv(
     rhs_stride: &[usize],
     rhs_offset: usize,
     rhs_buffer: &Buffer,
+    bias: Option<(&Buffer, usize)>,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
@@ -393,9 +398,10 @@ pub fn call_mlx_gemv(
         GemmDType::BF16 => "bfloat16",
     };
     let kernel_prefix = if transpose_mat { "gemv_t" } else { "gemv" };
+    let axpby = if bias.is_some() { 1 } else { 0 };
     let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0",
-        kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn
+        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby{}",
+        kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn, axpby
     );
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
@@ -407,20 +413,23 @@ pub fn call_mlx_gemv(
     let vec_batch_strides = [vec_batch_stride];
     let mat_batch_strides = [mat_batch_stride];
     let bias_batch_strides = [0i64];
+    // The kernel only reads the bias when compiled with axpby: out is then
+    // alpha * result + beta * bias.
+    let beta = if bias.is_some() { 1.0f32 } else { 0.0f32 };
 
     set_params!(
         encoder,
         (
             Input::with_offset(mat_buffer, mat_offset),
             Input::with_offset(vec_buffer, vec_offset),
-            (), // bias
+            (), // bias, bound below when present
             Output::new(output),
             in_vec_size as i32,
             out_vec_size as i32,
             mat_ld as i32,
             1.0f32, // alpha
-            0.0f32, // beta
-            1i32,   // batch_ndim
+            beta,
+            1i32, // batch_ndim
             &batch_shape[..],
             &vec_batch_strides[..],
             &mat_batch_strides[..],
@@ -428,6 +437,9 @@ pub fn call_mlx_gemv(
             1i32 // bias_stride
         )
     );
+    if let Some((bias, bias_offset)) = bias {
+        encoder.set_input_buffer(2, Some(bias), bias_offset);
+    }
 
     let n_out_per_tgp = if transpose_mat {
         bn * sn * tn
@@ -462,6 +474,43 @@ pub fn call_mlx_gemm(
     rhs_stride: &[usize],
     rhs_offset: usize,
     rhs_buffer: &Buffer,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_mlx_gemm_with_bias(
+        device,
+        ep,
+        kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        None,
+        output,
+    )
+}
+
+/// `call_mlx_gemm` with an optional fused `out += bias` epilogue: the bias is
+/// an `n`-element vector broadcast over rows and batch, applied through the
+/// steel kernel's addmm path (`use_out_source`/`do_axpby` function constants
+/// with a zero row stride) or the gemv `_axpby1` variants for M=1/N=1.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemm_with_bias(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    bias: Option<(&Buffer, usize)>,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
@@ -530,6 +579,7 @@ pub fn call_mlx_gemm(
             rhs_stride,
             rhs_offset,
             rhs_buffer,
+            bias,
             output,
         );
     }
@@ -555,8 +605,8 @@ pub fn call_mlx_gemm(
 
     let constants = Some(ConstantValues::new(vec![
         (10, Value::Bool(has_batch)),
-        (100, Value::Bool(/* use_out_source */ false)),
-        (110, Value::Bool(/* do_axpby */ false)),
+        (100, Value::Bool(/* use_out_source */ bias.is_some())),
+        (110, Value::Bool(/* do_axpby */ bias.is_some())),
         (200, Value::Bool(/* align_m */ m % bm == 0)),
         (201, Value::Bool(/* align_n */ n % bn == 0)),
         (202, Value::Bool(/* align_k */ k % bk == 0)),
@@ -636,22 +686,61 @@ pub fn call_mlx_gemm(
         }
     }
 
-    // Batch strides for buffer 7 (same as main branch)
-    let batch_strides = [batch_stride_a, batch_stride_b];
+    // Mirrors the MSL GEMMAddMMParams layout (mlx_gemm.metal).
+    #[derive(Debug)]
+    #[repr(C)]
+    struct GemmAddMMParams {
+        ldc: i32,
+        fdc: i32,
+        batch_stride_c: usize,
+        alpha: f32,
+        beta: f32,
+    }
+    impl EncoderParam for GemmAddMMParams {
+        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+            encoder.set_bytes(position, &data);
+        }
+    }
+
+    // Buffer 7 holds per-operand batch strides: A, then B, then — only when
+    // use_out_source is set — C (batch_ndim entries each). The zero C stride
+    // broadcasts the bias across the batch.
+    let batch_strides = [batch_stride_a, batch_stride_b, 0isize];
+    let batch_strides: &[isize] = if bias.is_some() {
+        &batch_strides[..]
+    } else {
+        &batch_strides[..2]
+    };
 
     set_params!(
         encoder,
         (
             (lhs_buffer, lhs_offset),
             (rhs_buffer, rhs_offset),
-            (),
+            (), // C, bound below when a bias is fused
             Output::new(output),
             gemm_params,
-            (),
+            (), // addmm_params, set below when a bias is fused
             b as i32,
-            &batch_strides[..]
+            batch_strides
         )
     );
+    if let Some((bias, bias_offset)) = bias {
+        encoder.set_input_buffer(2, Some(bias), bias_offset);
+        // A zero row stride broadcasts the n-element bias across rows and
+        // batch; alpha/beta = 1 makes the epilogue a plain `+ bias`.
+        crate::utils::set_param(
+            encoder,
+            5,
+            GemmAddMMParams {
+                ldc: 0,
+                fdc: 1,
+                batch_stride_c: 0,
+                alpha: 1.0,
+                beta: 1.0,
+            },
+        );
+    }
 
     let grid_size = MTLSize {
         width: tn,

@@ -1511,6 +1511,165 @@ fn run_mlx_gemm<T: Clone>(
     read_to_vec(&output, length)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_mlx_gemm_bias<T: Clone>(
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[T],
+    lhs_stride: &[usize],
+    rhs: &[T],
+    rhs_stride: &[usize],
+    bias: &[T],
+) -> Vec<T> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let lhs = device
+        .new_buffer_with_data(
+            lhs.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(lhs),
+            options,
+        )
+        .unwrap();
+    let rhs = device
+        .new_buffer_with_data(
+            rhs.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(rhs),
+            options,
+        )
+        .unwrap();
+    let bias = device
+        .new_buffer_with_data(
+            bias.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(bias),
+            options,
+        )
+        .unwrap();
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<T>(), options)
+        .unwrap();
+    call_mlx_gemm_with_bias(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs,
+        rhs_stride,
+        0,
+        &rhs,
+        Some((&bias, 0)),
+        &output,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    read_to_vec(&output, length)
+}
+
+#[test]
+fn mlx_gemm_bias() {
+    // Steel path (m > 1): the fused bias must equal gemm + broadcast add.
+    let (b, m, n, k) = (2, 2, 4, 3);
+    let lhs: Vec<f32> = (0..b * m * k).map(|f| f as f32).collect();
+    let rhs: Vec<f32> = (0..b * n * k).map(|f| f as f32).collect();
+    let bias: Vec<f32> = (0..n).map(|f| 10.0 + f as f32).collect();
+    let plain = run_mlx_gemm(
+        GemmDType::F32,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        0,
+        &rhs,
+        &[n * k, n, 1],
+        0,
+    );
+    let fused = run_mlx_gemm_bias(
+        GemmDType::F32,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        &rhs,
+        &[n * k, n, 1],
+        &bias,
+    );
+    let expected: Vec<f32> = plain
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v + bias[i % n])
+        .collect();
+    assert_eq!(approx(fused, 4), approx(expected, 4));
+
+    // GEMV path (m == 1): the `_axpby1` variant.
+    let (b, m, n, k) = (1, 1, 8, 16);
+    let lhs: Vec<f32> = (0..b * m * k).map(|f| f as f32 * 0.25).collect();
+    let rhs: Vec<f32> = (0..b * n * k).map(|f| f as f32 * 0.125).collect();
+    let bias: Vec<f32> = (0..n).map(|f| 100.0 - f as f32).collect();
+    let plain = run_mlx_gemm(
+        GemmDType::F32,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        0,
+        &rhs,
+        &[n * k, n, 1],
+        0,
+    );
+    let fused = run_mlx_gemm_bias(
+        GemmDType::F32,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        &rhs,
+        &[n * k, n, 1],
+        &bias,
+    );
+    let expected: Vec<f32> = plain
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v + bias[i % n])
+        .collect();
+    assert_eq!(approx(fused, 4), approx(expected, 4));
+
+    // bf16 GEMV, exactly representable values.
+    let (b, m, n, k) = (1, 1, 4, 8);
+    let lhs: Vec<bf16> = (0..k).map(|f| bf16::from_f32(f as f32)).collect();
+    let rhs: Vec<bf16> = (0..n * k).map(|f| bf16::from_f32((f % 5) as f32)).collect();
+    let bias: Vec<bf16> = (0..n).map(|f| bf16::from_f32(8.0 + f as f32)).collect();
+    let plain = run_mlx_gemm(
+        GemmDType::BF16,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        0,
+        &rhs,
+        &[n * k, n, 1],
+        0,
+    );
+    let fused = run_mlx_gemm_bias(
+        GemmDType::BF16,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        &rhs,
+        &[n * k, n, 1],
+        &bias,
+    );
+    let expected: Vec<bf16> = plain
+        .iter()
+        .enumerate()
+        .map(|(i, v)| bf16::from_f32(v.to_f32() + bias[i % n].to_f32()))
+        .collect();
+    assert_eq!(fused, expected);
+}
+
 #[test]
 fn mlx_gemm() {
     let (b, m, n, k) = (1, 2, 4, 3);

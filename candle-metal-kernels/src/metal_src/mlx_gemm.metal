@@ -2,6 +2,7 @@
 // https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/steel/gemm
 // Copyright © 2024 Apple Inc.
 
+#include <metal_math>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
@@ -1010,6 +1011,42 @@ constant bool do_gather [[function_constant(300)]];
 
 constant bool gather_bias = do_gather && use_out_source;
 
+// Unary activation fused into the epilogue, applied after the optional addmm
+// epilogue: 0 = none, 1 = relu, 2 = gelu (tanh approximation), 3 = silu.
+constant ushort gemm_activation [[function_constant(120)]];
+constant bool do_activation = gemm_activation != 0;
+
+// Formulas and evaluation type mirror unary.metal's urelu/ugelu/usilu so the
+// fused result matches the composed matmul + unary chain.
+template <typename T>
+METAL_FUNC T gemm_activation_apply(T x) {
+  if (gemm_activation == 1) { // relu
+    return x < 0 ? T(0) : x;
+  } else if (gemm_activation == 2) { // gelu (tanh approximation)
+    if (x > 5) {
+      return x;
+    }
+    T x_sq = x * x;
+    T x_cube = x_sq * x;
+    T alpha = x + static_cast<T>(0.044715) * x_cube;
+    T beta = (static_cast<T>(M_2_SQRTPI_F * M_SQRT1_2_F) * alpha);
+    return static_cast<T>(0.5) * x * (static_cast<T>(1.0) + T(precise::tanh(beta)));
+  } else if (gemm_activation == 3) { // silu
+    return static_cast<T>(x / (1 + exp(-x)));
+  }
+  return x;
+}
+
+// Unary epilogue for BlockMMA::apply_epilogue. The activation is evaluated in
+// the output type OutT (not the accumulator type) to match the precision of
+// the composed chain, which applies the unary op to the stored output.
+template <typename OutT, typename AccT>
+struct TransformActivation {
+  METAL_FUNC AccT apply(AccT x) const {
+    return static_cast<AccT>(gemm_activation_apply(static_cast<OutT>(x)));
+  }
+};
+
 // clang-format off
 template <
     typename T,
@@ -1226,6 +1263,7 @@ template <
       addmm_params->alpha, addmm_params->beta);
   const TransformAxpby<AccumType, AccumType> epilogue_op_axpby(
       addmm_params->alpha, addmm_params->beta);
+  const TransformActivation<T, AccumType> epilogue_op_act = {};
 
   ///////////////////////////////////////////////////////////////////////////////
   // MNK aligned loop
@@ -1260,6 +1298,10 @@ template <
       }
     }
 
+    if (do_activation) {
+      mma_op.apply_epilogue(epilogue_op_act);
+    }
+
     // Store results to device memory
     return mma_op.store_result(D, params->ldd);
 
@@ -1292,6 +1334,10 @@ template <
           mma_op.apply_epilogue(
               C, addmm_params->ldc, addmm_params->fdc, epilogue_op_add);
         }
+      }
+
+      if (do_activation) {
+        mma_op.apply_epilogue(epilogue_op_act);
       }
 
       // Store results to device memory
@@ -1329,6 +1375,10 @@ template <
         }
       }
 
+      if (do_activation) {
+        mma_op.apply_epilogue(epilogue_op_act);
+      }
+
       // Store results to device memory
       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
 
@@ -1364,6 +1414,10 @@ template <
         }
       }
 
+      if (do_activation) {
+        mma_op.apply_epilogue(epilogue_op_act);
+      }
+
       // Store results to device memory
       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
 
@@ -1397,6 +1451,10 @@ template <
               short2(tgp_bn, tgp_bm),
               epilogue_op_add);
         }
+      }
+
+      if (do_activation) {
+        mma_op.apply_epilogue(epilogue_op_act);
       }
 
       // Store results to device memory

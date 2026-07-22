@@ -424,6 +424,43 @@ fn matmul_bias(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn matmul_bias_act(device: &Device) -> Result<()> {
+    use candle_nn::ops::MatmulActivation;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(299792458);
+    let mut rand = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.random::<f32>() - 0.5).collect() };
+
+    // Decode row (gemv) and small prefill (steel) shapes.
+    for (b, m, k, n) in [(1usize, 1usize, 64usize, 48usize), (2, 33, 64, 48)] {
+        let lhs = Tensor::from_vec(rand(b * m * k), (b, m, k), device)?;
+        let rhs = Tensor::from_vec(rand(k * n), (k, n), device)?;
+        let bias = Tensor::from_vec(rand(n), n, device)?;
+        let base = lhs.broadcast_matmul(&rhs)?.broadcast_add(&bias)?;
+        for act in [
+            MatmulActivation::Relu,
+            MatmulActivation::Gelu,
+            MatmulActivation::Silu,
+        ] {
+            let fused = candle_nn::ops::matmul_bias_act(&lhs, &rhs, &bias, act)?;
+            let reference = match act {
+                MatmulActivation::Relu => base.relu()?,
+                MatmulActivation::Gelu => base.gelu()?,
+                MatmulActivation::Silu => base.silu()?,
+            };
+            let diff = (&fused - &reference)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .to_scalar::<f32>()?;
+            assert!(
+                diff < 1e-5,
+                "matmul_bias_act mismatch at b={b} m={m} k={k} n={n} act={act:?}: {diff}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn sigmoid(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
@@ -449,5 +486,11 @@ test_device!(
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
 test_device!(matmul_bias, matmul_bias_cpu, matmul_bias_gpu, matmul_bias_metal);
+test_device!(
+    matmul_bias_act,
+    matmul_bias_act_cpu,
+    matmul_bias_act_gpu,
+    matmul_bias_act_metal
+);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);

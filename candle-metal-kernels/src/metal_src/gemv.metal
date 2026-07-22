@@ -2,6 +2,7 @@
 // https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/gemv.metal
 // Copyright © 2023-2024 Apple Inc.
 
+#include <metal_math>
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
@@ -9,6 +10,33 @@ using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
 #define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+
+// Unary activation fused into the epilogue, applied after the optional axpby
+// bias: 0 = none, 1 = relu, 2 = gelu (tanh approximation), 3 = silu. Same
+// constant index and semantics as mlx_gemm.metal (the files compile as
+// separate libraries, so the helper is duplicated).
+constant ushort gemm_activation [[function_constant(120)]];
+
+// Formulas and evaluation type mirror unary.metal's urelu/ugelu/usilu so the
+// fused result matches the composed matmul + unary chain.
+template <typename T>
+METAL_FUNC T gemm_activation_apply(T x) {
+  if (gemm_activation == 1) { // relu
+    return x < 0 ? T(0) : x;
+  } else if (gemm_activation == 2) { // gelu (tanh approximation)
+    if (x > 5) {
+      return x;
+    }
+    T x_sq = x * x;
+    T x_cube = x_sq * x;
+    T alpha = x + static_cast<T>(0.044715) * x_cube;
+    T beta = (static_cast<T>(M_2_SQRTPI_F * M_SQRT1_2_F) * alpha);
+    return static_cast<T>(0.5) * x * (static_cast<T>(1.0) + T(precise::tanh(beta)));
+  } else if (gemm_activation == 3) { // silu
+    return static_cast<T>(x / (1 + exp(-x)));
+  }
+  return x;
+}
 
 // elem_to_loc for nc=1 batch handling
 template <typename stride_t>
@@ -198,11 +226,12 @@ struct GEMVKernel {
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         if (kDoAxpby) {
-          out_vec[out_row + tm] =
+          out_vec[out_row + tm] = gemm_activation_apply(
               static_cast<T>(alpha) * static_cast<T>(result[tm]) +
-              static_cast<T>(beta) * bias[(out_row + tm) * bias_stride];
+              static_cast<T>(beta) * bias[(out_row + tm) * bias_stride]);
         } else {
-          out_vec[out_row + tm] = static_cast<T>(result[tm]);
+          out_vec[out_row + tm] =
+              gemm_activation_apply(static_cast<T>(result[tm]));
         }
       }
     }
@@ -357,11 +386,11 @@ struct GEMVTKernel {
       MLX_MTL_PRAGMA_UNROLL
       for (int j = 0; j < TN; j++) {
         if (kDoAxpby) {
-          out_vec[out_col + j] =
+          out_vec[out_col + j] = gemm_activation_apply(
               static_cast<T>(alpha) * static_cast<T>(result[j]) +
-              static_cast<T>(beta) * bias[(out_col + j) * bias_stride];
+              static_cast<T>(beta) * bias[(out_col + j) * bias_stride]);
         } else {
-          out_vec[out_col + j] = static_cast<T>(result[j]);
+          out_vec[out_col + j] = gemm_activation_apply(static_cast<T>(result[j]));
         }
       }
     }

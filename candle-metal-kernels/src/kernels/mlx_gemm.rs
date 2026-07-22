@@ -13,6 +13,31 @@ pub enum GemmDType {
     F32,
 }
 
+/// Unary activation fused into the GEMM/GEMV epilogue, applied after the
+/// optional bias. Selected through function constant 120 in mlx_gemm.metal
+/// and gemv.metal; the kernel formulas mirror unary.metal's urelu/ugelu/usilu
+/// so the fused result matches the composed matmul + unary chain.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum GemmActivation {
+    #[default]
+    None,
+    Relu,
+    /// The tanh-approximation gelu (candle's `Tensor::gelu`).
+    Gelu,
+    Silu,
+}
+
+impl GemmActivation {
+    fn constant_value(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Relu => 1,
+            Self::Gelu => 2,
+            Self::Silu => 3,
+        }
+    }
+}
+
 /// Tile configuration for GEMM kernel.
 ///
 /// These parameters control the block sizes and warp tiling for the Metal GEMM kernel.
@@ -260,7 +285,8 @@ fn should_use_split_k(b: usize, m: usize, n: usize, k: usize) -> bool {
 ///
 /// `bias` fuses `out += bias` into the kernel epilogue (the `_axpby1`
 /// variants with alpha = beta = 1). The bias vector has `out_vec_size`
-/// elements and broadcasts across the batch.
+/// elements and broadcasts across the batch. `activation` applies a fused
+/// unary op after the bias.
 #[allow(clippy::too_many_arguments)]
 pub fn call_mlx_gemv(
     device: &Device,
@@ -275,6 +301,7 @@ pub fn call_mlx_gemv(
     rhs_offset: usize,
     rhs_buffer: &Buffer,
     bias: Option<(&Buffer, usize)>,
+    activation: GemmActivation,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
@@ -404,7 +431,13 @@ pub fn call_mlx_gemv(
         kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn, axpby
     );
 
-    let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
+    // The gemv kernels always reference the activation function constant, so
+    // it must be set even for the identity case.
+    let constants = Some(ConstantValues::new(vec![(
+        120,
+        Value::U16(activation.constant_value()),
+    )]));
+    let pipeline = kernels.load_pipeline_with_constants(device, Source::Gemv, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -489,14 +522,16 @@ pub fn call_mlx_gemm(
         rhs_offset,
         rhs_buffer,
         None,
+        GemmActivation::None,
         output,
     )
 }
 
-/// `call_mlx_gemm` with an optional fused `out += bias` epilogue: the bias is
-/// an `n`-element vector broadcast over rows and batch, applied through the
-/// steel kernel's addmm path (`use_out_source`/`do_axpby` function constants
-/// with a zero row stride) or the gemv `_axpby1` variants for M=1/N=1.
+/// `call_mlx_gemm` with an optional fused epilogue: `bias` is an `n`-element
+/// vector broadcast over rows and batch, applied through the steel kernel's
+/// addmm path (`use_out_source`/`do_axpby` function constants with a zero row
+/// stride) or the gemv `_axpby1` variants for M=1/N=1; `activation` then
+/// applies a fused unary op (with or without a bias).
 #[allow(clippy::too_many_arguments)]
 pub fn call_mlx_gemm_with_bias(
     device: &Device,
@@ -511,6 +546,7 @@ pub fn call_mlx_gemm_with_bias(
     rhs_offset: usize,
     rhs_buffer: &Buffer,
     bias: Option<(&Buffer, usize)>,
+    activation: GemmActivation,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
@@ -580,6 +616,7 @@ pub fn call_mlx_gemm_with_bias(
             rhs_offset,
             rhs_buffer,
             bias,
+            activation,
             output,
         );
     }
@@ -607,6 +644,7 @@ pub fn call_mlx_gemm_with_bias(
         (10, Value::Bool(has_batch)),
         (100, Value::Bool(/* use_out_source */ bias.is_some())),
         (110, Value::Bool(/* do_axpby */ bias.is_some())),
+        (120, Value::U16(/* gemm_activation */ activation.constant_value())),
         (200, Value::Bool(/* align_m */ m % bm == 0)),
         (201, Value::Bool(/* align_n */ n % bn == 0)),
         (202, Value::Bool(/* align_k */ k % bk == 0)),

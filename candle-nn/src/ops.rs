@@ -1156,7 +1156,20 @@ pub fn layer_norm_no_bias(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tenso
     xs.apply_op2_no_bwd(alpha, &LayerNormNoBias { eps })
 }
 
-struct MatmulBias;
+/// Unary activation fusable into `matmul_bias`'s GEMM epilogue on Metal.
+/// Each variant computes the same formula as the matching tensor op:
+/// `relu`, `gelu` (the tanh approximation) or `silu`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MatmulActivation {
+    Relu,
+    Gelu,
+    Silu,
+}
+
+struct MatmulBias {
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    activation: Option<MatmulActivation>,
+}
 
 impl candle::CustomOp3 for MatmulBias {
     fn name(&self) -> &'static str {
@@ -1219,6 +1232,13 @@ impl candle::CustomOp3 for MatmulBias {
             candle::bail!("matmul-bias dtypes must match");
         }
 
+        let activation = match self.activation {
+            None => candle_metal_kernels::GemmActivation::None,
+            Some(MatmulActivation::Relu) => candle_metal_kernels::GemmActivation::Relu,
+            Some(MatmulActivation::Gelu) => candle_metal_kernels::GemmActivation::Gelu,
+            Some(MatmulActivation::Silu) => candle_metal_kernels::GemmActivation::Silu,
+        };
+
         let device = lhs.device();
         let elem_count = b * m * n;
         let output = device
@@ -1243,6 +1263,7 @@ impl candle::CustomOp3 for MatmulBias {
                 bias.buffer(),
                 bias_l.start_offset() * bias.dtype().size_in_bytes(),
             )),
+            activation,
             &output,
         )
         .map_err(candle::Error::wrap)?;
@@ -1262,6 +1283,35 @@ pub fn matmul_bias(lhs: &Tensor, rhs: &Tensor, bias: &Tensor) -> Result<Tensor> 
     if !lhs.device().is_metal() {
         return lhs.broadcast_matmul(rhs)?.broadcast_add(bias);
     }
+    fused_matmul_bias(lhs, rhs, bias, None)
+}
+
+/// `matmul_bias` followed by a unary activation, all fused into the GEMM
+/// epilogue on Metal. Other backends compose the same chain from separate
+/// ops.
+pub fn matmul_bias_act(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    bias: &Tensor,
+    activation: MatmulActivation,
+) -> Result<Tensor> {
+    if !lhs.device().is_metal() {
+        let out = lhs.broadcast_matmul(rhs)?.broadcast_add(bias)?;
+        return match activation {
+            MatmulActivation::Relu => out.relu(),
+            MatmulActivation::Gelu => out.gelu(),
+            MatmulActivation::Silu => out.silu(),
+        };
+    }
+    fused_matmul_bias(lhs, rhs, bias, Some(activation))
+}
+
+fn fused_matmul_bias(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    bias: &Tensor,
+    activation: Option<MatmulActivation>,
+) -> Result<Tensor> {
     // Give a lower-rank rhs explicit zero-stride batch dims so the kernel's
     // per-operand batch strides are exact.
     let rhs = if rhs.rank() < lhs.rank() {
@@ -1270,7 +1320,7 @@ pub fn matmul_bias(lhs: &Tensor, rhs: &Tensor, bias: &Tensor) -> Result<Tensor> 
     } else {
         rhs.clone()
     };
-    lhs.apply_op3_no_bwd(&rhs, bias, &MatmulBias)
+    lhs.apply_op3_no_bwd(&rhs, bias, &MatmulBias { activation })
 }
 
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html

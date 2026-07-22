@@ -1519,7 +1519,8 @@ fn run_mlx_gemm_bias<T: Clone>(
     lhs_stride: &[usize],
     rhs: &[T],
     rhs_stride: &[usize],
-    bias: &[T],
+    bias: Option<&[T]>,
+    activation: GemmActivation,
 ) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
@@ -1541,13 +1542,15 @@ fn run_mlx_gemm_bias<T: Clone>(
             options,
         )
         .unwrap();
-    let bias = device
-        .new_buffer_with_data(
-            bias.as_ptr() as *const core::ffi::c_void,
-            std::mem::size_of_val(bias),
-            options,
-        )
-        .unwrap();
+    let bias = bias.map(|bias| {
+        device
+            .new_buffer_with_data(
+                bias.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(bias),
+                options,
+            )
+            .unwrap()
+    });
     let length = b * m * n;
     let output = device
         .new_buffer(length * core::mem::size_of::<T>(), options)
@@ -1564,7 +1567,8 @@ fn run_mlx_gemm_bias<T: Clone>(
         rhs_stride,
         0,
         &rhs,
-        Some((&bias, 0)),
+        bias.as_ref().map(|bias| (bias, 0)),
+        activation,
         &output,
     )
     .unwrap();
@@ -1598,7 +1602,8 @@ fn mlx_gemm_bias() {
         &[m * k, k, 1],
         &rhs,
         &[n * k, n, 1],
-        &bias,
+        Some(&bias),
+        GemmActivation::None,
     );
     let expected: Vec<f32> = plain
         .iter()
@@ -1629,7 +1634,8 @@ fn mlx_gemm_bias() {
         &[m * k, k, 1],
         &rhs,
         &[n * k, n, 1],
-        &bias,
+        Some(&bias),
+        GemmActivation::None,
     );
     let expected: Vec<f32> = plain
         .iter()
@@ -1660,7 +1666,8 @@ fn mlx_gemm_bias() {
         &[m * k, k, 1],
         &rhs,
         &[n * k, n, 1],
-        &bias,
+        Some(&bias),
+        GemmActivation::None,
     );
     let expected: Vec<bf16> = plain
         .iter()
@@ -1668,6 +1675,231 @@ fn mlx_gemm_bias() {
         .map(|(i, v)| bf16::from_f32(v.to_f32() + bias[i % n].to_f32()))
         .collect();
     assert_eq!(fused, expected);
+}
+
+/// f32 reference for the fused epilogue activations, mirroring the kernel
+/// (and unary.metal) formulas.
+fn activation_ref(activation: GemmActivation, x: f32) -> f32 {
+    match activation {
+        GemmActivation::None => x,
+        GemmActivation::Relu => {
+            if x < 0.0 {
+                0.0
+            } else {
+                x
+            }
+        }
+        GemmActivation::Gelu => {
+            if x > 5.0 {
+                x
+            } else {
+                let beta = (2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                0.5 * x * (1.0 + beta.tanh())
+            }
+        }
+        GemmActivation::Silu => x / (1.0 + (-x).exp()),
+    }
+}
+
+fn assert_close(a: &[f32], b: &[f32], tol: f32, ctx: &str) {
+    assert_eq!(a.len(), b.len(), "{ctx}: length mismatch");
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert!(
+            (x - y).abs() <= tol,
+            "{ctx}: mismatch at {i}: {x} vs {y} (tol {tol})"
+        );
+    }
+}
+
+#[test]
+fn mlx_gemm_activation() {
+    let acts = [
+        GemmActivation::Relu,
+        GemmActivation::Gelu,
+        GemmActivation::Silu,
+    ];
+    // Signed inputs so relu/silu see negative pre-activation values; the
+    // scales keep the accumulators small enough for tight tolerances.
+    let signed_lhs = |len: usize| -> Vec<f32> {
+        (0..len).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect()
+    };
+    let signed_rhs = |len: usize| -> Vec<f32> {
+        (0..len).map(|i| ((i % 5) as f32 - 2.0) * 0.25).collect()
+    };
+
+    // Steel path (m >= 16): shapes chosen to hit every store branch of the
+    // kernel (fully aligned, M-aligned, N-aligned, both unaligned + batch).
+    // Tile sizes vary per device type, so alignment coverage is best-effort.
+    for (b, m, n, k) in [(1, 64, 64, 32), (1, 64, 18, 20), (1, 33, 32, 32), (2, 33, 18, 20)] {
+        let lhs = signed_lhs(b * m * k);
+        let rhs = signed_rhs(b * n * k);
+        let bias: Vec<f32> = (0..n).map(|i| (i as f32 - 8.0) * 0.5).collect();
+        let plain = run_mlx_gemm(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            0,
+            &rhs,
+            &[n * k, n, 1],
+            0,
+        );
+        for act in acts {
+            let fused = run_mlx_gemm_bias(
+                GemmDType::F32,
+                (b, m, n, k),
+                &lhs,
+                &[m * k, k, 1],
+                &rhs,
+                &[n * k, n, 1],
+                Some(&bias),
+                act,
+            );
+            let expected: Vec<f32> = plain
+                .iter()
+                .enumerate()
+                .map(|(i, v)| activation_ref(act, v + bias[i % n]))
+                .collect();
+            assert_close(&fused, &expected, 1e-4, &format!("steel {m}x{n}x{k} bias {act:?}"));
+
+            // Activation without a bias.
+            let fused = run_mlx_gemm_bias(
+                GemmDType::F32,
+                (b, m, n, k),
+                &lhs,
+                &[m * k, k, 1],
+                &rhs,
+                &[n * k, n, 1],
+                None,
+                act,
+            );
+            let expected: Vec<f32> = plain.iter().map(|v| activation_ref(act, *v)).collect();
+            assert_close(&fused, &expected, 1e-4, &format!("steel {m}x{n}x{k} {act:?}"));
+        }
+    }
+
+    // GEMV paths: m == 1 -> gemv_t, n == 1 -> gemv. The bias vector has
+    // out_vec_size elements (n for gemv_t, m for gemv).
+    for (b, m, n, k) in [(1, 1, 18, 32), (1, 1, 18, 192), (1, 8, 1, 32), (1, 8, 1, 192)] {
+        let lhs = signed_lhs(b * m * k);
+        let rhs = signed_rhs(b * n * k);
+        let out_len = if m == 1 { n } else { m };
+        let bias: Vec<f32> = (0..out_len).map(|i| (i as f32 - 8.0) * 0.5).collect();
+        let plain = run_mlx_gemm(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            0,
+            &rhs,
+            &[n * k, n, 1],
+            0,
+        );
+        for act in acts {
+            let fused = run_mlx_gemm_bias(
+                GemmDType::F32,
+                (b, m, n, k),
+                &lhs,
+                &[m * k, k, 1],
+                &rhs,
+                &[n * k, n, 1],
+                Some(&bias),
+                act,
+            );
+            let expected: Vec<f32> = plain
+                .iter()
+                .enumerate()
+                .map(|(i, v)| activation_ref(act, v + bias[i % out_len]))
+                .collect();
+            assert_close(&fused, &expected, 1e-4, &format!("gemv {m}x{n}x{k} bias {act:?}"));
+
+            let fused = run_mlx_gemm_bias(
+                GemmDType::F32,
+                (b, m, n, k),
+                &lhs,
+                &[m * k, k, 1],
+                &rhs,
+                &[n * k, n, 1],
+                None,
+                act,
+            );
+            let expected: Vec<f32> = plain.iter().map(|v| activation_ref(act, *v)).collect();
+            assert_close(&fused, &expected, 1e-4, &format!("gemv {m}x{n}x{k} {act:?}"));
+        }
+    }
+
+    // Half dtypes: the kernel evaluates the activation in the output type
+    // (matching the composed unary op), so compare against an f32 reference
+    // built from the plain half output with a dtype-sized tolerance.
+    let (b, m, n, k) = (1, 32, 32, 16);
+    let lhs: Vec<f16> = signed_lhs(b * m * k).iter().map(|v| f16::from_f32(*v)).collect();
+    let rhs: Vec<f16> = signed_rhs(b * n * k).iter().map(|v| f16::from_f32(*v)).collect();
+    let bias: Vec<f16> = (0..n).map(|i| f16::from_f32((i as f32 - 8.0) * 0.5)).collect();
+    let plain = run_mlx_gemm(
+        GemmDType::F16,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        0,
+        &rhs,
+        &[n * k, n, 1],
+        0,
+    );
+    for act in acts {
+        let fused = run_mlx_gemm_bias(
+            GemmDType::F16,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            &rhs,
+            &[n * k, n, 1],
+            Some(&bias),
+            act,
+        );
+        let fused: Vec<f32> = fused.iter().map(|v: &f16| v.to_f32()).collect();
+        let expected: Vec<f32> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, v)| activation_ref(act, v.to_f32() + bias[i % n].to_f32()))
+            .collect();
+        assert_close(&fused, &expected, 3e-2, &format!("steel f16 bias {act:?}"));
+    }
+
+    let (b, m, n, k) = (1, 1, 18, 32);
+    let lhs: Vec<bf16> = signed_lhs(b * m * k).iter().map(|v| bf16::from_f32(*v)).collect();
+    let rhs: Vec<bf16> = signed_rhs(b * n * k).iter().map(|v| bf16::from_f32(*v)).collect();
+    let bias: Vec<bf16> = (0..n).map(|i| bf16::from_f32((i as f32 - 8.0) * 0.5)).collect();
+    let plain = run_mlx_gemm(
+        GemmDType::BF16,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        0,
+        &rhs,
+        &[n * k, n, 1],
+        0,
+    );
+    for act in acts {
+        let fused = run_mlx_gemm_bias(
+            GemmDType::BF16,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            &rhs,
+            &[n * k, n, 1],
+            Some(&bias),
+            act,
+        );
+        let fused: Vec<f32> = fused.iter().map(|v: &bf16| v.to_f32()).collect();
+        let expected: Vec<f32> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, v)| activation_ref(act, v.to_f32() + bias[i % n].to_f32()))
+            .collect();
+        // The gemv axpby and activation both evaluate in bf16, so allow a
+        // couple of bf16 ulps at these magnitudes vs the f32 reference.
+        assert_close(&fused, &expected, 1.5e-1, &format!("gemv bf16 bias {act:?}"));
+    }
 }
 
 #[test]

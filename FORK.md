@@ -6,12 +6,18 @@ themselves in production use, then graduate to focused `fix/*` / `feat/*` /
 `perf/*` topic branches and upstream PRs. This file is the single inventory —
 every carried change, its upstream status, and our confidence in it.
 
+**Base**: `tomsanbear-dev` is merged with upstream `main` at 0.11.0
+(`31f35b14`, merge commit `23b9460e`, 2026-07-22). Validation at the merge:
+candle-metal-kernels 60/60, candle-core `--features metal` 334/334,
+candle-nn `--features metal` 75/75.
+
 **Status vocabulary** (adapted from Yocto's `Upstream-Status`, the closest
 industry standard for carried patches): `Incubating` (on tomsanbear-dev, not
 yet PR'd) · `Submitted (#PR)` (open upstream) · `Merged (#PR)` (in upstream
 main) · `Rejected (#PR)` (upstream said no) · `Refuted` (we measured it and
-killed it ourselves — kept for the record) · `Wanted` (identified need,
-nothing written yet).
+killed it ourselves — kept for the record) · `Superseded` (upstream solved
+the same problem another way — kept for the record) · `Wanted` (identified
+need, nothing written yet).
 
 **Confidence**: `proven` (shipping in a project with receipts) · `tested`
 (unit/bench coverage, not in production) · `experimental` · `n/a`.
@@ -23,13 +29,16 @@ per logical change, not per commit.
 
 ## In flight (open upstream PRs)
 
+All five 2026 PRs below are also carried on `tomsanbear-dev` (cherry-picked
+2026-07-22, re-validated on the 0.11 base).
+
 | Item | Area | Branch | Status | Confidence | Notes |
 |---|---|---|---|---|---|
 | Shared locks for Metal pipeline-cache hits | metal-core | perf/metal-cache-read-locks | Submitted (#3761) | tested | read-mostly cache; contention fix |
 | Metal pipeline cache source identity | metal-core | fix/metal-pipeline-cache-identity | Submitted (#3760) | tested | cache key collisions across kernel sources |
 | CPU batched matmul with broadcast (stride-0) views | cpu | fix/cpu-stride-zero-batched-matmul | Submitted (#3758) | tested | |
 | Empty binary-op validation + gradients | core/autograd | fix/empty-binary-validation-autograd | Submitted (#3757) | tested | |
-| Zero-sized matmul validation + gradients | core/autograd | fix/zero-matmul-validation-autograd | Submitted (#3756) | tested | |
+| Zero-sized matmul validation + gradients | core/autograd | fix/zero-matmul-validation-autograd | Submitted (#3756) | tested | dev carries the 3-arg helper as `assert_zero_grad_shaped` (renamed at cherry-pick to coexist with #3757's 2-arg one) |
 | Metal kernels take encoder not command buffer | metal-core | (legacy) | Submitted (#2061) | n/a | 2024-era; likely stale — triage: close or refresh |
 | Command encoder/buffer reuse refactor | metal-core | (legacy) | Submitted (#2037) | n/a | 2024-era; superseded by later upstream work — triage |
 
@@ -37,18 +46,19 @@ per logical change, not per commit.
 
 | Item | Area | Commits | Status | Confidence | Notes |
 |---|---|---|---|---|---|
-| Thread-local private-buffers pool (concurrent reuse race) | metal-core | b9376840, 2300b05e | Incubating | tested | pairs with the pool-sweep fix below |
-| `drop_unused_buffers` sweeps the private pool | metal-core | fix/metal-private-buffer-pool-sweep (cdabfbcf) | Incubating | tested | memory growth under long sessions |
-| Runtime-tunable `compute_per_buffer` (+ buffer `label()` reader) | metal-core | 169e7e80 | Incubating | experimental | wolfrpsiw's cadence probe (GPU busy 97.1%) says default is fine there; knob still useful for other workloads |
+| Metal quantized matvec tail out-of-bounds + dispatch geometry | metal-quantized | d2318473 | Incubating | tested (`quantized_matmul_mv_*_metal` on 0.11) | **no upstream PR yet — needs one** |
+| Runtime-tunable `compute_per_buffer` (+ buffer `label()` reader) | metal-core | 169e7e80, re-grafted in 23b9460e | Incubating | experimental | now an `AtomicUsize` on the fence-based `Commands`; wolfrpsiw's cadence probe (GPU busy 97.1%) says default is fine there; knob still useful for other workloads |
 | `truncate_to` on RotatingCache/RotatingKvCache | candle-nn | 587590d7 | Incubating | tested | wolfrpsiw has its own truncate pattern; converge when adopting KvCache |
-| Encoder-label propagation fixes (label-after-dispatch clobber; op-level gaps; gemm/indexing/reduce/cast labels) | metal-debug | 6f1a3aad, f22b3e69, 8eb56a2d, 6e2ea560 | Incubating | proven (wolfrpsiw gputrace campaign consumed labels) | follow-up to merged #3542 |
-| Completion hook + `addCompletedHandler`/kernel timestamps for programmatic profiling | metal-profile | fe62c4e3, 22839282 | Incubating | tested | foundation for the profiling framework branch |
+| Completion hook + `addCompletedHandler`/kernel timestamps for programmatic profiling | metal-profile | fe62c4e3, 22839282, re-grafted in 23b9460e | Incubating | tested | re-ported onto the post-#3511 fence architecture at the 0.11 merge: hook installs in `commit_swap_locked` before commit; `command_encoder_with_buffer` re-expressed against `CommandsGuard`. Foundation for the profiling framework branch, which predates the merge and needs the same re-port |
+| Thread-local private-buffers pool (concurrent reuse race) | metal-core | b9376840, 2300b05e | Superseded | n/a | upstream's #3532 fence architecture orders buffer reuse on the GPU; the transplanted claim-then-`wait_until_completed` also cleared `prev_ce_outputs` racily under concurrency (caught by upstream's `metal_concurrent_tests` at the merge). Upstream allocators restored in 23b9460e |
+| `drop_unused_buffers` sweeps the private pool | metal-core | fix/metal-private-buffer-pool-sweep (cdabfbcf) | Superseded | n/a | upstream 0.11 sweeps both pools (with residency-set removal) |
+| Encoder-label propagation fixes (label-after-dispatch clobber; op-level gaps; gemm/indexing/reduce/cast labels) | metal-debug | 6f1a3aad, f22b3e69, 8eb56a2d, 6e2ea560 | Superseded | n/a | prototype predating #3542's merge (branch point 2026-04-16, PR merged 2026-06-18); the merged debug-group design covers per-dispatch attribution, and per-dispatch `set_label` is wrong on the shared concurrent encoder — dropped at the 0.11 merge |
 
 ## Incubating on side branches
 
 | Item | Area | Branch | Status | Confidence | Notes |
 |---|---|---|---|---|---|
-| Comprehensive Metal profiling framework (per-dispatch GPU timestamps, counter sets, os_signpost, chrome-trace, docs/CI) | metal-profile | feat/metal-profile-comprehensive (+13, ~4.6k lines) | Incubating | tested | would have replaced most of wolfrpsiw's gpudebug workflow; propose upstream as a feature-gated module |
+| Comprehensive Metal profiling framework (per-dispatch GPU timestamps, counter sets, os_signpost, chrome-trace, docs/CI) | metal-profile | feat/metal-profile-comprehensive (+13, ~4.6k lines) | Incubating | tested | would have replaced most of wolfrpsiw's gpudebug workflow; propose upstream as a feature-gated module. Predates the 0.11 merge — needs the same post-#3511 re-port the hook layer got in 23b9460e |
 | GatedDeltaNet Metal kernels (streaming prefill, chunked w/ GQA, decode) | metal-kernels/models | lmbrrr | Incubating | proven (lmbrrr) | large; upstream appetite unknown — propose as candle-nn ops or examples |
 | Ternary/2-bit quantized Metal GEMM family (`mm2d_q2_0` + split-K, bit-plane popcount GEMV spike) | metal-quantized | lmbrrr | Incubating | proven (lmbrrr) / experimental (B3 spike) | needs Metal-4 toolchain notes; see lmbrrr repo receipts |
 | Quantized support/infra changes backing the above | quantized | lmbrrr (candle-core/quantized) | Incubating | proven (lmbrrr) | untangle from campaign-specific code before PR |
@@ -91,7 +101,10 @@ scatter-add f16/bf16.
 - `feat/metal-i16-i32-copy` is a stale pre-split integration branch (its
   content shipped via #3477–#3479 and tomsanbear-dev) — delete after checking.
 - `backup/*` branches are pre-rebase snapshots of the label work — delete
-  once #3542 follow-ups land.
+  once #3542 follow-ups land. The label prototype itself is now Superseded
+  (see above), so these are candidates for deletion outright.
+- `fix/metal-private-buffer-pool-sweep` and the thread-local-pool history are
+  Superseded as of the 0.11 merge — deletable after verification.
 - Local topic branches are behind their `tomsanbear` remotes (review pushed
   from elsewhere); `git fetch tomsanbear` + fast-forward before touching.
 - 7 registered worktrees are prunable (`git worktree prune`).

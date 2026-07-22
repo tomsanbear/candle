@@ -932,6 +932,123 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/* This test is based on the following script.
+import torch
+torch.manual_seed(4242)
+def q(x): return torch.round(x * 1e4) / 1e4
+t = q(torch.randn((1, 2, 5)))
+w = q(torch.randn((2, 3, 4)))
+print(t.flatten()); print(w.flatten())
+print(torch.nn.functional.conv_transpose1d(t, w, stride=2, padding=1).flatten())
+print(torch.nn.functional.conv_transpose1d(t, w, stride=2, padding=1, output_padding=1).flatten())
+print(torch.nn.functional.conv_transpose1d(t, w, stride=3, padding=2, output_padding=2).flatten())
+print(torch.nn.functional.conv_transpose1d(t, w, stride=2, padding=1, dilation=2).flatten())
+t2 = q(torch.randn((1, 4, 5)))
+w2 = q(torch.randn((4, 2, 3)))
+print(t2.flatten()); print(w2.flatten())
+print(torch.nn.functional.conv_transpose1d(t2, w2, stride=2, padding=2, groups=2).flatten())
+*/
+fn conv_transpose1d_padded(dev: &Device) -> Result<()> {
+    let t = Tensor::new(
+        &[
+            -2.6359f32, 0.0573, 1.3114, -1.1091, 0.2368, 0.2579, -0.8759, 0.9521, -1.1351, 1.3841,
+        ],
+        dev,
+    )?
+    .reshape((1, 2, 5))?;
+    let w = Tensor::new(
+        &[
+            1.2279f32, -0.9287, -1.7030, 0.1370, 0.1866, 0.4145, 1.8025, -0.1536, -0.4732, 0.1329,
+            0.7535, 0.1211, -0.2071, 1.1586, 0.4717, 0.3865, 1.1973, 0.7830, 0.0490, -0.2948,
+            0.6630, -0.2021, 2.6090, 0.2049,
+        ],
+        dev,
+    )?
+    .reshape((2, 3, 4))?;
+
+    // padding > 0: unblocked col2im fast path via the centre-crop rewrite.
+    let res = t.conv_transpose1d(&w, 1, 0, 2, 1, 1)?;
+    assert_eq!(res.dims(), [1, 3, 10]);
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            2.7468, 4.8623, -1.3295, 0.9023, -0.4455, -2.911, 0.2625, 1.3575, 0.793, 0.2496,
+            -0.8906, -5.7766, -0.3332, 1.445, 1.5385, 0.8444, -1.8306, -0.3534, 1.6869, 0.4947,
+            -0.4024, -1.9211, -0.0817, -2.2314, -0.1907, 3.2444, 0.4359, -2.9916, -0.6151, 3.7895
+        ]
+    );
+
+    // output_padding < padding keeps the crop in bounds.
+    let res = t.conv_transpose1d(&w, 1, 1, 2, 1, 1)?;
+    assert_eq!(res.dims(), [1, 3, 11]);
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            2.7468, 4.8623, -1.3295, 0.9023, -0.4455, -2.911, 0.2625, 1.3575, 0.793, 0.2496,
+            0.5674, -0.8906, -5.7766, -0.3332, 1.445, 1.5385, 0.8444, -1.8306, -0.3534, 1.6869,
+            0.4947, -0.4444, -0.4024, -1.9211, -0.0817, -2.2314, -0.1907, 3.2444, 0.4359, -2.9916,
+            -0.6151, 3.7895, 0.3123
+        ]
+    );
+
+    // output_padding == padding is the crop boundary case.
+    let res = t.conv_transpose1d(&w, 2, 2, 3, 1, 1)?;
+    assert_eq!(res.dims(), [1, 3, 14]);
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            4.6106, -0.0097, -1.068, -0.5107, 1.0824, -0.1148, -1.7842, -0.5791, -0.2851, 1.3534,
+            -0.5865, 1.3837, 0.2496, 0.5674, -4.7386, -0.7092, -0.6621, 0.0604, 1.6341, 1.2891,
+            2.4105, -2.0481, -1.3485, -2.0548, 2.2064, 1.1819, 0.4947, -0.4444, -1.3133, -0.8742,
+            0.1846, -2.242, -0.1618, -0.0181, 3.4722, 0.1262, 0.082, -3.7972, 0.4387, -0.2483,
+            3.7895, 0.3123
+        ]
+    );
+
+    // dilation > 1 stays on the direct kernel; padding must still be correct there.
+    let res = t.conv_transpose1d(&w, 1, 0, 2, 2, 1)?;
+    assert_eq!(res.dims(), [1, 3, 13]);
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            0.0, 2.9985, 0.0, 4.9556, 0.0, -2.0138, 0.0, -2.3959, 0.0, 3.2847, 0.0, -0.3411, 0.0,
+            0.0, -1.9287, 0.0, -4.016, 0.0, 0.1123, 0.0, 3.0127, 0.0, -1.355, 0.0, 0.9996, 0.0,
+            0.0, -1.0103, 0.0, -1.118, 0.0, -2.7543, 0.0, 4.1872, 0.0, -3.6915, 0.0, 3.4227, 0.0
+        ]
+    );
+
+    // groups > 1 combined with padding.
+    let t2 = Tensor::new(
+        &[
+            0.8670f32, -0.7181, -1.1111, 0.8869, -0.4431, -0.4720, -0.7890, 0.2620, 0.5411,
+            -1.1715, -2.4997, 2.3249, -0.8912, -0.4733, -0.5701, -2.8888, -1.4112, -0.5471,
+            -0.9234, -1.1660,
+        ],
+        dev,
+    )?
+    .reshape((1, 4, 5))?;
+    let w2 = Tensor::new(
+        &[
+            0.4189f32, -0.7465, -0.6473, 0.1402, 0.7875, 0.5377, -0.6779, -0.8088, 0.8764,
+            -0.1832, 0.2987, -0.6488, 0.2363, -0.2873, -0.8411, 1.7624, -0.5079, -0.5766, -2.4729,
+            1.6734, 1.2201, 1.7473, -0.8771, -0.5970,
+        ],
+        dev,
+    )?
+    .reshape((4, 2, 3))?;
+    let res = t2.conv_transpose1d(&w2, 2, 0, 2, 1, 2)?;
+    assert_eq!(res.dims(), [1, 4, 7]);
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            -0.7408, 1.1742, -0.8697, 0.6175, 0.9535, -1.0997, 0.5087, 0.8163, -0.8012, -0.078,
+            -0.7967, -0.7422, 0.8601, 0.2783, 2.617, -3.0294, -2.5349, -0.6595, 2.2537, -1.4092,
+            2.0201, 4.7976, 0.0569, -3.0246, 0.9325, -1.6071, 1.0503, -2.2179
+        ]
+    );
+    Ok(())
+}
+
 /* Regression test: the im2col paths of conv1d/conv2d materialized a contiguous
    copy of a non-contiguous kernel but then ran the matmul on the ORIGINAL
    kernel storage through a contiguous layout at the original offset, reading
@@ -976,6 +1093,12 @@ fn conv_noncontiguous_kernel(dev: &Device) -> Result<()> {
 }
 
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
+test_device!(
+    conv_transpose1d_padded,
+    conv_transpose1d_padded_cpu,
+    conv_transpose1d_padded_gpu,
+    conv_transpose1d_padded_metal
+);
 test_device!(
     conv_noncontiguous_kernel,
     conv_noncontiguous_kernel_cpu,

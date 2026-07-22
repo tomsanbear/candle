@@ -237,6 +237,19 @@ impl Tensor {
         dilation: usize,
         groups: usize,
     ) -> Result<Self> {
+        // A padded transposed convolution is the centre crop of the unpadded
+        // one: l_out(p, op) = (l_in - 1) * s + d * (k - 1) + 1 + op - 2 * p,
+        // so for op <= p the padded output is unpadded.narrow(2, p, l_out).
+        // Rewriting it that way unblocks the col2im fast path on every
+        // backend, which is gated on padding == 0 (the crop end index
+        // l_out_unpadded - p + op stays in bounds exactly when op <= p).
+        if padding > 0 && dilation == 1 && output_padding <= padding {
+            let out = self.conv_transpose1d(kernel, 0, 0, stride, dilation, groups)?;
+            let (_, _, l_in) = self.dims3()?;
+            let (_, _, k_size) = kernel.dims3()?;
+            let l_out = (l_in - 1) * stride + k_size + output_padding - 2 * padding;
+            return out.narrow(2, padding, l_out);
+        }
         let (c_in_k, c_out, k_size) = kernel.dims3()?;
         let (b_size, c_in, l_in) = self.dims3()?;
         if c_in != c_in_k {

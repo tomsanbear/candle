@@ -76,8 +76,9 @@ template <typename T, typename U, typename IR = T>
     init_kernel("cast_" #tname "_" #uname, cast_kernel, t, u)                   \
     init_kernel("cast_" #tname "_" #uname "_strided", cast_kernel_strided, t, u)
 
-// f64 is deliberately absent: Metal has no native double type, so f64
-// tensors cannot exist on this backend in the first place.
+// f64 is deliberately absent: MSL has no double type at any feature level
+// ("Metal does not support the double ... data types", MSL spec 2.1), so
+// no f64 kernel can exist on this backend.
 #if defined(__HAVE_BFLOAT__)
 #define init_cast_all(tname, t)         \
     init_cast(tname, t, f32, float)     \

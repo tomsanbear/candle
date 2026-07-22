@@ -98,6 +98,14 @@ scatter-add f16/bf16.
 | Batched (simdgroup-per-row) layernorm/rmsnorm variant + row-count dispatch heuristic | metal-kernels | wolfrpsiw: stock kernel 5.34 ns/elem at 355–2840×512; working MSL exists in wolfrpsiw `metal_fused.rs` (1e-4 verified); CAUTION: batched shape regresses rows==1 (measured 0.67→0.77 s) — heuristic mandatory | port wolfrpsiw kernel + `rows>=32` gate |
 | Elementwise-chain fusion (investigate `ug` JIT first) | metal-core | wolfrpsiw flow: diffuse glue ~half the stage; candle 0.11 ships a `ug` codegen path — experiment before writing kernels | experiment, then decide |
 
+## Open investigations
+
+- `metal_concurrent_tests::concurrent_readback` SIGSEGV'd once under a full
+  parallel suite run (348 tests, many concurrent Metal devices) at 03e58a1d;
+  8 isolated runs + 2 subsequent full runs were clean. Likely a rare race in
+  upstream's post-#3511 concurrency machinery (the same family its own tests
+  target). Track frequency; investigate if it recurs.
+
 ## Branch hygiene notes
 
 - `feat/metal-i16-i32-copy` is a stale pre-split integration branch (its

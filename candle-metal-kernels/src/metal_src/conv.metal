@@ -715,3 +715,89 @@ CONVT2D_OP(half, float, conv_transpose2d_f16)
 #if defined(__HAVE_BFLOAT__)
 CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
 #endif
+
+// Bilinear grid_sample with zeros padding, matching
+// torch.nn.functional.grid_sample(mode="bilinear", padding_mode="zeros").
+// One thread per (n, h_out, w_out) output position, looping the channels so
+// the grid coordinates unnormalize once per position.
+template <typename T>
+METAL_FUNC void grid_sample_impl(
+    constant uint &n,
+    constant uint &c,
+    constant uint &h,
+    constant uint &w,
+    constant uint &h_out,
+    constant uint &w_out,
+    constant uint &align_corners,
+    device const T *input,
+    device const T *grid,
+    device T *output,
+    uint tid
+) {
+    const uint total = n * h_out * w_out;
+    if (tid >= total) return;
+    const uint ni = tid / (h_out * w_out);
+    const uint sp = tid % (h_out * w_out);
+    const float gx = float(grid[(ulong)tid * 2 + 0]);
+    const float gy = float(grid[(ulong)tid * 2 + 1]);
+    float ix, iy;
+    if (align_corners != 0) {
+        ix = (gx + 1.0f) * 0.5f * float(w - 1);
+        iy = (gy + 1.0f) * 0.5f * float(h - 1);
+    } else {
+        ix = ((gx + 1.0f) * float(w) - 1.0f) * 0.5f;
+        iy = ((gy + 1.0f) * float(h) - 1.0f) * 0.5f;
+    }
+    // Clamp before the int conversion: wildly out-of-range coordinates
+    // behave the same as barely out-of-range ones and avoid UB.
+    const int x0 = int(floor(clamp(ix, -2.0f, float(w))));
+    const int y0 = int(floor(clamp(iy, -2.0f, float(h))));
+    const float wx1 = clamp(ix - float(x0), 0.0f, 1.0f);
+    const float wy1 = clamp(iy - float(y0), 0.0f, 1.0f);
+    const bool x0_ok = x0 >= 0 && x0 < int(w);
+    const bool x1_ok = x0 + 1 >= 0 && x0 + 1 < int(w);
+    const bool y0_ok = y0 >= 0 && y0 < int(h);
+    const bool y1_ok = y0 + 1 >= 0 && y0 + 1 < int(h);
+    const float w00 = (1.0f - wx1) * (1.0f - wy1);
+    const float w10 = wx1 * (1.0f - wy1);
+    const float w01 = (1.0f - wx1) * wy1;
+    const float w11 = wx1 * wy1;
+    for (uint ci = 0; ci < c; ci++) {
+        device const T *plane = input + (ulong)(ni * c + ci) * h * w;
+        float acc = 0.0f;
+        if (y0_ok) {
+            if (x0_ok) { acc += w00 * float(plane[y0 * int(w) + x0]); }
+            if (x1_ok) { acc += w10 * float(plane[y0 * int(w) + x0 + 1]); }
+        }
+        if (y1_ok) {
+            if (x0_ok) { acc += w01 * float(plane[(y0 + 1) * int(w) + x0]); }
+            if (x1_ok) { acc += w11 * float(plane[(y0 + 1) * int(w) + x0 + 1]); }
+        }
+        output[(ulong)(ni * c + ci) * h_out * w_out + sp] = static_cast<T>(acc);
+    }
+}
+
+#define GRID_SAMPLE_OP(T, NAME)                       \
+kernel void NAME(                                     \
+    constant uint &n,                                 \
+    constant uint &c,                                 \
+    constant uint &h,                                 \
+    constant uint &w,                                 \
+    constant uint &h_out,                             \
+    constant uint &w_out,                             \
+    constant uint &align_corners,                     \
+    device const T *input,                            \
+    device const T *grid,                             \
+    device T *output,                                 \
+    uint tid [[ thread_position_in_grid ]]            \
+) {                                                   \
+    grid_sample_impl<T>(                              \
+        n, c, h, w, h_out, w_out, align_corners,      \
+        input, grid, output, tid);                    \
+}
+
+GRID_SAMPLE_OP(float, grid_sample_f32)
+GRID_SAMPLE_OP(half, grid_sample_f16)
+#if defined(__HAVE_BFLOAT__)
+GRID_SAMPLE_OP(bfloat, grid_sample_bf16)
+#endif

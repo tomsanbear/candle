@@ -894,3 +894,88 @@ COL2IM1D_OP(float, col2im1d_f32)
 COL2IM1D_OP(double, col2im1d_f64)
 COL2IM1D_OP(uint8_t, col2im1d_u8)
 COL2IM1D_OP(uint32_t, col2im1d_u32)
+
+// Bilinear grid_sample with zeros padding, matching
+// torch.nn.functional.grid_sample(mode="bilinear", padding_mode="zeros").
+// One thread per (n, h_out, w_out) output position, looping the channels so
+// the grid coordinates unnormalize once per position.
+template <typename T>
+__device__ void grid_sample_op(
+    const uint32_t n,
+    const uint32_t c,
+    const uint32_t h,
+    const uint32_t w,
+    const uint32_t h_out,
+    const uint32_t w_out,
+    const uint32_t align_corners,
+    const T *input,
+    const T *grid,
+    T *output
+) {
+  const uint32_t total = n * h_out * w_out;
+  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= total) return;
+  const uint32_t ni = tid / (h_out * w_out);
+  const uint32_t sp = tid % (h_out * w_out);
+  const float gx = static_cast<float>(grid[(size_t)tid * 2 + 0]);
+  const float gy = static_cast<float>(grid[(size_t)tid * 2 + 1]);
+  float ix, iy;
+  if (align_corners != 0) {
+    ix = (gx + 1.0f) * 0.5f * (float)(w - 1);
+    iy = (gy + 1.0f) * 0.5f * (float)(h - 1);
+  } else {
+    ix = ((gx + 1.0f) * (float)w - 1.0f) * 0.5f;
+    iy = ((gy + 1.0f) * (float)h - 1.0f) * 0.5f;
+  }
+  // Clamp before the int conversion: wildly out-of-range coordinates behave
+  // the same as barely out-of-range ones and avoid UB.
+  const int x0 = (int)floorf(fminf(fmaxf(ix, -2.0f), (float)w));
+  const int y0 = (int)floorf(fminf(fmaxf(iy, -2.0f), (float)h));
+  const float wx1 = fminf(fmaxf(ix - (float)x0, 0.0f), 1.0f);
+  const float wy1 = fminf(fmaxf(iy - (float)y0, 0.0f), 1.0f);
+  const bool x0_ok = x0 >= 0 && x0 < (int)w;
+  const bool x1_ok = x0 + 1 >= 0 && x0 + 1 < (int)w;
+  const bool y0_ok = y0 >= 0 && y0 < (int)h;
+  const bool y1_ok = y0 + 1 >= 0 && y0 + 1 < (int)h;
+  const float w00 = (1.0f - wx1) * (1.0f - wy1);
+  const float w10 = wx1 * (1.0f - wy1);
+  const float w01 = (1.0f - wx1) * wy1;
+  const float w11 = wx1 * wy1;
+  for (uint32_t ci = 0; ci < c; ci++) {
+    const T *plane = input + (size_t)(ni * c + ci) * h * w;
+    float acc = 0.0f;
+    if (y0_ok) {
+      if (x0_ok) { acc += w00 * static_cast<float>(plane[y0 * (int)w + x0]); }
+      if (x1_ok) { acc += w10 * static_cast<float>(plane[y0 * (int)w + x0 + 1]); }
+    }
+    if (y1_ok) {
+      if (x0_ok) { acc += w01 * static_cast<float>(plane[(y0 + 1) * (int)w + x0]); }
+      if (x1_ok) { acc += w11 * static_cast<float>(plane[(y0 + 1) * (int)w + x0 + 1]); }
+    }
+    output[(size_t)(ni * c + ci) * h_out * w_out + sp] = static_cast<T>(acc);
+  }
+}
+
+#define GRID_SAMPLE_OP(TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const uint32_t n, \
+    const uint32_t c, \
+    const uint32_t h, \
+    const uint32_t w, \
+    const uint32_t h_out, \
+    const uint32_t w_out, \
+    const uint32_t align_corners, \
+    const TYPENAME *input, \
+    const TYPENAME *grid, \
+    TYPENAME *output \
+) { \
+  grid_sample_op<TYPENAME>(n, c, h, w, h_out, w_out, align_corners, input, grid, output); \
+} \
+
+#if __CUDA_ARCH__ >= 800
+GRID_SAMPLE_OP(__nv_bfloat16, grid_sample_bf16)
+#endif
+#if __CUDA_ARCH__ >= 530
+GRID_SAMPLE_OP(__half, grid_sample_f16)
+#endif
+GRID_SAMPLE_OP(float, grid_sample_f32)

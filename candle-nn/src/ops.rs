@@ -1167,7 +1167,7 @@ pub enum MatmulActivation {
 }
 
 struct MatmulBias {
-    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    #[allow(dead_code)] // only read by metal_fwd
     activation: Option<MatmulActivation>,
 }
 
@@ -1275,7 +1275,363 @@ impl candle::CustomOp3 for MatmulBias {
     }
 }
 
+struct GridSample {
+    align_corners: bool,
+}
+
+/// Map a [-1, 1] grid coordinate to input pixel space, torch-style.
+fn grid_unnormalize(coord: f32, size: usize, align_corners: bool) -> f32 {
+    if align_corners {
+        (coord + 1.0) / 2.0 * (size as f32 - 1.0)
+    } else {
+        ((coord + 1.0) * size as f32 - 1.0) / 2.0
+    }
+}
+
+/// Bilinear sample with zeros padding at `(ix, iy)` in pixel space.
+fn bilinear_sample<T: Copy>(
+    plane: &[T],
+    (h, w): (usize, usize),
+    (ix, iy): (f32, f32),
+    to_f32: fn(T) -> f32,
+) -> f32 {
+    let x0 = ix.floor();
+    let y0 = iy.floor();
+    let wx1 = ix - x0;
+    let wy1 = iy - y0;
+    let mut acc = 0f32;
+    for (dy, wy) in [(0f32, 1.0 - wy1), (1.0, wy1)] {
+        for (dx, wx) in [(0f32, 1.0 - wx1), (1.0, wx1)] {
+            let x = x0 + dx;
+            let y = y0 + dy;
+            if x >= 0.0 && x < w as f32 && y >= 0.0 && y < h as f32 {
+                acc += wx * wy * to_f32(plane[y as usize * w + x as usize]);
+            }
+        }
+    }
+    acc
+}
+
+fn grid_sample_cpu<T: Copy + Send + Sync>(
+    input: &[T],
+    grid: &[T],
+    (n, c, h, w): (usize, usize, usize, usize),
+    (h_out, w_out): (usize, usize),
+    align_corners: bool,
+    to_f32: fn(T) -> f32,
+    from_f32: fn(f32) -> T,
+) -> Vec<T> {
+    let mut out = vec![from_f32(0.0); n * c * h_out * w_out];
+    out.par_chunks_mut(h_out * w_out)
+        .enumerate()
+        .for_each(|(nc, chunk)| {
+            let (ni, ci) = (nc / c, nc % c);
+            let plane = &input[(ni * c + ci) * h * w..][..h * w];
+            let grid_n = &grid[ni * h_out * w_out * 2..][..h_out * w_out * 2];
+            for (i, o) in chunk.iter_mut().enumerate() {
+                let ix = grid_unnormalize(to_f32(grid_n[2 * i]), w, align_corners);
+                let iy = grid_unnormalize(to_f32(grid_n[2 * i + 1]), h, align_corners);
+                *o = from_f32(bilinear_sample(plane, (h, w), (ix, iy), to_f32));
+            }
+        });
+    out
+}
+
+impl candle::CustomOp2 for GridSample {
+    fn name(&self) -> &'static str {
+        "grid-sample"
+    }
+
+    fn cpu_fwd(
+        &self,
+        input: &CpuStorage,
+        input_l: &Layout,
+        grid: &CpuStorage,
+        grid_l: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (dims, out_shape) = grid_sample_check(input_l, grid_l)?;
+        let (n, c, h, w, h_out, w_out) = dims;
+        let out = match (input, grid) {
+            (CpuStorage::F32(input), CpuStorage::F32(grid)) => CpuStorage::F32(grid_sample_cpu(
+                input,
+                grid,
+                (n, c, h, w),
+                (h_out, w_out),
+                self.align_corners,
+                |v| v,
+                |v| v,
+            )),
+            (CpuStorage::F16(input), CpuStorage::F16(grid)) => CpuStorage::F16(grid_sample_cpu(
+                input,
+                grid,
+                (n, c, h, w),
+                (h_out, w_out),
+                self.align_corners,
+                half::f16::to_f32,
+                half::f16::from_f32,
+            )),
+            (CpuStorage::BF16(input), CpuStorage::BF16(grid)) => CpuStorage::BF16(grid_sample_cpu(
+                input,
+                grid,
+                (n, c, h, w),
+                (h_out, w_out),
+                self.align_corners,
+                half::bf16::to_f32,
+                half::bf16::from_f32,
+            )),
+            _ => candle::bail!("grid-sample requires matching f32/f16/bf16 input and grid"),
+        };
+        Ok((out, out_shape))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        input: &candle::CudaStorage,
+        input_l: &Layout,
+        grid: &candle::CudaStorage,
+        grid_l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{
+            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
+        };
+        use candle::cuda_backend::{kernel_name, kernels, Map2, WrapErr};
+        use candle::{CudaDevice, WithDType};
+
+        struct S {
+            dims: GridSampleDims,
+            align_corners: bool,
+        }
+        impl Map2 for S {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+                &self,
+                input: &CudaSlice<T>,
+                input_l: &Layout,
+                grid: &CudaSlice<T>,
+                grid_l: &Layout,
+                dev: &CudaDevice,
+            ) -> Result<CudaSlice<T>> {
+                let (n, c, h, w, h_out, w_out) = self.dims;
+                let input = match input_l.contiguous_offsets() {
+                    None => candle::bail!("grid-sample input has to be contiguous"),
+                    Some((o1, o2)) => input.slice(o1..o2),
+                };
+                let grid = match grid_l.contiguous_offsets() {
+                    None => candle::bail!("grid-sample grid has to be contiguous"),
+                    Some((o1, o2)) => grid.slice(o1..o2),
+                };
+                let cfg = LaunchConfig::for_num_elems((n * h_out * w_out) as u32);
+                let func = dev.get_or_load_func(&kernel_name::<T>("grid_sample"), &kernels::CONV)?;
+                // SAFETY: Set later by running the kernel.
+                let out = unsafe { dev.alloc::<T>(n * c * h_out * w_out)? };
+                let mut builder = func.builder();
+                candle::builder_arg!(
+                    builder,
+                    n as u32,
+                    c as u32,
+                    h as u32,
+                    w as u32,
+                    h_out as u32,
+                    w_out as u32,
+                    self.align_corners as u32
+                );
+                builder.arg(&input);
+                builder.arg(&grid);
+                builder.arg(&out);
+                // SAFETY: ffi.
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(out)
+            }
+        }
+
+        let (dims, out_shape) = grid_sample_check(input_l, grid_l)?;
+        let dev = input.device();
+        let slice = S {
+            dims,
+            align_corners: self.align_corners,
+        }
+        .map(&input.slice, input_l, &grid.slice, grid_l, dev)?;
+        let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, out_shape))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        input: &candle::MetalStorage,
+        input_l: &Layout,
+        grid: &candle::MetalStorage,
+        grid_l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+
+        let (dims, out_shape) = grid_sample_check(input_l, grid_l)?;
+        let (n, c, h, w, h_out, w_out) = dims;
+        if grid.dtype() != input.dtype() {
+            candle::bail!("grid-sample requires matching input and grid dtypes");
+        }
+        let name = match input.dtype() {
+            DType::F32 => "grid_sample_f32",
+            DType::F16 => "grid_sample_f16",
+            DType::BF16 => "grid_sample_bf16",
+            dtype => candle::bail!("grid-sample does not support {dtype:?} on Metal"),
+        };
+        let device = input.device();
+        let elem_count = out_shape.elem_count();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, input.dtype())
+            .with_label("grid-sample")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        let input_src = candle_metal_kernels::BufferOffset {
+            buffer: input.buffer(),
+            offset_in_bytes: input_l.start_offset() * input.dtype().size_in_bytes(),
+        };
+        let grid_src = candle_metal_kernels::BufferOffset {
+            buffer: grid.buffer(),
+            offset_in_bytes: grid_l.start_offset() * grid.dtype().size_in_bytes(),
+        };
+        candle_metal_kernels::call_grid_sample(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            name,
+            (n, c, h, w),
+            (h_out, w_out),
+            self.align_corners,
+            input_src,
+            grid_src,
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let storage = candle::MetalStorage::new(output, device.clone(), elem_count, input.dtype());
+        Ok((storage, out_shape))
+    }
+}
+
+type GridSampleDims = (usize, usize, usize, usize, usize, usize);
+
+/// Validate layouts and shapes; returns (n, c, h, w, h_out, w_out) and the
+/// output shape.
+fn grid_sample_check(input_l: &Layout, grid_l: &Layout) -> Result<(GridSampleDims, Shape)> {
+    if !input_l.is_contiguous() || !grid_l.is_contiguous() {
+        candle::bail!("grid-sample requires contiguous input and grid")
+    }
+    let (n, c, h, w) = input_l.shape().dims4()?;
+    let (gn, h_out, w_out, two) = grid_l.shape().dims4()?;
+    if gn != n || two != 2 {
+        candle::bail!(
+            "grid-sample shape mismatch: input {:?} grid {:?} (want (n, h_out, w_out, 2))",
+            input_l.shape(),
+            grid_l.shape()
+        )
+    }
+    Ok((
+        (n, c, h, w, h_out, w_out),
+        Shape::from_dims(&[n, c, h_out, w_out]),
+    ))
+}
+
+/// Bilinear `grid_sample` with zeros padding — `torch.nn.functional.
+/// grid_sample(input, grid, mode="bilinear", padding_mode="zeros")`
+/// semantics. `input` is `(n, c, h, w)`, `grid` is `(n, h_out, w_out, 2)`
+/// with x/y coordinates in `[-1, 1]`; the output is `(n, c, h_out, w_out)`.
+pub fn grid_sample(input: &Tensor, grid: &Tensor, align_corners: bool) -> Result<Tensor> {
+    input
+        .contiguous()?
+        .apply_op2_no_bwd(&grid.contiguous()?, &GridSample { align_corners })
+}
+
+/// Multiscale deformable attention (Deformable-DETR semantics), composed
+/// on-device from [`grid_sample`]: per level, bilinear-sample the value
+/// feature map at the sampling locations, then reduce with the attention
+/// weights.
+///
+/// * `value`: `(n, len_v, heads, head_dim)` — flattened multi-level features
+///   (levels concatenated along `len_v`).
+/// * `spatial_shapes`: per-level `(h, w)`; their products must sum to
+///   `len_v`.
+/// * `sampling_locations`: `(n, len_q, heads, levels, points, 2)` in
+///   `[0, 1]` (normalized per level).
+/// * `attention_weights`: `(n, len_q, heads, levels, points)`.
+///
+/// Returns `(n, len_q, heads * head_dim)`.
+pub fn ms_deform_attn(
+    value: &Tensor,
+    spatial_shapes: &[(usize, usize)],
+    sampling_locations: &Tensor,
+    attention_weights: &Tensor,
+) -> Result<Tensor> {
+    let (n, len_v, heads, head_dim) = value.dims4()?;
+    let (sn, len_q, sh, levels, points, two) = match *sampling_locations.dims() {
+        [a, b, c, d, e, f] => (a, b, c, d, e, f),
+        _ => candle::bail!(
+            "ms-deform-attn sampling_locations must be 6d, got {:?}",
+            sampling_locations.shape()
+        ),
+    };
+    if sn != n || sh != heads || two != 2 || levels != spatial_shapes.len() {
+        candle::bail!(
+            "ms-deform-attn shape mismatch: value {:?} sampling_locations {:?} ({} levels)",
+            value.shape(),
+            sampling_locations.shape(),
+            spatial_shapes.len()
+        )
+    }
+    let total: usize = spatial_shapes.iter().map(|&(h, w)| h * w).sum();
+    if total != len_v {
+        candle::bail!("ms-deform-attn: spatial shapes cover {total} positions, value has {len_v}")
+    }
+    if attention_weights.dims() != [n, len_q, heads, levels, points] {
+        candle::bail!(
+            "ms-deform-attn attention_weights shape {:?} does not match",
+            attention_weights.shape()
+        )
+    }
+
+    let mut level_outputs = Vec::with_capacity(levels);
+    let mut offset = 0;
+    for (lid, &(h, w)) in spatial_shapes.iter().enumerate() {
+        // (n, h*w, heads, d) -> (n*heads, d, h, w)
+        let v = value
+            .narrow(1, offset, h * w)?
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((n * heads, head_dim, h, w))?;
+        // (n, len_q, heads, points, 2) -> (n*heads, len_q, points, 2), [0,1] -> [-1,1]
+        let grid = sampling_locations
+            .narrow(3, lid, 1)?
+            .squeeze(3)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((n * heads, len_q, points, 2))?;
+        let grid = ((grid * 2.0)? - 1.0)?;
+        // (n*heads, d, len_q, points)
+        level_outputs.push(grid_sample(&v, &grid, false)?);
+        offset += h * w;
+    }
+    // (n*heads, d, len_q, levels*points)
+    let sampled = Tensor::stack(&level_outputs, 3)?
+        .reshape((n * heads, head_dim, len_q, levels * points))?;
+    // (n, len_q, heads, levels, points) -> (n*heads, 1, len_q, levels*points)
+    let weights = attention_weights
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((n * heads, 1, len_q, levels * points))?;
+    let out = sampled.broadcast_mul(&weights)?.sum(D::Minus1)?; // (n*heads, d, len_q)
+    out.reshape((n, heads, head_dim, len_q))?
+        .permute((0, 3, 1, 2))?
+        .contiguous()?
+        .reshape((n, len_q, heads * head_dim))
+}
+
 struct TopK {
+    #[allow(dead_code)] // only read by metal_fwd
     k_pad: usize,
 }
 

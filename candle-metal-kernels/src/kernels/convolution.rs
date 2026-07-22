@@ -375,3 +375,49 @@ pub fn call_conv_transpose2d(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Bilinear grid_sample with zeros padding (torch semantics). `input` is
+/// contiguous `(n, c, h, w)`, `grid` contiguous `(n, h_out, w_out, 2)` of
+/// the same dtype; the output is `(n, c, h_out, w_out)`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_grid_sample(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    (n, c, h, w): (usize, usize, usize, usize),
+    (h_out, w_out): (usize, usize),
+    align_corners: bool,
+    input: BufferOffset,
+    grid: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "grid_sample {name} n={n} c={c} {h}x{w} -> {h_out}x{w_out}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            n as u32,
+            c as u32,
+            h as u32,
+            w as u32,
+            h_out as u32,
+            w_out as u32,
+            align_corners as u32,
+            &input,
+            &grid,
+            Output::new(output)
+        )
+    );
+
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, n * h_out * w_out);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}

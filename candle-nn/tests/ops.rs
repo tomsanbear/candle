@@ -508,6 +508,81 @@ fn matmul_bias_act(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn grid_sample(device: &Device) -> Result<()> {
+    // PyTorch 2.10 reference (torch.nn.functional.grid_sample, bilinear,
+    // zeros padding):
+    //   inp = torch.arange(24).reshape(1, 2, 3, 4) * 0.25 - 1.5
+    //   grid = [[[[-1, -1], [0.3, -0.4], [1.2, 0.1]],
+    //            [[0, 0], [-0.7, 0.9], [2, -2]]]]
+    let input = ((Tensor::arange(0f32, 24.0, device)?.reshape((1, 2, 3, 4))? * 0.25)? - 1.5)?;
+    let grid = Tensor::new(
+        &[[
+            [[-1.0f32, -1.0], [0.3, -0.4], [1.2, 0.1]],
+            [[0.0, 0.0], [-0.7, 0.9], [2.0, -2.0]],
+        ]],
+        device,
+    )?;
+
+    let out = candle_nn::ops::grid_sample(&input, &grid, true)?;
+    assert_eq!(
+        to_vec3_round(&out.flatten(0, 1)?, 4)?,
+        [
+            [[-1.5, -0.4125, 0.245], [-0.125, 0.5125, 0.0]],
+            [[1.5, 2.5875, 2.345], [2.875, 3.5125, 0.0]]
+        ]
+    );
+    let out = candle_nn::ops::grid_sample(&input, &grid, false)?;
+    assert_eq!(
+        to_vec3_round(&out.flatten(0, 1)?, 4)?,
+        [
+            [[-0.375, -0.575, 0.04], [-0.125, 0.3413, 0.0]],
+            [[0.375, 2.425, 0.34], [2.875, 2.2913, 0.0]]
+        ]
+    );
+    Ok(())
+}
+
+fn ms_deform_attn(device: &Device) -> Result<()> {
+    // PyTorch reference: the canonical ms_deform_attn_core_pytorch from
+    // Deformable-DETR run at n=1, heads=2, head_dim=4, levels=(4x4, 2x2),
+    // len_q=3, points=2, with value = arange * 0.05 - 2 and seeded random
+    // locations/weights (seed 299792458, torch 2.10).
+    let (n, heads, head_dim, len_q, points) = (1, 2, 4, 3, 2);
+    let shapes = [(4usize, 4usize), (2, 2)];
+    let len_v: usize = shapes.iter().map(|&(h, w)| h * w).sum();
+    let value = ((Tensor::arange(0f32, (n * len_v * heads * head_dim) as f32, device)?
+        .reshape((n, len_v, heads, head_dim))?
+        * 0.05)?
+        - 2.0)?;
+    let loc: Vec<f32> = vec![
+        0.353966, 0.795738, 0.295635, 0.257869, 0.576933, 0.411533, 0.523919, 0.487519, 0.060644,
+        0.020147, 0.886757, 0.433249, 0.302519, 0.001571, 0.934453, 0.337463, 0.341743, 0.651286,
+        0.577522, 0.048914, 0.394754, 0.735515, 0.228865, 0.924882, 0.577559, 0.181697, 0.311408,
+        0.621761, 0.231438, 0.196352, 0.711909, 0.437983, 0.731336, 0.762558, 0.010661, 0.31207,
+        0.578678, 0.211012, 0.626158, 0.670766, 0.135081, 0.121379, 0.556344, 0.619083, 0.146501,
+        0.768792, 0.528556, 0.633408,
+    ];
+    let loc = Tensor::from_vec(loc, (n, len_q, heads, shapes.len(), points, 2), device)?;
+    let attn: Vec<f32> = vec![
+        0.375696, 0.20049, 0.221033, 0.202781, 0.281843, 0.174073, 0.249621, 0.294463, 0.287216,
+        0.186161, 0.308332, 0.218291, 0.300359, 0.27515, 0.212002, 0.212489, 0.321818, 0.1609,
+        0.147986, 0.369296, 0.344103, 0.176868, 0.30112, 0.177909,
+    ];
+    let attn = Tensor::from_vec(attn, (n, len_q, heads, shapes.len(), points), device)?;
+    let out = candle_nn::ops::ms_deform_attn(&value, &shapes, &loc, &attn)?;
+    let expected: Vec<f32> = vec![
+        2.924467, 2.974467, 3.024467, 3.074467, 1.547197, 1.577138, 1.607079, 1.637021, 2.666118,
+        2.709168, 2.752218, 2.795268, 2.205537, 2.254049, 2.30256, 2.351071, 3.532517, 3.578261,
+        3.624004, 3.669748, 1.966199, 2.012384, 2.05857, 2.104755,
+    ];
+    let got = out.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(got.len(), expected.len());
+    for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+        assert!((g - e).abs() < 1e-4, "idx {i}: {g} vs {e}");
+    }
+    Ok(())
+}
+
 fn topk(device: &Device) -> Result<()> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     let mut rng = StdRng::seed_from_u64(299792458);
@@ -569,3 +644,15 @@ test_device!(
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
 test_device!(topk, topk_cpu, topk_gpu, topk_metal);
+test_device!(
+    grid_sample,
+    grid_sample_cpu,
+    grid_sample_gpu,
+    grid_sample_metal
+);
+test_device!(
+    ms_deform_attn,
+    ms_deform_attn_cpu,
+    ms_deform_attn_gpu,
+    ms_deform_attn_metal
+);

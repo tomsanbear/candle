@@ -41,6 +41,7 @@ All five 2026 PRs below are also carried on `tomsanbear-dev` (cherry-picked
 | Zero-sized matmul validation + gradients | core/autograd | fix/zero-matmul-validation-autograd | Submitted (#3756) | tested | dev carries the 3-arg helper as `assert_zero_grad_shaped` (renamed at cherry-pick to coexist with #3757's 2-arg one) |
 | Metal kernels take encoder not command buffer | metal-core | (legacy) | Submitted (#2061) | n/a | 2024-era; likely stale — triage: close or refresh |
 | Command encoder/buffer reuse refactor | metal-core | (legacy) | Submitted (#2037) | n/a | 2024-era; superseded by later upstream work — triage |
+| Rust 1.97 clippy fixes + `LogitsProcessor` NaN guard | workspace | third-party #3754 (GregoryBolshakov) | Carried | tested (clippy clean on core/transformers after) | cherry-picked (`-x`) onto dev 2026-07-22, authorship preserved; also clears the long-standing shape.rs warning; drops out naturally at the next upstream merge once #3754 lands |
 
 ## Incubating on `tomsanbear-dev` (not yet PR'd)
 

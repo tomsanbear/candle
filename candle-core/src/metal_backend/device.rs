@@ -4,71 +4,18 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device,
-        MTLResourceOptions,
+        BlitCommandsGuard, Buffer, BufferMap, Commands, CommandsGuard, Device, MTLResourceOptions,
+        ResidencySet,
     },
     Kernels,
 };
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::MetalError;
-
-thread_local! {
-    /// Per-thread, per-device private buffer pool. Each thread maintains its
-    /// own `BufferMap` for each `DeviceId` it has touched; pools are
-    /// completely disjoint between threads.
-    ///
-    /// ## Why thread-local?
-    ///
-    /// `find_available_buffer` uses `Arc::strong_count == 1` as a proxy for
-    /// "free" — i.e. the pool is the only owner, so the buffer is reusable.
-    /// This proxy is safe **within a single thread** because Metal serialises
-    /// command buffers on one queue in commit order: if thread A writes to
-    /// buffer X in CB1 then reuses X in CB2, the GPU runs CB1 before CB2 and
-    /// the final contents of X reflect CB2's write. Within the same CB,
-    /// encoders are inherently ordered. So intra-thread reuse via
-    /// strong-count is always correct.
-    ///
-    /// It is **not safe across threads**. Thread A can dispatch a kernel
-    /// writing X on an uncommitted CB1, the Tensor holding X can be sent to
-    /// thread B and dropped there, leaving `Arc::strong_count(X) == 1` (only
-    /// the shared pool remains). Thread B now asks for a buffer, the shared
-    /// pool hands back X, and thread B dispatches a kernel writing X on its
-    /// own CB (CB_B). If CB_B commits before CB1 (commit order is determined
-    /// by whichever thread's `commit()` call reaches the queue first), the
-    /// GPU runs CB_B then CB1, and A's write — which was supposed to be
-    /// stale — clobbers B's fresh result. The empirical symptom: downstream
-    /// consumers read garbage (e.g. BitNet b1.58's `round + clamp(-1,1)`
-    /// pipeline produces values outside [-1, 1]).
-    ///
-    /// Thread-local pools eliminate the class of race: a buffer is only ever
-    /// reused by the thread that created it, and that thread's own dispatch
-    /// sequence is totally ordered by Metal.
-    ///
-    /// ## Memory overhead
-    ///
-    /// Each thread's pool grows to its peak working set. For rayon workloads
-    /// with N long-lived workers, peak memory is ~N× the single-thread
-    /// baseline. In practice this is bounded (workers process similar shapes
-    /// so hit the same size buckets) and drops fully when the thread exits.
-    ///
-    /// ## Why not the shared-storage `buffers` pool too?
-    ///
-    /// `allocate_buffer` (shared-storage pool) sees far less traffic
-    /// (only blit destinations and CPU-visible allocations) and retains a
-    /// `wait_until_completed` guard after claiming a buffer, which is
-    /// correct even across threads. Converting it to thread-local is
-    /// possible but would cost extra memory for little benefit given its
-    /// hit rate; leaving it on the shared pool keeps the diff surgical.
-    static PRIVATE_POOL: RefCell<HashMap<DeviceId, BufferMap>> =
-        RefCell::new(HashMap::new());
-}
 
 /// Unique identifier for metal devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -92,7 +39,7 @@ pub struct MetalDevice {
     /// Raw metal device: <https://developer.apple.com/documentation/metal/mtldevice?language=objc>
     pub(crate) device: Device,
 
-    pub(crate) commands: Arc<RwLock<Commands>>,
+    pub(crate) commands: Arc<Commands>,
 
     /// Simple allocator struct.
     /// The buffers are stored in size buckets since ML tends to use similar shapes over and over.
@@ -109,6 +56,10 @@ pub struct MetalDevice {
     /// (strong_count = 1).
     pub(crate) buffers: Arc<RwLock<BufferMap>>,
 
+    /// Same as `buffers` but uses `PRIVATE_RESOURCE_OPTIONS` (StorageModePrivate on macOS).
+    /// Intermediate compute buffers don't need CPU access so Private avoids coherency overhead.
+    pub(crate) private_buffers: Arc<RwLock<BufferMap>>,
+
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`candle_metal_kernels`]
     pub(crate) kernels: Arc<Kernels>,
@@ -116,19 +67,21 @@ pub struct MetalDevice {
     pub(crate) seed: Arc<Mutex<Buffer>>,
     /// Last seed value set on this device.
     pub(crate) seed_value: Arc<RwLock<u64>>,
+    /// Residency set registered on the command queue.
+    pub(crate) residency_set: Arc<ResidencySet>,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
-pub const RESOURCE_OPTIONS: MTLResourceOptions =
-    objc2_metal::MTLResourceOptions(MTLResourceOptions::StorageModeShared.bits());
-//| MTLResourceOptions::HazardTrackingModeUntracked.bits(),
-//);
-
+pub const RESOURCE_OPTIONS: MTLResourceOptions = objc2_metal::MTLResourceOptions(
+    MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
+);
 // Resource options used for `new_private_buffer`. This uses `private` where supported.
 #[cfg(target_os = "ios")]
-pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
+pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = RESOURCE_OPTIONS;
 #[cfg(not(target_os = "ios"))]
-pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModePrivate;
+pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = objc2_metal::MTLResourceOptions(
+    MTLResourceOptions::StorageModePrivate.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
+);
 
 impl std::fmt::Debug for MetalDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,75 +132,85 @@ impl MetalDevice {
     fn drop_unused_buffers(&self) -> Result<()> {
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         for subbuffers in buffers.values_mut() {
-            let newbuffers = subbuffers
-                .iter()
-                .filter(|s| Arc::strong_count(*s) > 1)
-                .map(Arc::clone)
-                .collect();
-            *subbuffers = newbuffers;
+            subbuffers.retain(|s| {
+                if Arc::strong_count(s) == 1 {
+                    self.residency_set.remove(s);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let mut private_buffers = self.private_buffers.write().map_err(MetalError::from)?;
+        for subbuffers in private_buffers.values_mut() {
+            subbuffers.retain(|s| {
+                if Arc::strong_count(s) == 1 {
+                    self.residency_set.remove(s);
+                    false
+                } else {
+                    true
+                }
+            });
         }
         Ok(())
     }
 
-    pub fn command_encoder(&self) -> Result<ComputeCommandEncoder> {
-        let commands = self.commands.write().map_err(MetalError::from)?;
-        let (flush, command_encoder) = commands.command_encoder().map_err(MetalError::from)?;
-        if flush {
-            self.drop_unused_buffers()?
-        }
+    pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
+        let command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
         Ok(command_encoder)
     }
 
-    /// Programmatic-profiling variant: also returns the owning `CommandBuffer`
-    /// so the caller can attach a completion handler (via
-    /// `CommandBuffer::add_completed_handler`) before dropping the encoder.
-    /// The buffer is committed by the pool as normal — this just gives the
-    /// caller a clone-reference in time to register timing callbacks.
+    /// Programmatic-profiling variant of `command_encoder()`: also returns
+    /// a clone of the owning `CommandBuffer` so the caller can attach a
+    /// completion handler (via `CommandBuffer::add_completed_handler`)
+    /// before the buffer is committed.
     pub fn command_encoder_with_buffer(
         &self,
-    ) -> Result<(ComputeCommandEncoder, candle_metal_kernels::CommandBuffer)> {
-        let commands = self.commands.write().map_err(MetalError::from)?;
-        let (flush, command_encoder, command_buffer) = commands
+    ) -> Result<(CommandsGuard<'_>, candle_metal_kernels::CommandBuffer)> {
+        let (guard, command_buffer) = self
+            .commands
             .command_encoder_with_buffer()
             .map_err(MetalError::from)?;
-        if flush {
-            self.drop_unused_buffers()?
-        }
-        Ok((command_encoder, command_buffer))
+        Ok((guard, command_buffer))
     }
 
-    pub fn blit_command_encoder(&self) -> Result<BlitCommandEncoder> {
-        let commands = self.commands.write().map_err(MetalError::from)?;
-        let (flush, command_encoder) = commands.blit_command_encoder().map_err(MetalError::from)?;
-        if flush {
-            self.drop_unused_buffers()?
-        }
+    pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>> {
+        let command_encoder = self
+            .commands
+            .blit_command_encoder()
+            .map_err(MetalError::from)?;
         Ok(command_encoder)
     }
 
     pub fn wait_until_completed(&self) -> Result<()> {
-        let commands = self.commands.write().map_err(MetalError::from)?;
-        commands.wait_until_completed().map_err(MetalError::from)?;
+        self.commands
+            .wait_until_completed()
+            .map_err(MetalError::from)?;
+
+        self.drop_unused_buffers()?;
+        Ok(())
+    }
+
+    /// Commit and wait on the buffer holding the caller's work; safe for concurrent CPU readbacks.
+    pub fn flush_and_wait_current(&self) -> Result<()> {
+        self.commands
+            .flush_and_wait_current()
+            .map_err(MetalError::from)?;
+
+        self.drop_unused_buffers()?;
         Ok(())
     }
 
     /// Install or clear a per-buffer completion hook on this device's
-    /// command-buffer pool. When `Some`, every command buffer produced by
-    /// the pool — whether from `command_encoder()` or
-    /// `command_encoder_with_buffer()` — gets the hook registered via
-    /// `addCompletedHandler` before it's committed.
-    ///
-    /// Intended for programmatic profilers. bitnet-rs's `metal-profile`
-    /// feature sets a hook that records kernel_start_time / kernel_end_time
-    /// + the buffer's label into a Chrome-JSON trace sink, giving coverage
-    /// of *every* Metal kernel candle dispatches (sdpa, cat, contiguous,
-    /// argmax, linear, rms_norm, etc.) without per-kernel patches.
+    /// command pool. When `Some`, every command buffer gets the hook
+    /// registered via `addCompletedHandler` before it's committed —
+    /// giving programmatic profilers coverage of every Metal kernel
+    /// candle dispatches without per-kernel patches.
     pub fn set_completion_hook(
         &self,
         hook: Option<candle_metal_kernels::metal::CompletionHook>,
     ) -> Result<()> {
-        let commands = self.commands.write().map_err(MetalError::from)?;
-        commands.set_completion_hook(hook);
+        self.commands.set_completion_hook(hook);
         Ok(())
     }
 
@@ -256,9 +219,8 @@ impl MetalDevice {
     /// attribution via the completion hook). Returns the previous value
     /// so the caller can restore it when profiling ends.
     pub fn set_compute_per_buffer(&self, value: usize) -> Result<usize> {
-        let commands = self.commands.write().map_err(MetalError::from)?;
-        let prev = commands.compute_per_buffer();
-        commands.set_compute_per_buffer(value);
+        let prev = self.commands.compute_per_buffer();
+        self.commands.set_compute_per_buffer(value);
         Ok(prev)
     }
 
@@ -270,24 +232,15 @@ impl MetalDevice {
         &self.device
     }
 
-    /// Creates a new buffer (not necessarily zeroed), drawn from this
-    /// thread's private-storage pool for the current device. May reuse a
-    /// previously-returned buffer of the same size bucket if the caller has
-    /// dropped its last reference.
+    /// Returns a builder for buffer allocation. See `BufferBuilder`.
+    pub fn new_buffer_builder(&self) -> BufferBuilder<'_> {
+        BufferBuilder::new(self)
+    }
+
+    /// Creates a new buffer (not necessarily zeroed).
     ///
-    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU
-    /// coherency overhead). Falls back to StorageModeShared on iOS where
-    /// Private is not always available.
-    ///
-    /// ## Thread-safety
-    ///
-    /// The pool is thread-local — see `PRIVATE_POOL` for the full rationale.
-    /// Short version: within a single thread, `Arc::strong_count == 1` is a
-    /// safe "free" proxy because Metal serialises the thread's command
-    /// buffers on the device queue in commit order, so a reused buffer's
-    /// old contents are always overwritten by the new dispatch before any
-    /// consumer reads. Cross-thread reuse via a shared pool is not safe
-    /// (see `PRIVATE_POOL` for the race).
+    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
+    /// Falls back to StorageModeShared on iOS where Private is not always available.
     pub fn new_buffer(
         &self,
         element_count: usize,
@@ -295,22 +248,21 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<Arc<Buffer>> {
         let size = element_count * dtype.size_in_bytes();
+        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
+        if let Some(b) = find_available_buffer(size, &buffers) {
+            return Ok(b.clone());
+        }
         let size = buf_size(size);
-        PRIVATE_POOL.with(|pool| -> Result<Arc<Buffer>> {
-            let mut pool = pool.borrow_mut();
-            let device_pool = pool.entry(self.id).or_default();
-            if let Some(b) = find_available_buffer(size, device_pool) {
-                return Ok(b);
-            }
-            let subbuffers = device_pool.entry(size).or_insert_with(Vec::new);
-            let new_buffer = self
-                .device
-                .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
-                .map_err(MetalError::from)?;
-            let new_buffer = Arc::new(new_buffer);
-            subbuffers.push(new_buffer.clone());
-            Ok(new_buffer)
-        })
+        let subbuffers = buffers.entry(size).or_insert(vec![]);
+
+        let new_buffer = self
+            .device
+            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        let new_buffer = Arc::new(new_buffer);
+        self.residency_set.insert(&new_buffer);
+        subbuffers.push(new_buffer.clone());
+        Ok(new_buffer)
     }
 
     /// Creates a new private buffer (not necessarily zeroed).
@@ -327,7 +279,9 @@ impl MetalDevice {
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        Ok(Arc::new(buffer))
+        let buffer = Arc::new(buffer);
+        self.residency_set.insert(&buffer);
+        Ok(buffer)
     }
 
     /// Creates a new buffer from data.
@@ -345,63 +299,51 @@ impl MetalDevice {
         let subbuffers = buffers.entry(size).or_insert(vec![]);
 
         let new_buffer = Arc::new(new_buffer);
+        self.residency_set.insert(&new_buffer);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
         let buffer = self.allocate_buffer(size_in_bytes)?;
-        let blit = self.blit_command_encoder()?;
+        let mut blit = self.blit_command_encoder()?;
         blit.set_label("zeros");
         blit.fill_buffer(&buffer, (0, buffer.length()), 0);
-        blit.end_encoding();
+        /*
+        // Alternative impl
+        if size_in_bytes > 0 {
+            let encoder = self.command_encoder()?;
+            call_const_fill(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                "fill_u8",
+                size_in_bytes,
+                &buffer,
+                0u8,
+            )
+            .map_err(crate::Error::wrap)?;
+        }
+        */
         Ok(buffer)
     }
 
-    /// The critical allocator algorithm.
-    ///
-    /// The pool recycles buffers whose `Arc::strong_count == 1` — i.e. only
-    /// the pool still holds a reference. For a single-threaded caller this
-    /// is a safe proxy for "the previous user is done with it": by the time
-    /// the caller's next `allocate_buffer` runs, ownership of the previous
-    /// tensor has been dropped, and the subsequent user-observable sync
-    /// (e.g. `to_cpu()` → `wait_until_completed`) drains any GPU work.
-    ///
-    /// With concurrent callers the proxy is NOT sufficient: thread A can
-    /// drop an intermediate tensor while thread A's owning command buffer
-    /// is still pending commit (or in flight on the GPU). strong_count
-    /// hits 1, thread B's allocator then hands the same buffer to a new
-    /// kernel, and the GPU races write-over-write between A's and B's work.
-    /// Symptom in practice: downstream consumers read back garbage values
-    /// (e.g. a BF16 weight that was supposed to be clamped to [-1, 1]
-    /// emerges as an arbitrary large float).
-    ///
-    /// Fix: hold the buffers **write lock** during the find-and-claim so two
-    /// concurrent callers can't both see the same `strong_count == 1`
-    /// buffer (classic TOCTOU under a read lock). The `Arc::clone` inside
-    /// `find_available_buffer` bumps strong_count to 2 while the lock is
-    /// still held — later callers that reacquire the lock will skip this
-    /// buffer. We then drop the write lock and call `wait_until_completed`
-    /// (which itself takes the commands pool's own lock, not ours) to drain
-    /// any pending GPU work on the claimed buffer before we hand it out.
+    /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
-        let claimed = {
-            let buffers = self.buffers.write().map_err(MetalError::from)?;
-            find_available_buffer(size, &buffers)
-        };
-        if let Some(b) = claimed {
-            // b.strong_count is now >= 2; concurrent allocators will skip it.
-            self.wait_until_completed()?;
-            return Ok(b);
+        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+        if let Some(b) = find_available_buffer(size, &buffers) {
+            // Cloning also ensures we increment the strong count
+            return Ok(b.clone());
         }
         let size = buf_size(size);
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         let subbuffers = buffers.entry(size).or_insert(vec![]);
+
         let new_buffer = self
             .device
             .new_buffer(size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
+        self.residency_set.insert(&new_buffer);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
     }
@@ -431,6 +373,105 @@ impl MetalDevice {
 
 fn buf_size(size: usize) -> usize {
     size.next_power_of_two()
+}
+
+/// Applies the [`BufferBuilder`] label, clearing any stale label on a reused pooled buffer.
+#[cfg(feature = "metal-debug-labels")]
+#[inline]
+fn buffer_label(buffer: &Buffer, label: Option<&str>) {
+    buffer.set_label(label.unwrap_or("unlabeled"));
+}
+#[cfg(not(feature = "metal-debug-labels"))]
+#[inline]
+fn buffer_label(_buffer: &Buffer, _label: Option<&str>) {}
+
+type DataUpload<'a> = Box<dyn FnOnce(&MetalDevice) -> Result<Arc<Buffer>> + 'a>;
+
+enum BufferInit<'a> {
+    Typed { elem_count: usize, dtype: DType },
+    Size(usize),
+    Zeros(usize),
+    Data(DataUpload<'a>),
+}
+
+/// Builder for `MTLBuffer` allocations; pool reuse handled by [`MetalDevice`].
+pub struct BufferBuilder<'a> {
+    device: &'a MetalDevice,
+    label: Option<&'a str>,
+}
+
+/// [`BufferBuilder`] with an init kind set; `build()` lives here.
+pub struct ReadyBufferBuilder<'a> {
+    device: &'a MetalDevice,
+    init: BufferInit<'a>,
+    label: Option<&'a str>,
+}
+
+impl<'a> BufferBuilder<'a> {
+    fn new(device: &'a MetalDevice) -> Self {
+        Self {
+            device,
+            label: None,
+        }
+    }
+
+    /// Allocate elem_count * dtype size bytes, uninitialized, private storage.
+    pub fn with_size_for(self, elem_count: usize, dtype: DType) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Typed { elem_count, dtype })
+    }
+
+    /// Allocate size bytes, uninitialized, shared storage.
+    pub fn with_size(self, size: usize) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Size(size))
+    }
+
+    /// Allocate size bytes, zero-filled, shared storage. Pool rounding may make
+    /// the allocation larger than size; the extra bytes are also zeroed.
+    pub fn with_zeros(self, size: usize) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Zeros(size))
+    }
+
+    /// Allocate a shared buffer initialized from data. Always allocates; does not
+    /// reuse the pool.
+    pub fn with_data<T>(self, data: &'a [T]) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Data(Box::new(move |device| {
+            device.new_buffer_with_data(data)
+        })))
+    }
+
+    pub fn with_label(mut self, label: &'a str) -> Self {
+        self.label = Some(label);
+        self
+    }
+
+    #[inline]
+    fn ready(self, init: BufferInit<'a>) -> ReadyBufferBuilder<'a> {
+        ReadyBufferBuilder {
+            device: self.device,
+            init,
+            label: self.label,
+        }
+    }
+}
+
+impl<'a> ReadyBufferBuilder<'a> {
+    pub fn with_label(mut self, label: &'a str) -> Self {
+        self.label = Some(label);
+        self
+    }
+
+    pub fn build(self) -> Result<Arc<Buffer>> {
+        let buffer = match self.init {
+            BufferInit::Typed { elem_count, dtype } => {
+                self.device.new_buffer(elem_count, dtype, "")?
+            }
+            BufferInit::Size(size) => self.device.allocate_buffer(size)?,
+            BufferInit::Zeros(size) => self.device.allocate_zeros(size)?,
+            BufferInit::Data(upload) => upload(self.device)?,
+        };
+        buffer_label(&buffer, self.label);
+        Ok(buffer)
+    }
 }
 
 #[cfg(test)]

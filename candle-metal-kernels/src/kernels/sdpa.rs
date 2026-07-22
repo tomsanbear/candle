@@ -1,9 +1,9 @@
 use crate::utils::EncoderProvider;
 use crate::{
-    set_params, Buffer, ComputeCommandEncoder, ConstantValues, Device, EncoderParam, Kernels,
-    MetalKernelError, Source, Value,
+    debug_group, set_params, Buffer, ComputeCommandEncoder, ConstantValues, Device, EncoderParam,
+    Kernels, MetalKernelError, Output, Source, Value,
 };
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use objc2_metal::MTLSize;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SdpaDType {
@@ -119,6 +119,12 @@ pub fn call_sdpa_full(
     let align_k = (kl % bk) == 0;
     let has_mask = mask_buffer.is_some();
 
+    // When an explicit additive mask is supplied it already encodes causality.
+    // Also enabling the in-kernel `do_causal` path double-applies causality and,
+    // at periodic sequence lengths, leaves a query row fully masked -> softmax
+    // normalizer sum(exp) == 0 -> final divide computes 0/0 = NaN logits.
+    let do_causal = do_causal && !has_mask;
+
     let itype_repr = match itype {
         SdpaDType::BF16 => "bfloat16",
         SdpaDType::F16 => "float16",
@@ -140,13 +146,16 @@ pub fn call_sdpa_full(
         (301, Value::Bool(/* do_causal */ do_causal)),
     ]));
 
+    #[cfg(feature = "debug-labels")]
+    let name_for_label = name.clone();
     let pipeline = kernels.load_pipeline_with_constants(device, Source::Sdpa, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "sdpa_full b={b} h={h} d={d} ql={ql} kl={kl}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "sdpa_full {name_for_label} B={b} H={h} D={d} QL={ql} KL={kl}"
+    );
 
     let nq = (ql + bq - 1) / bq;
     let nk = (kl + bk - 1) / bk;
@@ -213,7 +222,6 @@ pub fn call_sdpa_full(
                 mask_strides[2] as i64,
             ],
         };
-        encoder.use_resource(mask, MTLResourceUsage::Read);
 
         set_params!(
             encoder,
@@ -221,7 +229,7 @@ pub fn call_sdpa_full(
                 (q_buffer, q_offset),
                 (k_buffer, k_offset),
                 (v_buffer, v_offset),
-                output,
+                Output::new(output),
                 params,
                 mask_params,
                 mask
@@ -234,7 +242,7 @@ pub fn call_sdpa_full(
                 (q_buffer, q_offset),
                 (k_buffer, k_offset),
                 (v_buffer, v_offset),
-                output,
+                Output::new(output),
                 params
             )
         );
@@ -250,10 +258,6 @@ pub fn call_sdpa_full(
         height: wm,
         depth: wn,
     };
-    encoder.use_resource(q_buffer, MTLResourceUsage::Read);
-    encoder.use_resource(k_buffer, MTLResourceUsage::Read);
-    encoder.use_resource(v_buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(grid_dims, group_dims);
 
     Ok(())
@@ -333,13 +337,8 @@ pub fn call_sdpa_vector(
     let pipeline = kernels.load_pipeline_with_constants(device, Source::Sdpa, name, constants)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "sdpa_vector b={} d={} kl={}",
-        q_shape[0] * q_shape[1],
-        bk,
-        k_shape[2]
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "sdpa_vector bk={bk} B={b} N={n}");
 
     // q = (bs, qhead, seq, hidden)
     // k/v = (bs, kv_head, kv_seq, hidden)
@@ -350,7 +349,7 @@ pub fn call_sdpa_vector(
             (q_buffer, q_offset),
             (k_buffer, k_offset),
             (v_buffer, v_offset),
-            output,
+            Output::new(output),
             gqa_factor,
             n,
             kstride,
@@ -370,10 +369,6 @@ pub fn call_sdpa_vector(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(q_buffer, MTLResourceUsage::Read);
-    encoder.use_resource(k_buffer, MTLResourceUsage::Read);
-    encoder.use_resource(v_buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(grid_dims, group_dims);
     Ok(())
 }
@@ -461,6 +456,7 @@ pub fn call_sdpa_vector_2pass(
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
+        debug_group!(encoder, "sdpa_vector_2pass pass1 bk={bk} B={b} N={n}");
 
         // q = (bs, qhead, seq, hidden)
         // k/v = (bs, kv_head, kv_seq, hidden)
@@ -471,9 +467,9 @@ pub fn call_sdpa_vector_2pass(
                 (q_buffer, q_offset),
                 (k_buffer, k_offset),
                 (v_buffer, v_offset),
-                intermediate,
-                sums,
-                maxs,
+                Output::new(intermediate),
+                Output::new(sums),
+                Output::new(maxs),
                 gqa_factor,
                 n,
                 kstride,
@@ -493,12 +489,6 @@ pub fn call_sdpa_vector_2pass(
             height: 1,
             depth: 1,
         };
-        encoder.use_resource(q_buffer, MTLResourceUsage::Read);
-        encoder.use_resource(k_buffer, MTLResourceUsage::Read);
-        encoder.use_resource(v_buffer, MTLResourceUsage::Read);
-        encoder.use_resource(intermediate, MTLResourceUsage::Write);
-        encoder.use_resource(sums, MTLResourceUsage::Write);
-        encoder.use_resource(maxs, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(grid_dims, group_dims);
     }
@@ -539,11 +529,12 @@ pub fn call_sdpa_vector_2pass(
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
+        debug_group!(encoder, "sdpa_vector_2pass pass2 bk={bk} B={b}");
 
         // q = (bs, qhead, seq, hidden)
         // k/v = (bs, kv_head, kv_seq, hidden)
 
-        set_params!(encoder, (intermediate, sums, maxs, output));
+        set_params!(encoder, (intermediate, sums, maxs, Output::new(output)));
 
         let grid_dims = MTLSize {
             width: 1,
@@ -555,10 +546,6 @@ pub fn call_sdpa_vector_2pass(
             height: 1,
             depth: 1,
         };
-        encoder.use_resource(intermediate, MTLResourceUsage::Write);
-        encoder.use_resource(sums, MTLResourceUsage::Write);
-        encoder.use_resource(maxs, MTLResourceUsage::Write);
-        encoder.use_resource(output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(grid_dims, group_dims);
     }

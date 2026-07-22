@@ -1,7 +1,10 @@
 use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use crate::{
+    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
+    Output, Source,
+};
+use objc2_metal::MTLSize;
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_reduce_contiguous(
@@ -22,10 +25,11 @@ pub fn call_reduce_contiguous(
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "reduce {kernel_name} len={length} out={out_length}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "reduce {kernel_name} length={length} out_length={out_length}"
+    );
 
     let shape: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
     set_params!(
@@ -36,7 +40,7 @@ pub fn call_reduce_contiguous(
             shape.as_slice(),
             work_per_threadgroup as u32,
             &input,
-            output
+            Output::new(output)
         )
     );
 
@@ -44,8 +48,6 @@ pub fn call_reduce_contiguous(
         pipeline.max_total_threads_per_threadgroup(),
         (work_per_threadgroup / 2).next_power_of_two(),
     );
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(
         MTLSize {
             width: out_length,
@@ -81,10 +83,11 @@ pub fn call_reduce_strided(
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "reduce_strided {kernel_name} len={length} out={out_length}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "reduce_strided {kernel_name} length={length} out_length={out_length}"
+    );
 
     let shape: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
     let strides: Vec<u32> = strides.iter().map(|&x| x as u32).collect();
@@ -97,7 +100,7 @@ pub fn call_reduce_strided(
             strides.as_slice(),
             work_per_threadgroup as u32,
             &input,
-            output
+            Output::new(output)
         )
     );
 
@@ -105,8 +108,6 @@ pub fn call_reduce_strided(
         pipeline.max_total_threads_per_threadgroup(),
         (work_per_threadgroup / 2).next_power_of_two(),
     );
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(
         MTLSize {
             width: out_length,
@@ -139,14 +140,20 @@ pub fn call_last_softmax(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "softmax {kernel_name} len={length} elements={elements}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "softmax {kernel_name} length={length} elements={elements}"
+    );
 
     set_params!(
         encoder,
-        (length, work_per_threadgroup, (input, input_offset), output)
+        (
+            length,
+            work_per_threadgroup,
+            (input, input_offset),
+            Output::new(output)
+        )
     );
 
     let out_length = length / work_per_threadgroup;
@@ -167,8 +174,6 @@ pub fn call_last_softmax(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -191,11 +196,11 @@ pub fn call_rms_norm(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "rms_norm {kernel_name} rows={} cols={elements_to_sum}",
-        length / elements_to_sum.max(1)
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "rms_norm {kernel_name} length={length} elements_to_sum={elements_to_sum}"
+    );
 
     set_params!(
         encoder,
@@ -203,7 +208,7 @@ pub fn call_rms_norm(
             length,
             elements_to_sum,
             (input, input_offset),
-            output,
+            Output::new(output),
             (alpha, alpha_offset),
             eps
         )
@@ -228,9 +233,6 @@ pub fn call_rms_norm(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(alpha, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -255,11 +257,11 @@ pub fn call_layer_norm(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "layer_norm {kernel_name} rows={} cols={elements_to_sum}",
-        length / elements_to_sum.max(1)
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "layer_norm {kernel_name} length={length} elements_to_sum={elements_to_sum}"
+    );
 
     set_params!(
         encoder,
@@ -267,7 +269,7 @@ pub fn call_layer_norm(
             length,
             elements_to_sum,
             (input, input_offset),
-            output,
+            Output::new(output),
             (alpha, alpha_offset),
             (beta, beta_offset),
             eps
@@ -294,10 +296,6 @@ pub fn call_layer_norm(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(alpha, MTLResourceUsage::Read);
-    encoder.use_resource(beta, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -322,10 +320,8 @@ pub fn call_rope_i(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "rope_i {kernel_name} bh={bh} td={td}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rope_i {kernel_name} bh={bh} td={td}");
 
     set_params!(
         encoder,
@@ -336,14 +332,10 @@ pub fn call_rope_i(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            Output::new(output)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(cos, MTLResourceUsage::Read);
-    encoder.use_resource(sin, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -370,10 +362,8 @@ pub fn call_rope_thd(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "rope_thd {kernel_name} b={b} t={t} h={h} d={d}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rope_thd {kernel_name} b={b} t={t} h={h} d={d}");
 
     set_params!(
         encoder,
@@ -386,14 +376,10 @@ pub fn call_rope_thd(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            Output::new(output)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (b * t * h * d) / 2);
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(cos, MTLResourceUsage::Read);
-    encoder.use_resource(sin, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -419,10 +405,8 @@ pub fn call_rope(
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_label(&format!(
-        "rope {kernel_name} bh={bh} td={td} d={d}"
-    ));
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rope {kernel_name} bh={bh} td={td} d={d}");
 
     set_params!(
         encoder,
@@ -434,14 +418,10 @@ pub fn call_rope(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            Output::new(output)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(cos, MTLResourceUsage::Read);
-    encoder.use_resource(sin, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

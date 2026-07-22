@@ -115,13 +115,17 @@ impl LayerNorm {
 
 impl Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if x.is_contiguous() && self.remove_mean {
+        if self.remove_mean {
+            // The fused kernels need contiguous input; making it so is
+            // cheaper than the composed slow path below (and a no-op clone
+            // when the input already is).
+            let x = x.contiguous()?;
             match self.bias.as_ref() {
                 Some(bias) => {
-                    return crate::ops::layer_norm(x, &self.weight, bias, self.eps as f32)
+                    return crate::ops::layer_norm(&x, &self.weight, bias, self.eps as f32)
                 }
                 None => {
-                    return crate::ops::layer_norm_no_bias(x, &self.weight, self.eps as f32)
+                    return crate::ops::layer_norm_no_bias(&x, &self.weight, self.eps as f32)
                 }
             }
         }
@@ -206,11 +210,9 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        if xs.is_contiguous() {
-            crate::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)
-        } else {
-            self.0.forward(xs)
-        }
+        // As in LayerNorm::forward: contiguous-then-fused beats the composed
+        // slow path, and contiguous() is a no-op clone when already so.
+        crate::ops::rms_norm(&xs.contiguous()?, &self.0.weight, self.0.eps as f32)
     }
 }
 

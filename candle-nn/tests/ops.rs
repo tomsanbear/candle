@@ -99,6 +99,53 @@ fn rms_norml(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn norm_non_contiguous(device: &Device) -> Result<()> {
+    use candle_nn::Module;
+    // A transposed view routes the Module forwards through the
+    // auto-contiguous fused path; parity vs the composed slow ops, which
+    // handle strides natively.
+    let base = Tensor::new(
+        &[[3f32, 1., 4., 1.], [5., 9., 2., 6.], [5., 3., 5., 8.]],
+        device,
+    )?;
+    let xs = base.t()?; // (4, 3), non-contiguous
+    assert!(!xs.is_contiguous());
+    let alpha = Tensor::new(&[1f32, 2., 3.], device)?;
+    let beta = Tensor::new(&[0.5f32, -1., 0.25], device)?;
+
+    let rms = candle_nn::RmsNorm::new(alpha.clone(), 1e-5);
+    let fused = rms.forward(&xs)?;
+    let slow = candle_nn::ops::rms_norm_slow(&xs, &alpha, 1e-5)?;
+    let diff = (fused - slow)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "rms_norm non-contiguous: {diff}");
+
+    let ln = candle_nn::LayerNorm::new(alpha.clone(), beta.clone(), 1e-5);
+    let fused = ln.forward(&xs)?;
+    let slow = candle_nn::ops::layer_norm_slow(&xs, &alpha, &beta, 1e-5)?;
+    let diff = (fused - slow)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "layer_norm non-contiguous: {diff}");
+
+    let ln_nb = candle_nn::LayerNorm::new_no_bias(alpha.clone(), 1e-5);
+    let fused = ln_nb.forward(&xs)?;
+    let zero = Tensor::zeros(3, candle::DType::F32, device)?;
+    let slow = candle_nn::ops::layer_norm_slow(&xs, &alpha, &zero, 1e-5)?;
+    let diff = (fused - slow)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "layer_norm_no_bias non-contiguous: {diff}");
+    Ok(())
+}
+
 fn rms_norm_large_magnitude(device: &Device) -> Result<()> {
     let (rows, hidden) = (4usize, 6912usize);
     let data: Vec<f32> = (0..rows * hidden)
@@ -484,6 +531,7 @@ test_device!(
     rms_norm_large_magnitude_metal
 );
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
+test_device!(norm_non_contiguous, nnc_cpu, nnc_gpu, nnc_metal);
 test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
 test_device!(matmul_bias, matmul_bias_cpu, matmul_bias_gpu, matmul_bias_metal);
 test_device!(

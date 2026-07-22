@@ -30,6 +30,15 @@ impl DeviceId {
     }
 }
 
+/// A handle to a Metal GPU with its own command queue, fence machinery and
+/// buffer pools.
+///
+/// Identity is per handle, not per GPU: `MetalDevice::new(0)` called twice
+/// yields two devices that compare unequal and whose tensors cannot be
+/// mixed, because command ordering and buffer reuse are only tracked within
+/// one handle. Create the device once per GPU and share it (clones share
+/// the underlying state). Deduplicating handles per ordinal upstream is a
+/// possible future design change.
 #[derive(Clone)]
 pub struct MetalDevice {
     /// Unique identifier, the registryID is not sufficient as it identifies the GPU rather than

@@ -255,6 +255,14 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new_with_stream(ordinal)?))
     }
 
+    /// Create a new Metal device handle.
+    ///
+    /// Each call creates a distinct handle with its own command queue, fence
+    /// machinery and buffer pools, even for the same `ordinal`: two handles
+    /// compare unequal under [`Device::same_device`] and tensors created on
+    /// one cannot be used with tensors from the other. Create one handle per
+    /// GPU and share it (clones share the underlying state) across every
+    /// model/module that must exchange tensors.
     pub fn new_metal(ordinal: usize) -> Result<Self> {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }

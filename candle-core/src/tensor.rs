@@ -432,6 +432,11 @@ impl Tensor {
     }
 
     /// Returns a new tensor with all the elements having the same specified value.
+    ///
+    /// The dtype comes from the Rust type of `value` — note that a bare
+    /// float literal like `3.5` is `f64`, so pass `3.5f32` (or cast with
+    /// [`Tensor::to_dtype`]) when a device tensor of another dtype is
+    /// wanted; the same applies to [`Tensor::new`] with float data.
     ///```rust
     /// use candle_core::{Tensor, Device};
     /// let a = Tensor::full(3.5, (2, 4), &Device::Cpu)?;
@@ -1514,6 +1519,15 @@ impl Tensor {
     /// * `rhs` - A tensor with dimensions `b1, b2, ..., bi, k, n`.
     ///
     /// The resulting tensor has dimensions `b1, b2, ..., bi, m, n`.
+    ///
+    /// # Layout requirements
+    ///
+    /// The CUDA and Metal backends accept operands whose last two dimensions
+    /// are laid out as a (possibly transposed) matrix over a contiguous
+    /// batch; other views — e.g. the result of a `narrow` or `permute` that
+    /// leaves an irregular stride — fail with `MatMulNonContiguous`. Calling
+    /// `.contiguous()` on the offending operand is the remedy (attention
+    /// implementations typically do this after their head transposes).
     pub fn matmul(&self, rhs: &Self) -> Result<Self> {
         let a_dims = self.shape().dims();
         let b_dims = rhs.shape().dims();

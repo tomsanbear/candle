@@ -1953,10 +1953,10 @@ fn to_dtype(dev: &Device) -> Result<()> {
         // The CUDA cast kernels do not cover i16/i32 yet.
         dtypes.push(DType::I32);
         dtypes.push(DType::I16);
-        // On Metal the f64 pairs run through software bit-conversion kernels
-        // (MSL has no double type); CUDA coverage is still partial.
-        dtypes.push(DType::F64);
     }
+    // On Metal the f64 pairs run through software bit-conversion kernels
+    // (MSL has no double type); CUDA casts f64 natively.
+    dtypes.push(DType::F64);
     let cpu = Device::Cpu;
     for &src in dtypes.iter() {
         for &dst in dtypes.iter() {

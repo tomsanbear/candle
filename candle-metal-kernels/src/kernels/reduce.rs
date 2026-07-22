@@ -201,7 +201,10 @@ pub fn call_rms_norm(
     let rows = length / elements_to_sum.max(1);
     if rows >= NORM_BATCHED_MIN_ROWS {
         let batched = match kernel_name {
-            "rmsnorm_f32" => Some("rmsnorm_batched_f32"),
+            // f32 rms is the one measured case where wide rows lose on the
+            // batched layout (m3: -11% at 1024 cols vs +48% at 512); the
+            // half types win at both widths.
+            "rmsnorm_f32" if elements_to_sum <= 512 => Some("rmsnorm_batched_f32"),
             "rmsnorm_f16" => Some("rmsnorm_batched_f16"),
             "rmsnorm_bf16" => Some("rmsnorm_batched_bf16"),
             _ => None,

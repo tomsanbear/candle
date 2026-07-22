@@ -250,8 +250,8 @@ pub fn call_layer_norm(
     input_offset: usize,
     alpha: &Buffer,
     alpha_offset: usize,
-    beta: &Buffer,
-    beta_offset: usize,
+    // `None` binds a null beta: the kernel then skips the bias add.
+    beta: Option<(&Buffer, usize)>,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
@@ -270,11 +270,14 @@ pub fn call_layer_norm(
             elements_to_sum,
             (input, input_offset),
             Output::new(output),
-            (alpha, alpha_offset),
-            (beta, beta_offset),
-            eps
+            (alpha, alpha_offset)
         )
     );
+    match beta {
+        Some((beta, beta_offset)) => encoder.set_input_buffer(5, Some(beta), beta_offset),
+        None => encoder.set_input_buffer(5, None, 0),
+    }
+    crate::utils::set_param(encoder, 6, eps);
 
     let work_per_threadgroup = elements_to_sum;
 

@@ -187,6 +187,42 @@ fn layer_norml(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn layer_norm_no_bias(device: &Device) -> Result<()> {
+    let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
+    let tensor = Tensor::new(data, device)?;
+    let alpha = Tensor::new(&[1f32, 2f32, 3f32], device)?;
+    let t = candle_nn::ops::layer_norm_no_bias(&tensor, &alpha, 1e-5)?;
+    let beta = Tensor::zeros(3, candle::DType::F32, device)?;
+    let t2 = candle_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
+    let diff = (&t - &t2)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    assert!(diff < 1e-5);
+    // The module-level no-bias constructor must reach the same values.
+    use candle::Module;
+    let t3 = candle_nn::LayerNorm::new_no_bias(alpha.clone(), 1e-5).forward(&tensor)?;
+    let diff = (&t - &t3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    assert!(diff < 1e-5);
+
+    // A larger many-rows shape to exercise the kernel path.
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let (b_size, seq_len, head_dim) = (24, 70, 64);
+    let el_count = b_size * seq_len * head_dim;
+    let mut rng = StdRng::seed_from_u64(299792458);
+    let src: Vec<f32> = (0..el_count).map(|_| rng.random::<f32>()).collect();
+    let tensor = Tensor::new(src, device)?.reshape((b_size, seq_len, head_dim))?;
+    let alpha = Tensor::ones(head_dim, candle::DType::F32, device)?;
+    let beta = Tensor::zeros(head_dim, candle::DType::F32, device)?;
+    let t = candle_nn::ops::layer_norm_no_bias(&tensor, &alpha, 1e-5)?;
+    let t2 = candle_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
+    let diff = (t - t2)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .reshape(())?
+        .to_vec0::<f32>()?;
+    assert!(diff < 1e-5);
+    Ok(())
+}
+
 #[test]
 fn softmax_numerical_stability() -> Result<()> {
     let dev = &Device::Cpu;
@@ -378,5 +414,6 @@ test_device!(
     rms_norm_large_magnitude_metal
 );
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
+test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);

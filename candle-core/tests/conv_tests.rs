@@ -932,7 +932,56 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/* Regression test: the im2col paths of conv1d/conv2d materialized a contiguous
+   copy of a non-contiguous kernel but then ran the matmul on the ORIGINAL
+   kernel storage through a contiguous layout at the original offset, reading
+   garbage. A non-contiguous kernel (with or without a storage offset) must give
+   the same result as its contiguous copy. */
+fn conv_noncontiguous_kernel(dev: &Device) -> Result<()> {
+    let t = Tensor::arange(0f32, 20f32, dev)?.reshape((1, 4, 5))?;
+    // Build the kernel as (c_in=4, c_out=2, k=3) then transpose it into the
+    // (c_out, c_in, k) shape conv1d expects, making it non-contiguous.
+    let w = Tensor::arange(0f32, 24f32, dev)?
+        .reshape((4, 2, 3))?
+        .transpose(0, 1)?;
+    let res = t.conv1d(&w, 1, 1, 1, 1)?;
+    let expected = t.conv1d(&w.contiguous()?, 1, 1, 1, 1)?;
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        test_utils::to_vec1_round(&expected.flatten_all()?, 4)?
+    );
+    // Same with a storage offset on the non-contiguous kernel.
+    let w = Tensor::arange(0f32, 48f32, dev)?
+        .reshape((2, 4, 2, 3))?
+        .i(1)?
+        .transpose(0, 1)?;
+    let res = t.conv1d(&w, 1, 1, 1, 1)?;
+    let expected = t.conv1d(&w.contiguous()?, 1, 1, 1, 1)?;
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        test_utils::to_vec1_round(&expected.flatten_all()?, 4)?
+    );
+
+    let t = Tensor::arange(0f32, 36f32, dev)?.reshape((1, 4, 3, 3))?;
+    let w = Tensor::arange(0f32, 72f32, dev)?
+        .reshape((4, 2, 3, 3))?
+        .transpose(0, 1)?;
+    let res = t.conv2d(&w, 1, 1, 1, 1)?;
+    let expected = t.conv2d(&w.contiguous()?, 1, 1, 1, 1)?;
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        test_utils::to_vec1_round(&expected.flatten_all()?, 4)?
+    );
+    Ok(())
+}
+
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
+test_device!(
+    conv_noncontiguous_kernel,
+    conv_noncontiguous_kernel_cpu,
+    conv_noncontiguous_kernel_gpu,
+    conv_noncontiguous_kernel_metal
+);
 test_device!(
     conv1d_small,
     conv1d_small_cpu,

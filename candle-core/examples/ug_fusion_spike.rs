@@ -12,9 +12,11 @@ fn main() -> candle_core::Result<()> {
     use candle_core::{Device, Tensor, UgIOp1};
     use std::time::Instant;
 
-    fn chain_kernel(depth: usize) -> candle_core::Result<candle_ug::lang::ssa::Kernel> {
+    // ug kernels are shape-specialized: the layout is baked in at lowering,
+    // so each (chain, shape) pair costs one runtime MSL compile.
+    fn chain_kernel(depth: usize, n: usize) -> candle_core::Result<candle_ug::lang::ssa::Kernel> {
         use candle_ug::lang::op;
-        let layout = candle_ug::Layout::from_shape(&[1]); // resized at launch by elem count
+        let layout = candle_ug::Layout::from_shape(&[n]);
         let ptr = op::Arg::ptr(candle_ug::DType::F32);
         let mut src = op::load(ptr.id(), layout.clone(), candle_ug::DType::F32)
             .map_err(candle_core::Error::wrap)?;
@@ -33,7 +35,7 @@ fn main() -> candle_core::Result<()> {
 
     for &n in [356_352usize, 1 << 20].iter() {
         for &depth in [3usize, 6].iter() {
-            let op = UgIOp1::new("cos_chain", chain_kernel(depth)?, &device)?;
+            let op = UgIOp1::new("cos_chain", chain_kernel(depth, n)?, &device)?;
 
             // Correctness: fused vs composed on identical inputs.
             let x0 = Tensor::rand(-1f32, 1f32, n, &device)?;

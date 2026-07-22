@@ -369,6 +369,15 @@ impl MetalDevice {
             .map_err(|e| MetalError::from(e.to_string()))?;
         Ok(())
     }
+
+    /// Stop the capture started by [`Self::capture`], sealing the .gputrace
+    /// file so it can be opened without waiting for process exit. Callers
+    /// should synchronize the device first so pending command buffers are
+    /// committed inside the capture scope.
+    pub fn stop_capture(&self) {
+        let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        capture.stopCapture();
+    }
 }
 
 fn buf_size(size: usize) -> usize {

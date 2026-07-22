@@ -24,5 +24,7 @@ fn main() -> Result<()> {
     // This second synchronize ensures that the command buffer gets committed before the end of the
     // capture scope.
     device.synchronize()?;
+    // Seal the .gputrace so it can be opened without waiting for process exit.
+    metal_device.stop_capture();
     Ok(())
 }

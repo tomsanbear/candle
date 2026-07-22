@@ -391,6 +391,39 @@ fn rope_thd(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn matmul_bias(device: &Device) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(299792458);
+    let mut rand = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.random::<f32>() - 0.5).collect() };
+
+    // (batch, m, k, n): decode row, small prefill, batched rhs.
+    for (b, m, k, n, batched_rhs) in [
+        (1usize, 1usize, 64usize, 48usize, false),
+        (2, 33, 64, 48, false),
+        (2, 17, 32, 16, true),
+    ] {
+        let lhs = Tensor::from_vec(rand(b * m * k), (b, m, k), device)?;
+        let rhs = if batched_rhs {
+            Tensor::from_vec(rand(b * k * n), (b, k, n), device)?
+        } else {
+            Tensor::from_vec(rand(k * n), (k, n), device)?
+        };
+        let bias = Tensor::from_vec(rand(n), n, device)?;
+        let fused = candle_nn::ops::matmul_bias(&lhs, &rhs, &bias)?;
+        let reference = lhs.broadcast_matmul(&rhs)?.broadcast_add(&bias)?;
+        let diff = (&fused - &reference)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "matmul_bias mismatch at b={b} m={m} k={k} n={n} batched_rhs={batched_rhs}: {diff}"
+        );
+    }
+    Ok(())
+}
+
 fn sigmoid(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
@@ -415,5 +448,6 @@ test_device!(
 );
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
+test_device!(matmul_bias, matmul_bias_cpu, matmul_bias_gpu, matmul_bias_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);

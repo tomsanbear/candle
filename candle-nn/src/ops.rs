@@ -1156,6 +1156,123 @@ pub fn layer_norm_no_bias(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tenso
     xs.apply_op2_no_bwd(alpha, &LayerNormNoBias { eps })
 }
 
+struct MatmulBias;
+
+impl candle::CustomOp3 for MatmulBias {
+    fn name(&self) -> &'static str {
+        "matmul-bias"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("matmul-bias is fused on Metal only; the public fn composes elsewhere")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        lhs: &candle::MetalStorage,
+        lhs_l: &Layout,
+        rhs: &candle::MetalStorage,
+        rhs_l: &Layout,
+        bias: &candle::MetalStorage,
+        bias_l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+
+        let lhs_dims = lhs_l.dims();
+        let rhs_dims = rhs_l.dims();
+        if lhs_dims.len() < 2 || rhs_dims.len() < 2 {
+            candle::bail!("matmul-bias expects at least 2d lhs/rhs");
+        }
+        let m = lhs_dims[lhs_dims.len() - 2];
+        let k = lhs_dims[lhs_dims.len() - 1];
+        let k2 = rhs_dims[rhs_dims.len() - 2];
+        let n = rhs_dims[rhs_dims.len() - 1];
+        let b: usize = lhs_dims[..lhs_dims.len() - 2].iter().product();
+        let rhs_b: usize = rhs_dims[..rhs_dims.len() - 2].iter().product();
+        if k != k2 || (rhs_b != 1 && rhs_b != b) {
+            candle::bail!(
+                "matmul-bias shape mismatch lhs {lhs_dims:?} rhs {rhs_dims:?} (rhs batch must be 1 or match)"
+            );
+        }
+        if bias_l.dims() != [n] || !bias_l.is_contiguous() {
+            candle::bail!(
+                "matmul-bias bias must be a contiguous ({n},) vector, got {:?}",
+                bias_l.dims()
+            );
+        }
+        let dtype = match lhs.dtype() {
+            DType::F32 => candle_metal_kernels::GemmDType::F32,
+            DType::F16 => candle_metal_kernels::GemmDType::F16,
+            DType::BF16 => candle_metal_kernels::GemmDType::BF16,
+            dtype => candle::bail!("matmul-bias does not support {dtype:?}"),
+        };
+        if rhs.dtype() != lhs.dtype() || bias.dtype() != lhs.dtype() {
+            candle::bail!("matmul-bias dtypes must match");
+        }
+
+        let device = lhs.device();
+        let elem_count = b * m * n;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lhs.dtype())
+            .with_label("matmul-bias")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        candle_metal_kernels::call_mlx_gemm_with_bias(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            dtype,
+            (b, m, n, k),
+            lhs_l.stride(),
+            lhs_l.start_offset() * lhs.dtype().size_in_bytes(),
+            lhs.buffer(),
+            rhs_l.stride(),
+            rhs_l.start_offset() * rhs.dtype().size_in_bytes(),
+            rhs.buffer(),
+            Some((
+                bias.buffer(),
+                bias_l.start_offset() * bias.dtype().size_in_bytes(),
+            )),
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let mut out_dims = lhs_dims.to_vec();
+        out_dims[lhs_dims.len() - 1] = n;
+        let out_shape = Shape::from_dims(&out_dims);
+        let storage = candle::MetalStorage::new(output, device.clone(), elem_count, lhs.dtype());
+        Ok((storage, out_shape))
+    }
+}
+
+/// `lhs.matmul(rhs) + bias`, with the bias add fused into the GEMM epilogue
+/// on Metal. `bias` is an `n`-element vector broadcast over rows and batch;
+/// `rhs` may be 2d (broadcast over the batch) or share `lhs`'s batch shape.
+/// Other backends compose `broadcast_matmul` + `broadcast_add`.
+pub fn matmul_bias(lhs: &Tensor, rhs: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    if !lhs.device().is_metal() {
+        return lhs.broadcast_matmul(rhs)?.broadcast_add(bias);
+    }
+    // Give a lower-rank rhs explicit zero-stride batch dims so the kernel's
+    // per-operand batch strides are exact.
+    let rhs = if rhs.rank() < lhs.rank() {
+        let batch_dims = &lhs.dims()[..lhs.rank() - 2];
+        rhs.broadcast_left(batch_dims)?
+    } else {
+        rhs.clone()
+    };
+    lhs.apply_op3_no_bwd(&rhs, bias, &MatmulBias)
+}
+
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html
 pub fn pixel_shuffle(xs: &Tensor, upscale_factor: usize) -> Result<Tensor> {
     let (b_size, c, h, w) = xs.dims4()?;

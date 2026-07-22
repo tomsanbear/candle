@@ -1,4 +1,5 @@
 pub(crate) mod conv;
+pub(crate) mod linear;
 pub(crate) mod norm;
 pub(crate) mod softmax;
 

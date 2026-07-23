@@ -187,9 +187,9 @@ const NORM_BATCHED_MIN_ROWS: usize = 32;
 /// threads per group). One simdgroup handles one row, so a group covers
 /// threads/32 rows. Wide rows use smaller groups: 32-row groups pack the
 /// cores too coarsely to hide the longer per-lane load chains (M3 Pro at
-/// 1024x1024 f32 measured 45% occupancy vs an 86% manager target — FORK.md
-/// batched-norm row has the receipts). Public so the norm_probe example
-/// dispatches exactly what production does.
+/// 1024x1024 f32 measured 45% occupancy vs an 86% manager target — FORK.md's
+/// batched-norm entry has the receipts). Public so the norm_probe example
+/// dispatches exactly what the real norm path dispatches.
 pub fn norm_batched_geometry(rows: usize, cols: usize) -> (usize, usize) {
     let threads = if cols >= 1024 { 256 } else { 1024 };
     (rows.div_ceil(threads / 32), threads)

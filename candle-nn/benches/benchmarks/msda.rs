@@ -4,7 +4,7 @@ use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
 
-/// Heron/RT-DETR-like multiscale deformable attention shape.
+/// Deformable-DETR/RT-DETR-style multiscale deformable attention shape.
 const N: usize = 1;
 const HEADS: usize = 8;
 const HEAD_DIM: usize = 32;

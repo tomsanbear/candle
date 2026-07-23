@@ -14,7 +14,8 @@ fn run_device(xs: &Tensor) {
 }
 
 /// The host round-trip this replaces: pull the scores to the CPU, sort
-/// there, keep the top k (what markers' layout pipeline ships today).
+/// there, keep the top k — what a detection pipeline has to do when the
+/// device has no top-k op.
 fn run_host(xs: &Tensor) {
     let rows = xs.to_vec2::<f32>().unwrap();
     let mut out = Vec::with_capacity(ROWS * K);

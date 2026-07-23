@@ -596,15 +596,22 @@ fn topk(device: &Device) -> Result<()> {
     // Wide rows (beyond the 1024-column bitonic argsort), batched, k a
     // non-power-of-two. Values must match a host reference exactly; indices
     // can differ on exact ties so the values are the comparison.
-    let (b, rows, ncols, k) = (2, 3, 4096, 300);
-    let data: Vec<f32> = (0..b * rows * ncols).map(|_| rng.random::<f32>()).collect();
-    let xs = Tensor::from_vec(data.clone(), (b, rows, ncols), device)?;
-    let (values, _indices) = candle_nn::ops::topk(&xs, k)?;
-    let values = values.flatten_all()?.to_vec1::<f32>()?;
-    for r in 0..b * rows {
-        let mut row: Vec<f32> = data[r * ncols..(r + 1) * ncols].to_vec();
-        row.sort_by(|a, b| b.total_cmp(a));
-        assert_eq!(&values[r * k..(r + 1) * k], &row[..k], "row {r}");
+    for &(b, rows, ncols, k) in &[
+        (2, 3, 4096, 300),
+        // Heron RT-DETR encoder tokens at 640px (80²+40²+20² = 8400).
+        (1, 1, 8400, 300),
+        // FORK.md RT-DETR-style query selection stress (pad shared would be 128 KiB).
+        (1, 2, 24000, 300),
+    ] {
+        let data: Vec<f32> = (0..b * rows * ncols).map(|_| rng.random::<f32>()).collect();
+        let xs = Tensor::from_vec(data.clone(), (b, rows, ncols), device)?;
+        let (values, _indices) = candle_nn::ops::topk(&xs, k)?;
+        let values = values.flatten_all()?.to_vec1::<f32>()?;
+        for r in 0..b * rows {
+            let mut row: Vec<f32> = data[r * ncols..(r + 1) * ncols].to_vec();
+            row.sort_by(|a, b| b.total_cmp(a));
+            assert_eq!(&values[r * k..(r + 1) * k], &row[..k], "shape {b}x{rows}x{ncols} k={k} row {r}");
+        }
     }
     Ok(())
 }

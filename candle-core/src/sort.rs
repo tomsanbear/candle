@@ -87,10 +87,34 @@ mod cuda {
             let ncols_pad = next_power_of_2(ncols);
             // Limit block dim to 1024 threads, which is the maximum on modern CUDA gpus.
             let block_dim = ncols_pad.min(1024);
+            // Bitonic asort stores one u32 index per padded column in shared
+            // memory. Default max dynamic shared is 48 KiB on most devices;
+            // Ada can raise it via cuFuncSetAttribute. Beyond ~100 KiB the
+            // kernel cannot run — use candle_nn::ops::topk for wide rows when
+            // only the top-k is needed, or sort on CPU.
+            let shared_mem_bytes = ncols_pad * std::mem::size_of::<u32>();
+            // 48 KiB default; 101376 is a common Ada/Ampere opt-in max for
+            // dynamic shared (device-dependent; we request what we need).
+            const DEFAULT_DYNAMIC_SHARED: usize = 48 * 1024;
+            const MAX_OPTIN_DYNAMIC_SHARED: usize = 99 * 1024;
+            if shared_mem_bytes > MAX_OPTIN_DYNAMIC_SHARED {
+                crate::bail!(
+                    "CUDA arg_sort_last_dim needs {shared_mem_bytes} bytes of shared memory for last_dim={ncols} (pad={ncols_pad}), which exceeds the ~{MAX_OPTIN_DYNAMIC_SHARED}-byte                      opt-in limit. Use candle_nn::ops::topk for wide last-dims when only k << ncols is required."
+                );
+            }
+            if shared_mem_bytes > DEFAULT_DYNAMIC_SHARED {
+                // Request enough dynamic shared for this launch (Ada/Ampere).
+                use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+                func.set_attribute(
+                    Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                )
+                .w()?;
+            }
             let cfg = LaunchConfig {
                 grid_dim: (nrows as u32, 1, 1),
                 block_dim: (block_dim as u32, 1, 1),
-                shared_mem_bytes: (ncols_pad * std::mem::size_of::<u32>()) as u32,
+                shared_mem_bytes: shared_mem_bytes as u32,
             };
             let stream = dev.cuda_stream();
             let mut builder = stream.launch_builder(&func);

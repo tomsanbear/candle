@@ -1631,7 +1631,7 @@ pub fn ms_deform_attn(
 }
 
 struct TopK {
-    #[allow(dead_code)] // only read by metal_fwd
+    /// Padded k (power of two); written into the last dim of the index tensor.
     k_pad: usize,
 }
 
@@ -1641,7 +1641,93 @@ impl candle::CustomOp1 for TopK {
     }
 
     fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("topk is fused on Metal only; the public fn composes elsewhere")
+        candle::bail!("topk CustomOp is GPU-only; the public fn composes on CPU")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        storage: &candle::CudaStorage,
+        layout: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{
+            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
+        };
+        use candle::cuda_backend::{
+            kernel_name, kernels, CudaDevice, CudaStorageSlice as S, Map1Any, WrapErr,
+        };
+        use candle::WithDType;
+
+        if !layout.is_contiguous() {
+            candle::bail!("topk requires a contiguous input")
+        }
+        let dims = layout.dims();
+        let k_pad = self.k_pad;
+        if k_pad == 0 || k_pad > 1024 || !k_pad.is_power_of_two() {
+            candle::bail!("topk k_pad={k_pad} must be a power of two in 1..=1024");
+        }
+        match storage.dtype() {
+            DType::F32 | DType::F16 | DType::BF16 => {}
+            dtype => candle::bail!("topk does not support {dtype:?} on CUDA"),
+        }
+
+        // Shared: (TILE + 2k) floats + (TILE + 2k) u32s — O(k), not O(ncols).
+        const TILE: usize = 1024;
+        let shared_mem_bytes =
+            (TILE + 2 * k_pad) * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+
+        struct TopKLaunch {
+            k_pad: usize,
+            shared_mem_bytes: usize,
+        }
+        impl Map1Any for TopKLaunch {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits, W: Fn(CudaSlice<T>) -> S>(
+                &self,
+                src: &CudaSlice<T>,
+                dev: &CudaDevice,
+                layout: &Layout,
+                _wrap: W,
+            ) -> Result<S> {
+                let src = match layout.contiguous_offsets() {
+                    None => candle::bail!("input has to be contiguous"),
+                    Some((o1, o2)) => src.slice(o1..o2),
+                };
+                let dims = layout.dims();
+                let ncols = *dims.last().unwrap();
+                let nrows: usize = dims[..dims.len() - 1].iter().product();
+                let elem_count = nrows * self.k_pad;
+                let dst = unsafe { dev.alloc::<u32>(elem_count)? };
+                let func = dev.get_or_load_func(&kernel_name::<T>("topk"), &kernels::SORT)?;
+                let cfg = LaunchConfig {
+                    grid_dim: (nrows as u32, 1, 1),
+                    block_dim: (1024u32, 1, 1),
+                    shared_mem_bytes: self.shared_mem_bytes as u32,
+                };
+                let stream = dev.cuda_stream();
+                let mut builder = stream.launch_builder(&func);
+                let ncols_i = ncols as i32;
+                let k_i = self.k_pad as i32;
+                builder.arg(&src).arg(&dst).arg(&ncols_i).arg(&k_i);
+                // SAFETY: topk kernel writes elem_count u32 indices.
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(S::U32(dst))
+            }
+        }
+
+        let dev = storage.device();
+        let slice = TopKLaunch {
+            k_pad,
+            shared_mem_bytes,
+        }
+        .map(&storage.slice, dev, layout)?;
+        let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        let mut out_dims = dims.to_vec();
+        *out_dims.last_mut().unwrap() = k_pad;
+        Ok((dst, Shape::from_dims(&out_dims)))
     }
 
     #[cfg(feature = "metal")]
@@ -1697,9 +1783,12 @@ impl candle::CustomOp1 for TopK {
 
 /// The `k` largest values along the last dimension and their indices, both
 /// descending by value — `torch.topk` semantics (ties break arbitrarily).
-/// Runs a dedicated kernel on Metal (any row width, unlike
-/// `arg_sort_last_dim`'s 1024-column bitonic); other backends compose a
-/// descending arg-sort with a narrow.
+///
+/// **Metal and CUDA** use a dedicated tile-and-merge kernel that works for
+/// arbitrary row widths (shared memory is O(k), not O(ncols)). Full-width
+/// `arg_sort_last_dim` on CUDA is limited by dynamic shared memory and must
+/// not be used for wide last-dims (e.g. Heron RT-DETR encoder tokens ≈ 8k).
+/// **CPU** (and other backends) compose a descending arg-sort with a narrow.
 pub fn topk(xs: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     let last = xs.dim(D::Minus1)?;
     if k == 0 || k > last {
@@ -1707,9 +1796,9 @@ pub fn topk(xs: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     }
     let xs = xs.contiguous()?;
     let k_pad = k.next_power_of_two();
-    let fused = xs.device().is_metal()
-        && k_pad <= 1024
-        && matches!(xs.dtype(), DType::F32 | DType::F16 | DType::BF16);
+    let fused = k_pad <= 1024
+        && matches!(xs.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        && (xs.device().is_metal() || xs.device().is_cuda());
     let indices = if fused {
         xs.apply_op1_no_bwd(&TopK { k_pad })?
             .narrow(D::Minus1, 0, k)?

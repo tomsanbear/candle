@@ -1594,7 +1594,16 @@ pub fn ms_deform_attn(
         )
     }
 
-    let mut level_outputs = Vec::with_capacity(levels);
+    // (n, len_q, heads, levels, points) -> (n*heads, 1, len_q, levels, points)
+    let weights = attention_weights
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((n * heads, 1, len_q, levels, points))?;
+    // Accumulate the weighted samples per level rather than stacking all
+    // levels into one (n*heads, d, len_q, levels*points) intermediate — the
+    // stack is a strided middle-dim concat of the whole sample volume and
+    // dominated the composed cost.
+    let mut acc: Option<Tensor> = None;
     let mut offset = 0;
     for (lid, &(h, w)) in spatial_shapes.iter().enumerate() {
         // (n, h*w, heads, d) -> (n*heads, d, h, w)
@@ -1611,19 +1620,19 @@ pub fn ms_deform_attn(
             .contiguous()?
             .reshape((n * heads, len_q, points, 2))?;
         let grid = ((grid * 2.0)? - 1.0)?;
-        // (n*heads, d, len_q, points)
-        level_outputs.push(grid_sample(&v, &grid, false)?);
+        let sampled = grid_sample(&v, &grid, false)?; // (n*heads, d, len_q, points)
+        let w_l = weights.narrow(3, lid, 1)?.squeeze(3)?; // (n*heads, 1, len_q, points)
+        let partial = sampled.broadcast_mul(&w_l)?.sum(D::Minus1)?; // (n*heads, d, len_q)
+        acc = Some(match acc {
+            Some(acc) => (acc + partial)?,
+            None => partial,
+        });
         offset += h * w;
     }
-    // (n*heads, d, len_q, levels*points)
-    let sampled = Tensor::stack(&level_outputs, 3)?
-        .reshape((n * heads, head_dim, len_q, levels * points))?;
-    // (n, len_q, heads, levels, points) -> (n*heads, 1, len_q, levels*points)
-    let weights = attention_weights
-        .transpose(1, 2)?
-        .contiguous()?
-        .reshape((n * heads, 1, len_q, levels * points))?;
-    let out = sampled.broadcast_mul(&weights)?.sum(D::Minus1)?; // (n*heads, d, len_q)
+    let out = match acc {
+        Some(out) => out,
+        None => candle::bail!("ms-deform-attn requires at least one level"),
+    };
     out.reshape((n, heads, head_dim, len_q))?
         .permute((0, 3, 1, 2))?
         .contiguous()?

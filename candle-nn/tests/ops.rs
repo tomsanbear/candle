@@ -206,6 +206,88 @@ fn rms_norm_mixed_dtype(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// The fused SwiGLU kernel against the composed reference it replaces. Shapes
+// deliberately include a row count above and below a threadgroup and a half-width
+// that is not a multiple of the threadgroup, so the kernel's tail path is covered.
+fn swiglu(device: &Device) -> Result<()> {
+    for (rows, half) in [(1usize, 3usize), (2, 4), (7, 65), (33, 128), (129, 1024)] {
+        let xs = Tensor::rand(-3f32, 3f32, (rows, half * 2), device)?;
+        let fused = candle_nn::ops::swiglu(&xs)?;
+        let slow = candle_nn::ops::swiglu_slow(&xs)?;
+        assert_eq!(fused.dims(), &[rows, half], "shape at {rows}x{half}");
+        assert_eq!(slow.dims(), fused.dims());
+        let diff = (&fused - &slow)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "fused vs slow at {rows}x{half}: {diff}");
+    }
+    // Rank-3 input: the last dim is the one that splits.
+    let xs = Tensor::rand(-2f32, 2f32, (2usize, 5usize, 8usize), device)?;
+    let fused = candle_nn::ops::swiglu(&xs)?;
+    assert_eq!(fused.dims(), &[2, 5, 4]);
+    let diff = (&fused - &candle_nn::ops::swiglu_slow(&xs)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-6, "rank-3 fused vs slow: {diff}");
+    // An odd last dim has no [gate | up] split and must be rejected, not
+    // silently truncated.
+    let odd = Tensor::rand(0f32, 1f32, (2usize, 7usize), device)?;
+    assert!(candle_nn::ops::swiglu(&odd).is_err());
+    Ok(())
+}
+
+// Fused residual-add + RMSNorm against the composed reference. Row counts span
+// the decode case (1-2 rows) and a prefill-sized batch; column counts cross the
+// 32-lane simdgroup boundary and the 1024-thread cap so the cross-simdgroup
+// reduction and the strided tail are both exercised.
+fn add_rms_norm(device: &Device) -> Result<()> {
+    for (rows, cols) in [(1usize, 8usize), (2, 33), (2, 1024), (32, 1024), (5, 2048)] {
+        let xs = Tensor::rand(-2f32, 2f32, (rows, cols), device)?;
+        let residual = Tensor::rand(-2f32, 2f32, (rows, cols), device)?;
+        let alpha = Tensor::rand(0.5f32, 1.5f32, cols, device)?;
+        let (sum, normed) = candle_nn::ops::add_rms_norm(&xs, &residual, &alpha, 1e-5)?;
+        let (sum_ref, normed_ref) =
+            candle_nn::ops::add_rms_norm_slow(&xs, &residual, &alpha, 1e-5)?;
+        assert_eq!(sum.dims(), &[rows, cols]);
+        assert_eq!(normed.dims(), &[rows, cols]);
+        // The leading-dim pack is what makes these usable without a copy; if it
+        // ever regressed to a trailing pack this is the assertion that catches it.
+        assert!(sum.is_contiguous(), "sum not contiguous at {rows}x{cols}");
+        assert!(normed.is_contiguous(), "normed not contiguous at {rows}x{cols}");
+        let ds = (&sum - &sum_ref)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(ds < 1e-6, "sum diff at {rows}x{cols}: {ds}");
+        let dn = (&normed - &normed_ref)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(dn < 1e-5, "normed diff at {rows}x{cols}: {dn}");
+    }
+    // Rank-3 input: rows are the flattened leading dims.
+    let xs = Tensor::rand(-1f32, 1f32, (2usize, 4usize, 64usize), device)?;
+    let residual = Tensor::rand(-1f32, 1f32, (2usize, 4usize, 64usize), device)?;
+    let alpha = Tensor::rand(0.5f32, 1.5f32, 64usize, device)?;
+    let (sum, normed) = candle_nn::ops::add_rms_norm(&xs, &residual, &alpha, 1e-5)?;
+    let (sum_ref, normed_ref) = candle_nn::ops::add_rms_norm_slow(&xs, &residual, &alpha, 1e-5)?;
+    assert_eq!(normed.dims(), &[2, 4, 64]);
+    let ds = (&sum - &sum_ref)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+    let dn = (&normed - &normed_ref)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(ds < 1e-6 && dn < 1e-5, "rank-3 diffs: sum {ds}, normed {dn}");
+    Ok(())
+}
+
 fn layer_norm(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
@@ -663,6 +745,13 @@ test_device!(
     rms_norm_large_magnitude_cpu,
     rms_norm_large_magnitude_gpu,
     rms_norm_large_magnitude_metal
+);
+test_device!(swiglu, swiglu_cpu, swiglu_gpu, swiglu_metal);
+test_device!(
+    add_rms_norm,
+    add_rms_norm_cpu,
+    add_rms_norm_gpu,
+    add_rms_norm_metal
 );
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(norm_non_contiguous, nnc_cpu, nnc_gpu, nnc_metal);

@@ -198,6 +198,42 @@ define_unary_op(usigmoid, sigmoid(x));
 // This has been an issue for the encodec example.
 define_unary_op(utanh, precise::tanh(x));
 
+// Fused SwiGLU over a width-concatenated [gate | up] input.
+//
+// `input` is (rows, 2 * half); `output` is (rows, half) with
+//   output[r, i] = silu(input[r, i]) * input[r, half + i].
+//
+// The composed spelling (chunk the last dim, silu one half, multiply by the
+// other) makes both elementwise ops read STRIDED views and materializes the
+// silu result: 3 reads + 2 writes over 2 dispatches. This is 2 reads + 1 write
+// in one dispatch, which is what makes width-fusing a gate/up projection pair
+// into a single GEMM worthwhile — without it the elementwise tail costs more
+// than the saved GEMM dispatch.
+//
+// silu is evaluated through `usilu`, the same functor the standalone `silu`
+// kernel instantiates, so the fused and composed paths agree bit-for-bit on the
+// activation and differ only in accumulation-free elementwise order.
+// `half_dim`, not `half`: `half` is the Metal f16 type keyword.
+template <typename T>
+[[kernel]] void swiglu_kernel(
+    constant size_t &dst_numel,
+    constant size_t &half_dim,
+    device const T *input,
+    device T *output,
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dst_numel) {
+        return;
+    }
+    usilu act;
+    const uint row = tid / half_dim;
+    const uint col = tid - row * half_dim;
+    const uint base = row * 2 * half_dim;
+    const T gate = input[base + col];
+    const T up = input[base + half_dim + col];
+    output[tid] = static_cast<T>(act(gate)) * up;
+}
+
 // Macros to help initialize kernels
 #define init_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
@@ -216,6 +252,9 @@ define_unary_op(utanh, precise::tanh(x));
     init_unary(op_name, unary_op, f32, float) \
     init_unary(op_name, unary_op, f16, half)
 #endif
+
+#define init_swiglu(tname, t) \
+    init_kernel("swiglu_" #tname, swiglu_kernel, t)
 
 #define init_copy2d(tname, t)  \
     init_kernel("copy2d_" #tname, copy2d, t)
@@ -255,7 +294,11 @@ init_copy2d(f16, half);
 init_const_set(f32, float);
 init_const_set(f16, half);
 
+init_swiglu(f32, float);
+init_swiglu(f16, half);
+
 #if defined(__HAVE_BFLOAT__)
+init_swiglu(bf16, bfloat);
 init_copy2d(bf16, bfloat);
 init_const_set(bf16, bfloat);
 #endif

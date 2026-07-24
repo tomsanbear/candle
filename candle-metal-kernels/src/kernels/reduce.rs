@@ -195,6 +195,71 @@ pub fn norm_batched_geometry(rows: usize, cols: usize) -> (usize, usize) {
     (rows.div_ceil(threads / 32), threads)
 }
 
+/// Fused residual-add + `RMSNorm`.
+///
+/// Writes a `(2, n_rows, n_cols)` output: the residual sums at `[0]`, their
+/// normalization at `[1]`. The pack dim is leading so each half is a contiguous
+/// slice the caller can hand on without a copy.
+///
+/// One threadgroup per row — the simdgroup-per-row `*_batched` geometry is
+/// wrong here because a decode step is 1-2 rows.
+#[allow(clippy::too_many_arguments)]
+pub fn call_add_rms_norm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    x: &Buffer,
+    x_offset: usize,
+    residual: &Buffer,
+    residual_offset: usize,
+    alpha: &Buffer,
+    alpha_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "add_rms_norm {kernel_name} rows={n_rows} cols={n_cols}");
+
+    set_params!(
+        encoder,
+        (
+            n_rows as u32,
+            n_cols as u32,
+            eps,
+            (x, x_offset),
+            (residual, residual_offset),
+            (alpha, alpha_offset),
+            Output::new(output)
+        )
+    );
+
+    // The cross-simdgroup reduction stage uses a fixed 32-entry scratch, so cap
+    // the group at 32 simdgroups (1024 threads).
+    let threads = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        n_cols.next_power_of_two().clamp(32, 1024),
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: n_rows,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_rms_norm(
     device: &Device,

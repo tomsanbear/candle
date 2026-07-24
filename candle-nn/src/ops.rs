@@ -41,9 +41,122 @@ pub fn silu(xs: &Tensor) -> Result<Tensor> {
     xs.silu()
 }
 
-pub fn swiglu(xs: &Tensor) -> Result<Tensor> {
+/// The composed `SwiGLU`: chunk the last dim, `silu` one half, multiply by the
+/// other. Correct everywhere and the reference [`swiglu`] is checked against,
+/// but it reads both halves as strided views and materializes the `silu`
+/// result — 3 reads + 2 writes across 2 dispatches.
+pub fn swiglu_slow(xs: &Tensor) -> Result<Tensor> {
     let xs = xs.chunk(2, D::Minus1)?;
     &xs[0].silu()? * &xs[1]
+}
+
+/// `SwiGLU` over a width-concatenated `[gate | up]` tensor: for a last dim of
+/// `2n`, returns `silu(xs[.., ..n]) * xs[.., n..]` with last dim `n`.
+///
+/// This is the shape a width-fused gate/up projection produces — one wide GEMM
+/// instead of two — and the fused kernel is what makes that fusion pay: the
+/// composed spelling's strided elementwise tail otherwise costs more than the
+/// saved GEMM dispatch.
+pub fn swiglu(xs: &Tensor) -> Result<Tensor> {
+    let last = xs.dim(D::Minus1)?;
+    if last % 2 != 0 {
+        candle::bail!("swiglu expects an even last dim, got {last}")
+    }
+    xs.apply_op1_no_bwd(&SwiGlu)
+}
+
+struct SwiGlu;
+
+impl candle::CustomOp1 for SwiGlu {
+    fn name(&self) -> &'static str {
+        "swiglu"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        fn inner<T: candle::WithDType + num_traits::Float>(
+            src: &[T],
+            layout: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("input has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let dims = layout.shape().dims();
+            let half = dims[dims.len() - 1] / 2;
+            let mut out_dims = dims.to_vec();
+            out_dims[dims.len() - 1] = half;
+            let mut dst = Vec::with_capacity(layout.shape().elem_count() / 2);
+            for row in src.chunks(half * 2) {
+                let (gate, up) = row.split_at(half);
+                for (g, u) in gate.iter().zip(up.iter()) {
+                    // silu(g) * u, in T — matching the elementwise path exactly.
+                    dst.push(*g / (T::one() + (-*g).exp()) * *u);
+                }
+            }
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, Shape::from_dims(&out_dims)))
+        }
+        use CpuStorage as C;
+        match storage {
+            C::BF16(s) => inner::<half::bf16>(s, layout),
+            C::F16(s) => inner::<half::f16>(s, layout),
+            C::F32(s) => inner::<f32>(s, layout),
+            s => {
+                use candle::backend::BackendStorage;
+                candle::bail!("unsupported dtype for swiglu {:?}", s.dtype())
+            }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        storage: &candle::MetalStorage,
+        layout: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::MetalError;
+        if !layout.is_contiguous() {
+            candle::bail!("swiglu requires a contiguous input")
+        }
+        let device = storage.device();
+        let dtype = storage.dtype();
+        let dims = layout.shape().dims();
+        let half = dims[dims.len() - 1] / 2;
+        let mut out_dims = dims.to_vec();
+        out_dims[dims.len() - 1] = half;
+        let dst_numel = layout.shape().elem_count() / 2;
+        let kernel_name = match dtype {
+            DType::F32 => "swiglu_f32",
+            DType::F16 => "swiglu_f16",
+            DType::BF16 => "swiglu_bf16",
+            dtype => candle::bail!("Metal swiglu {dtype:?} not implemented"),
+        };
+        let buffer = device
+            .new_buffer_builder()
+            .with_size_for(dst_numel, dtype)
+            .with_label("swiglu")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("swiglu");
+        let src = candle_metal_kernels::BufferOffset {
+            buffer: storage.buffer(),
+            offset_in_bytes: layout.start_offset() * dtype.size_in_bytes(),
+        };
+        candle_metal_kernels::call_swiglu(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            kernel_name,
+            half,
+            dst_numel,
+            src,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        let storage = candle::MetalStorage::new(buffer, device.clone(), dst_numel, dtype);
+        Ok((storage, Shape::from_dims(&out_dims)))
+    }
 }
 
 struct Sigmoid;
@@ -678,6 +791,132 @@ pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
     let x_normed = x.broadcast_div(&(norm_x + eps as f64)?.sqrt()?)?;
     x_normed.to_dtype(x_dtype)?.broadcast_mul(&alpha)
+}
+
+/// The composed residual-add + `RMSNorm`: the reference [`add_rms_norm`] is
+/// checked against.
+pub fn add_rms_norm_slow(
+    xs: &Tensor,
+    residual: &Tensor,
+    alpha: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let sum = (xs + residual)?;
+    let normed = rms_norm(&sum, alpha, eps)?;
+    Ok((sum, normed))
+}
+
+/// Fused residual-add + `RMSNorm`, returning `(xs + residual, rms_norm(xs +
+/// residual) * alpha)`.
+///
+/// A transformer block needs both halves — the sum continues the residual chain
+/// while the normalization feeds the next sublayer — so writing them separately
+/// costs two dispatches and two passes over the row. The kernel produces both in
+/// one pass; the returned tensors are contiguous views into a single packed
+/// buffer, so neither costs a copy.
+///
+/// Falls back to [`add_rms_norm_slow`] off Metal, on a non-contiguous input, or
+/// on a dtype/weight mismatch.
+pub fn add_rms_norm(
+    xs: &Tensor,
+    residual: &Tensor,
+    alpha: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let fusable = xs.device().is_metal()
+        && xs.is_contiguous()
+        && residual.is_contiguous()
+        && alpha.is_contiguous()
+        && xs.dtype() == residual.dtype()
+        && xs.dtype() == alpha.dtype()
+        && xs.shape() == residual.shape()
+        && xs.dim(D::Minus1)? == alpha.dims1()?;
+    if !fusable {
+        return add_rms_norm_slow(xs, residual, alpha, eps);
+    }
+    let packed = xs.apply_op3_no_bwd(residual, alpha, &AddRmsNorm { eps })?;
+    // Leading pack dim => both halves are contiguous slices.
+    use candle::IndexOp;
+    Ok((packed.i(0)?, packed.i(1)?))
+}
+
+struct AddRmsNorm {
+    eps: f32,
+}
+
+impl candle::CustomOp3 for AddRmsNorm {
+    fn name(&self) -> &'static str {
+        "add-rms-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        // `add_rms_norm` routes CPU callers to the composed path, so this is
+        // unreachable rather than a second implementation to keep in sync.
+        candle::bail!("add-rms-norm is Metal-only; use add_rms_norm_slow")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        x: &candle::MetalStorage,
+        xl: &Layout,
+        residual: &candle::MetalStorage,
+        rl: &Layout,
+        alpha: &candle::MetalStorage,
+        al: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::MetalError;
+        let device = x.device();
+        let dtype = x.dtype();
+        let dims = xl.shape().dims();
+        let n_cols = dims[dims.len() - 1];
+        let el_count = xl.shape().elem_count();
+        let n_rows = el_count / n_cols;
+        let kernel_name = match dtype {
+            DType::F32 => "add_rmsnorm_f32",
+            DType::F16 => "add_rmsnorm_f16",
+            DType::BF16 => "add_rmsnorm_bf16",
+            dtype => candle::bail!("Metal add_rms_norm {dtype:?} not implemented"),
+        };
+        let buffer = device
+            .new_buffer_builder()
+            .with_size_for(el_count * 2, dtype)
+            .with_label("add_rms_norm")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("add_rms_norm");
+        let size = dtype.size_in_bytes();
+        candle_metal_kernels::call_add_rms_norm(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            kernel_name,
+            n_rows,
+            n_cols,
+            self.eps,
+            x.buffer(),
+            xl.start_offset() * size,
+            residual.buffer(),
+            rl.start_offset() * size,
+            alpha.buffer(),
+            al.start_offset() * size,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        let storage = candle::MetalStorage::new(buffer, device.clone(), el_count * 2, dtype);
+        let mut out_dims = vec![2];
+        out_dims.extend_from_slice(dims);
+        Ok((storage, Shape::from_dims(&out_dims)))
+    }
 }
 
 pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {

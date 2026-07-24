@@ -64,6 +64,24 @@ Cherry-picked (`-x`) onto dev 2026-07-22 with authorship preserved, while it was
 
 ## Incubating on `tomsanbear-dev`
 
+### Fused SwiGLU kernel
+`metal-kernels` / `candle-nn` · `1fb99ab4` · Incubating · tested (`swiglu` cpu+metal)
+
+`candle_nn::ops::swiglu` was three lines of Rust — `chunk(2, last)` → `silu` → `mul` — with **no kernel behind it**, which is easy to mistake for a fused op when scanning the `ops::` surface. It now dispatches a real kernel; `swiglu_slow` keeps the composed spelling as the reference.
+
+Why it matters beyond the two saved dispatches: it is what makes a **width-fused gate|up projection** pay. One wide GEMM instead of two is arithmetically free, but the composed tail then reads both halves as *strided* views and materializes the `silu` result (3 reads + 2 writes over 2 dispatches vs 2 reads + 1 write over 1). Measured downstream on an M3 Pro (30-layer 1024-wide trunk), width-fusing gate|up **with the composed tail was a loss at every sequence length**: +0.9% at seq=1, +2.2% at 16, +13% at 64, +17% at 256. That is the disproof this kernel exists to flip.
+
+`silu` is evaluated through the same `usilu` functor the standalone `silu` kernel instantiates, so fused and composed agree bit-for-bit on the activation. Gotcha for anyone extending it: `half` is a Metal type keyword and cannot name a parameter.
+
+### Fused residual-add + RMSNorm
+`metal-kernels` / `candle-nn` · `1fb99ab4` · Incubating · tested (`add_rms_norm` cpu+metal)
+
+`candle_nn::ops::add_rms_norm(xs, residual, alpha, eps) -> (sum, normed)`. A transformer block always needs both halves of `x = x + sublayer; h = rms_norm(x)` — the sum continues the residual chain, the normalization feeds the next sublayer — so writing them separately is two dispatches and two passes over the row.
+
+**The interesting part is the API shape.** candle's `CustomOpN` returns exactly one storage and `InplaceOpN` returns none, so a two-output kernel looks inexpressible without either an API change or mutating an input's buffer (unsafe under candle's shared-storage tensors). It is expressible: pack both outputs into one `(2, rows, cols)` buffer. Because the pack dim is **leading**, `i(0)`/`i(1)` are contiguous slices, so both come back as ordinary contiguous tensors at no copy. A trailing pack — the obvious first instinct — would force strided reads and hand the saving straight back; the test asserts contiguity so that regression cannot land silently.
+
+One threadgroup per row with a two-level (simd, then cross-simdgroup) reduction, deliberately *not* the simdgroup-per-row `*_batched` geometry, which regresses the 1–2 row decode case. The row sum is rounded to `T` before the sum-of-squares accumulates it, matching what the composed pair does, so the paths agree at bf16/f16 rather than only at f32. Non-Metal, non-contiguous, and dtype-mismatched callers fall back to `add_rms_norm_slow`.
+
 ### `rms_norm` accepts a weight dtype ≠ the activation dtype
 `candle-nn` · `d60d9e4d` · Incubating · tested (`rms_norm_mixed_dtype` cpu+metal)
 

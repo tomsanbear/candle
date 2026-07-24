@@ -1679,6 +1679,102 @@ METAL_FUNC void rms_norm_batched(
     }
 }
 
+// Fused residual-add + RMSNorm.
+//
+// A transformer block always needs BOTH the residual sum and its normalization:
+// `x = x + sublayer_out; h = rms_norm(x)`, where `x` continues the residual
+// chain and `h` feeds the next sublayer. Written separately that is two
+// dispatches and two full passes over the row.
+//
+// Both outputs are packed into one `dst` of shape (2, rows, cols) — sums at
+// [0], normed at [1]. Because the pack dim is LEADING, each half is a
+// contiguous slice, so the caller gets two ordinary contiguous tensors with no
+// copy (a trailing pack would force strided reads and give the saving straight
+// back).
+//
+// One threadgroup per row, two-level reduction (simd, then across simdgroups).
+// Deliberately not the simdgroup-per-row `*_batched` geometry: that regresses
+// small row counts, and a decode step here is 1-2 rows.
+//
+// The row sum is rounded to T BEFORE the sum-of-squares accumulates it, which
+// is what the composed `(x + r)` then `rms_norm(...)` pair does — so the fused
+// and composed paths agree at every dtype rather than only at f32.
+template <typename T>
+METAL_FUNC void add_rms_norm(
+    constant uint &n_rows,
+    constant uint &n_cols,
+    constant float &eps,
+    device const T *x,
+    device const T *residual,
+    device const T *alpha,
+    device T *dst,
+    threadgroup float *shared,
+    uint row,
+    uint tid,
+    uint threads,
+    ushort simd_group,
+    ushort sgs,
+    ushort lane
+) {
+    if (row >= n_rows) return;
+    device const T *xr = x + (ulong)row * n_cols;
+    device const T *rr = residual + (ulong)row * n_cols;
+    device T *sum_out = dst + (ulong)row * n_cols;
+    device T *norm_out = dst + (ulong)n_rows * n_cols + (ulong)row * n_cols;
+
+    float sumsq = 0.0f;
+    for (uint i = tid; i < n_cols; i += threads) {
+        const T s = static_cast<T>(float(xr[i]) + float(rr[i]));
+        sum_out[i] = s;
+        const float v = float(s);
+        sumsq += v * v;
+    }
+    sumsq = simd_sum(sumsq);
+    if (lane == 0) shared[simd_group] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        float v = (tid < sgs) ? shared[tid] : 0.0f;
+        v = simd_sum(v);
+        if (tid == 0) shared[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = rsqrt(shared[0] / float(n_cols) + eps);
+
+    // Each lane re-reads only the entries it just wrote, so no barrier is owed
+    // between the passes.
+    for (uint i = tid; i < n_cols; i += threads) {
+        norm_out[i] = static_cast<T>(float(sum_out[i]) * total * float(alpha[i]));
+    }
+}
+
+#define impl_add_rms_norm(NAME, T)                              \
+kernel void NAME(                                               \
+    constant uint &n_rows,                                      \
+    constant uint &n_cols,                                      \
+    constant float &eps,                                        \
+    device const T *x,                                          \
+    device const T *residual,                                   \
+    device const T *alpha,                                      \
+    device T *dst,                                              \
+    uint tg_id [[ threadgroup_position_in_grid ]],              \
+    uint tid [[ thread_index_in_threadgroup ]],                 \
+    uint threads [[ threads_per_threadgroup ]],                 \
+    ushort simd_group [[ simdgroup_index_in_threadgroup ]],     \
+    ushort sgs [[ simdgroups_per_threadgroup ]],                \
+    ushort lane [[ thread_index_in_simdgroup ]]                 \
+) {                                                             \
+    threadgroup float shared[32];                               \
+    add_rms_norm<T>(                                            \
+        n_rows, n_cols, eps, x, residual, alpha, dst,           \
+        shared, tg_id, tid, threads, simd_group, sgs, lane);    \
+}
+
+impl_add_rms_norm(add_rmsnorm_f32, float)
+impl_add_rms_norm(add_rmsnorm_f16, half)
+#if defined(__HAVE_BFLOAT__)
+impl_add_rms_norm(add_rmsnorm_bf16, bfloat)
+#endif
+
 #define impl_layer_norm_batched(NAME, T)                        \
 kernel void NAME(                                               \
     constant uint &n_rows,                                      \

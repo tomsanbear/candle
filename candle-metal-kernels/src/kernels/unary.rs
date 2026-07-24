@@ -39,6 +39,37 @@ pub fn call_unary_contiguous(
     Ok(())
 }
 
+/// Fused `SwiGLU` over a width-concatenated `[gate | up]` input.
+///
+/// `input` is `(rows, 2 * half)` and `output` is `(rows, half)`, with
+/// `output[r, i] = silu(input[r, i]) * input[r, half + i]`. Both must be
+/// contiguous — the point of the kernel is to read the two halves in one pass
+/// rather than as the strided chunk views the composed spelling produces.
+#[allow(clippy::too_many_arguments)]
+pub fn call_swiglu(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    half: usize,
+    dst_numel: usize,
+    input: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Unary, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "swiglu {kernel_name} rows={} half={half}", dst_numel / half.max(1));
+
+    set_params!(encoder, (dst_numel, half, &input, Output::new(output)));
+
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_numel);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_unary_strided(
     device: &Device,

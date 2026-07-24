@@ -74,13 +74,17 @@ Why it matters beyond the two saved dispatches: it is what makes a **width-fused
 `silu` is evaluated through the same `usilu` functor the standalone `silu` kernel instantiates, so fused and composed agree bit-for-bit on the activation. Gotcha for anyone extending it: `half` is a Metal type keyword and cannot name a parameter.
 
 ### Fused residual-add + RMSNorm
-`metal-kernels` / `candle-nn` · `4e892d30` · Incubating · tested (`add_rms_norm` cpu+metal)
+`metal-kernels` / `candle-nn` · `4e892d30` · Incubating · tested (`add_rms_norm` cpu+metal) — **measured neutral downstream, see the receipt below**
 
 `candle_nn::ops::add_rms_norm(xs, residual, alpha, eps) -> (sum, normed)`. A transformer block always needs both halves of `x = x + sublayer; h = rms_norm(x)` — the sum continues the residual chain, the normalization feeds the next sublayer — so writing them separately is two dispatches and two passes over the row.
 
 **The interesting part is the API shape.** candle's `CustomOpN` returns exactly one storage and `InplaceOpN` returns none, so a two-output kernel looks inexpressible without either an API change or mutating an input's buffer (unsafe under candle's shared-storage tensors). It is expressible: pack both outputs into one `(2, rows, cols)` buffer. Because the pack dim is **leading**, `i(0)`/`i(1)` are contiguous slices, so both come back as ordinary contiguous tensors at no copy. A trailing pack — the obvious first instinct — would force strided reads and hand the saving straight back; the test asserts contiguity so that regression cannot land silently.
 
 One threadgroup per row with a two-level (simd, then cross-simdgroup) reduction, deliberately *not* the simdgroup-per-row `*_batched` geometry, which regresses the 1–2 row decode case. The row sum is rounded to `T` before the sum-of-squares accumulates it, matching what the composed pair does, so the paths agree at bf16/f16 rather than only at f32. Non-Metal, non-contiguous, and dtype-mismatched callers fall back to `add_rms_norm_slow`.
+
+**RECEIPT — it did not pay off downstream, and the reason is instructive.** Wired into a 30-layer 1024-wide trunk on an M3 Pro and A/B'd against the composed pair, it measured **neutral to slightly negative**: +0.7% at seq=16, +0.9% at seq=1, +0.3% at 64, within noise at 256. The dispatch-count argument (one kernel instead of two) predicted ~2–4% and was simply wrong, because it ignored *what the second dispatch was*: the stock `rms_norm` this replaces is not naive — it has vec4 loads and switches to the simdgroup-per-row batched kernel above 32 rows. Trading a well-optimized norm plus a cheap elementwise add for one unoptimized fused pass is a wash. Saving a dispatch only wins when the dispatch you fold in was not already carrying the optimizations you lose.
+
+Kept rather than refuted: the op is correct, tested, and the leading-dim packing is the reusable finding. It should get the vec4 body and a batched variant before anyone re-measures it — until then, do not reach for it expecting a win. (The sibling `swiglu` in the same commit is the opposite case: the composed path there had *no* kernel at all, and it delivered the full −6.0% at seq=16.)
 
 ### `rms_norm` accepts a weight dtype ≠ the activation dtype
 `candle-nn` · `d60d9e4d` · Incubating · tested (`rms_norm_mixed_dtype` cpu+metal)

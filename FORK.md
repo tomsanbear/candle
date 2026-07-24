@@ -65,7 +65,7 @@ Cherry-picked (`-x`) onto dev 2026-07-22 with authorship preserved, while it was
 ## Incubating on `tomsanbear-dev`
 
 ### Fused SwiGLU kernel
-`metal-kernels` / `candle-nn` · `1fb99ab4` · Incubating · tested (`swiglu` cpu+metal)
+`metal-kernels` / `candle-nn` · `4e892d30` · Incubating · tested (`swiglu` cpu+metal)
 
 `candle_nn::ops::swiglu` was three lines of Rust — `chunk(2, last)` → `silu` → `mul` — with **no kernel behind it**, which is easy to mistake for a fused op when scanning the `ops::` surface. It now dispatches a real kernel; `swiglu_slow` keeps the composed spelling as the reference.
 
@@ -74,7 +74,7 @@ Why it matters beyond the two saved dispatches: it is what makes a **width-fused
 `silu` is evaluated through the same `usilu` functor the standalone `silu` kernel instantiates, so fused and composed agree bit-for-bit on the activation. Gotcha for anyone extending it: `half` is a Metal type keyword and cannot name a parameter.
 
 ### Fused residual-add + RMSNorm
-`metal-kernels` / `candle-nn` · `1fb99ab4` · Incubating · tested (`add_rms_norm` cpu+metal)
+`metal-kernels` / `candle-nn` · `4e892d30` · Incubating · tested (`add_rms_norm` cpu+metal)
 
 `candle_nn::ops::add_rms_norm(xs, residual, alpha, eps) -> (sum, normed)`. A transformer block always needs both halves of `x = x + sublayer; h = rms_norm(x)` — the sum continues the residual chain, the normalization feeds the next sublayer — so writing them separately is two dispatches and two passes over the row.
 

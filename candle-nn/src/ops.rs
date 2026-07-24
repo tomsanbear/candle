@@ -665,10 +665,19 @@ pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
         d => d,
     };
     let hidden_size = x.dim(D::Minus1)?;
+    // A weight stored at a different precision than the activations (e.g. an F32
+    // norm weight dequantized from GGUF, applied to F16 activations) is aligned to
+    // the activation dtype — the result is the activation dtype, so no weight
+    // precision that would survive the output is lost.
+    let alpha = if alpha.dtype() == x_dtype {
+        alpha.clone()
+    } else {
+        alpha.to_dtype(x_dtype)?
+    };
     let x = x.to_dtype(internal_dtype)?;
     let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
     let x_normed = x.broadcast_div(&(norm_x + eps as f64)?.sqrt()?)?;
-    x_normed.to_dtype(x_dtype)?.broadcast_mul(alpha)
+    x_normed.to_dtype(x_dtype)?.broadcast_mul(&alpha)
 }
 
 pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
@@ -681,7 +690,17 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             alpha.shape()
         )
     }
-    xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
+    // The fused kernels are same-dtype (input and weight). A weight at a different
+    // precision than the activations (e.g. an F32 norm weight dequantized from
+    // GGUF, applied to F16 activations) is aligned to the activation dtype — the
+    // output is the activation dtype, so no weight precision that would survive the
+    // result is lost. Same-dtype callers are unaffected.
+    if alpha.dtype() == xs.dtype() {
+        xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
+    } else {
+        let alpha = alpha.to_dtype(xs.dtype())?;
+        xs.apply_op2_no_bwd(&alpha, &RmsNorm { eps })
+    }
 }
 
 #[derive(Debug, Clone)]

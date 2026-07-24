@@ -186,6 +186,26 @@ fn rms_norm_large_magnitude(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// F16 activations with an F32 weight (the GGUF-dequantized norm-weight case): the
+// fused kernels are same-dtype, so rms_norm must align the weight to the activation
+// dtype rather than error, and stay in parity with the slow reference.
+fn rms_norm_mixed_dtype(device: &Device) -> Result<()> {
+    let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
+    let xs = Tensor::new(data, device)?.to_dtype(candle::DType::F16)?;
+    let alpha = Tensor::new(&[1f32, 2f32, 3f32], device)?; // F32 weight, F16 activations
+    let fused = candle_nn::ops::rms_norm(&xs, &alpha, 1e-5)?;
+    let slow = candle_nn::ops::rms_norm_slow(&xs, &alpha, 1e-5)?;
+    assert_eq!(fused.dtype(), candle::DType::F16);
+    assert_eq!(slow.dtype(), candle::DType::F16);
+    let diff = (fused.to_dtype(candle::DType::F32)? - slow.to_dtype(candle::DType::F32)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-2, "fused vs slow (F16 input, F32 weight): {diff}");
+    Ok(())
+}
+
 fn layer_norm(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
@@ -632,6 +652,12 @@ test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
+test_device!(
+    rms_norm_mixed_dtype,
+    rms_norm_mixed_dtype_cpu,
+    rms_norm_mixed_dtype_gpu,
+    rms_norm_mixed_dtype_metal
+);
 test_device!(
     rms_norm_large_magnitude,
     rms_norm_large_magnitude_cpu,

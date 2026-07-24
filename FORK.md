@@ -64,6 +64,11 @@ Cherry-picked (`-x`) onto dev 2026-07-22 with authorship preserved, while it was
 
 ## Incubating on `tomsanbear-dev`
 
+### `rms_norm` accepts a weight dtype ≠ the activation dtype
+`candle-nn` · `d60d9e4d` · Incubating · tested (`rms_norm_mixed_dtype` cpu+metal)
+
+The fused `rms_norm` kernels (cpu/cuda/metal) are same-dtype — input and weight must match — so an F32 norm weight (the default GGUF `dequantize`) applied to F16 activations bailed with "rmsnorm is not implemented for F16 F32". Aligns the weight to the activation dtype inside `rms_norm`/`rms_norm_slow`; the result is the activation dtype, so no weight precision that would survive the output is lost, and same-dtype callers are untouched. Surfaced running an in-process Qwen3-0.6B decoder in native F16 (halves activation + KV traffic vs the F32-embedding path). Small, self-contained upstream-PR candidate.
+
 ### conv im2col paths discarded the contiguous kernel copy
 `core` (all 3 backends) · `14ae55a3` · Incubating · tested (regression across cpu/metal/cuda)
 

@@ -398,6 +398,27 @@ impl Device {
         self.rand_uniform_f64(lo.to_f64(), up.to_f64(), shape, T::DTYPE)
     }
 
+    pub(crate) fn rand_uniform_seeded<T: crate::FloatDType>(
+        &self,
+        lo: T,
+        up: T,
+        shape: &Shape,
+        seed: u64,
+    ) -> Result<Storage> {
+        let (lo, up, dtype) = (lo.to_f64(), up.to_f64(), T::DTYPE);
+        match self {
+            Device::Cpu => Ok(Storage::Cpu(
+                CpuDevice.rand_uniform_seeded(shape, dtype, lo, up, seed)?,
+            )),
+            Device::Cuda(device) => Ok(Storage::Cuda(
+                device.rand_uniform_seeded(shape, dtype, lo, up, seed)?,
+            )),
+            Device::Metal(device) => Ok(Storage::Metal(
+                device.rand_uniform_seeded(shape, dtype, lo, up, seed)?,
+            )),
+        }
+    }
+
     pub(crate) fn rand_normal_f64(
         &self,
         mean: f64,
@@ -434,6 +455,27 @@ impl Device {
         shape: &Shape,
     ) -> Result<Storage> {
         self.rand_normal_f64(mean.to_f64(), std.to_f64(), shape, T::DTYPE)
+    }
+
+    pub(crate) fn rand_normal_seeded<T: crate::FloatDType>(
+        &self,
+        mean: T,
+        std: T,
+        shape: &Shape,
+        seed: u64,
+    ) -> Result<Storage> {
+        let (mean, std, dtype) = (mean.to_f64(), std.to_f64(), T::DTYPE);
+        match self {
+            Device::Cpu => Ok(Storage::Cpu(
+                CpuDevice.rand_normal_seeded(shape, dtype, mean, std, seed)?,
+            )),
+            Device::Cuda(device) => Ok(Storage::Cuda(
+                device.rand_normal_seeded(shape, dtype, mean, std, seed)?,
+            )),
+            Device::Metal(device) => Ok(Storage::Metal(
+                device.rand_normal_seeded(shape, dtype, mean, std, seed)?,
+            )),
+        }
     }
 
     pub(crate) fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Storage> {

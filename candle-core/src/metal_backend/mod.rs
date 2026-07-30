@@ -2443,6 +2443,84 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
+    fn rand_uniform_seeded(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        min: f64,
+        max: f64,
+        seed: u64,
+    ) -> Result<Self::Storage> {
+        let name = match dtype {
+            DType::F32 => "rand_uniform_seeded_f32",
+            dtype => crate::bail!("rand_uniform_seeded only supports F32 on Metal, got {dtype:?}"),
+        };
+        let buffer = self
+            .new_buffer_builder()
+            .with_size_for(shape.elem_count(), dtype)
+            .with_label("rand_uniform_seeded")
+            .build()?;
+        let encoder = self.command_encoder()?;
+        candle_metal_kernels::call_random_uniform_seeded(
+            &self.device,
+            &encoder,
+            &self.kernels,
+            name,
+            min as f32,
+            max as f32,
+            shape.elem_count(),
+            seed,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(Self::Storage::new(
+            buffer,
+            self.clone(),
+            shape.elem_count(),
+            dtype,
+        ))
+    }
+
+    fn rand_normal_seeded(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        stddev: f64,
+        seed: u64,
+    ) -> Result<Self::Storage> {
+        let name = match dtype {
+            DType::F32 => "rand_normal_seeded_f32",
+            dtype => crate::bail!("rand_normal_seeded only supports F32 on Metal, got {dtype:?}"),
+        };
+        let buffer = self
+            .new_buffer_builder()
+            .with_size_for(shape.elem_count(), dtype)
+            .with_label("rand_normal_seeded")
+            .build()?;
+        let encoder = self.command_encoder()?;
+        candle_metal_kernels::call_random_normal_seeded(
+            &self.device,
+            &encoder,
+            &self.kernels,
+            name,
+            mean as f32,
+            stddev as f32,
+            shape.elem_count(),
+            seed,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(Self::Storage::new(
+            buffer,
+            self.clone(),
+            shape.elem_count(),
+            dtype,
+        ))
+    }
+
     fn set_seed(&self, seed: u64) -> Result<()> {
         *self.seed_value.write().unwrap() = seed;
 

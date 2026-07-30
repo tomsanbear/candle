@@ -340,10 +340,7 @@ fn bitnet_quantize_pipeline(device: &Device) -> Result<()> {
         let w_f32_cpu = w_cpu.to_dtype(DType::F32)?;
         let w_f32_dev = w_dev.to_dtype(DType::F32)?;
         let cpu_vec = w_f32_cpu.flatten_all()?.to_vec1::<f32>()?;
-        let dev_vec = w_f32_dev
-            .to_device(&cpu)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let dev_vec = w_f32_dev.to_device(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
         for (i, (&c, &d)) in cpu_vec.iter().zip(&dev_vec).enumerate() {
             assert!(
                 (c - d).abs() <= f32::EPSILON,
@@ -1899,6 +1896,192 @@ fn randn(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn seeded_random(device: &Device) -> Result<()> {
+    for (result, violation) in [
+        (
+            Tensor::rand_seeded(f32::NAN, 1f32, 0, 5, device),
+            "seeded uniform accepted a non-finite lower bound",
+        ),
+        (
+            Tensor::rand_seeded(0f32, f32::INFINITY, 8, 5, device),
+            "seeded uniform accepted a non-finite upper bound",
+        ),
+        (
+            Tensor::rand_seeded(1f32, 1f32, 8, 5, device),
+            "seeded uniform accepted an empty interval",
+        ),
+    ] {
+        let error = result.expect_err(violation);
+        assert!(
+            error
+                .to_string()
+                .contains("seeded uniform requires finite bounds with lo < up"),
+            "{violation}: wrong error: {error}"
+        );
+    }
+    for (result, violation) in [
+        (
+            Tensor::randn_seeded(f32::NAN, 1f32, 0, 5, device),
+            "seeded normal accepted a non-finite mean",
+        ),
+        (
+            Tensor::randn_seeded(0f32, 0f32, 8, 5, device),
+            "seeded normal accepted zero standard deviation",
+        ),
+        (
+            Tensor::randn_seeded(0f32, -1f32, 8, 5, device),
+            "seeded normal accepted negative standard deviation",
+        ),
+        (
+            Tensor::randn_seeded(0f32, f32::INFINITY, 8, 5, device),
+            "seeded normal accepted non-finite standard deviation",
+        ),
+    ] {
+        let error = result.expect_err(violation);
+        assert!(
+            error
+                .to_string()
+                .contains("seeded normal requires a finite mean and finite std > 0"),
+            "{violation}: wrong error: {error}"
+        );
+    }
+
+    assert_eq!(
+        Tensor::rand_seeded(0f32, 1f32, 0, 5, device)?.elem_count(),
+        0
+    );
+    assert_eq!(
+        Tensor::randn_seeded(0f32, 1f32, 0, 5, device)?.elem_count(),
+        0
+    );
+    let normal_a = Tensor::randn_seeded(0f32, 1f32, 33, 0x1234_5678_9abc_def0, device)?;
+    let uniform_a = Tensor::rand_seeded(-2f32, 3f32, 33, 0x1234_5678_9abc_def0, device)?;
+
+    // Queue unrelated stateful and explicitly seeded work before observing the
+    // first pair. An implementation backed by one deferred mutable seed cannot
+    // preserve both operations here.
+    let _unrelated = Tensor::randn(0f32, 1f32, 257, device)?;
+    let _other_seed = Tensor::randn_seeded(0f32, 1f32, 33, 7, device)?;
+    let normal_b = Tensor::randn_seeded(0f32, 1f32, 33, 0x1234_5678_9abc_def0, device)?;
+    let uniform_b = Tensor::rand_seeded(-2f32, 3f32, 33, 0x1234_5678_9abc_def0, device)?;
+
+    let normal_a = normal_a.to_vec1::<f32>()?;
+    let uniform_a = uniform_a.to_vec1::<f32>()?;
+    assert_eq!(
+        normal_a,
+        normal_b.to_vec1::<f32>()?,
+        "explicit normal seed depended on queued random work"
+    );
+    assert_eq!(
+        uniform_a,
+        uniform_b.to_vec1::<f32>()?,
+        "explicit uniform seed depended on queued random work"
+    );
+    assert!(
+        normal_a.iter().all(|value| value.is_finite()),
+        "explicit normal generation produced a non-finite value"
+    );
+
+    let high_bit_seed =
+        Tensor::randn_seeded(0f32, 1f32, 33, 0x1234_5679_9abc_def0, device)?.to_vec1::<f32>()?;
+    assert_ne!(
+        normal_a, high_bit_seed,
+        "upper 32 seed bits did not affect explicit random output"
+    );
+
+    let longer = Tensor::rand_seeded(-2f32, 3f32, 65, 11, device)?.to_vec1::<f32>()?;
+    let shorter = Tensor::rand_seeded(-2f32, 3f32, 33, 11, device)?.to_vec1::<f32>()?;
+    assert_eq!(
+        shorter,
+        longer[..shorter.len()],
+        "explicit random output is not prefix-stable across shapes"
+    );
+    let longer = Tensor::randn_seeded(0f32, 1f32, 65, 11, device)?.to_vec1::<f32>()?;
+    let shorter = Tensor::randn_seeded(0f32, 1f32, 33, 11, device)?.to_vec1::<f32>()?;
+    assert_eq!(
+        shorter,
+        longer[..shorter.len()],
+        "explicit normal output is not prefix-stable across shapes"
+    );
+
+    if device.is_metal() {
+        for (result, distribution) in [
+            (
+                Tensor::rand_seeded(half::f16::ZERO, half::f16::ONE, 8, 5, device),
+                "uniform F16",
+            ),
+            (
+                Tensor::rand_seeded(half::bf16::ZERO, half::bf16::ONE, 8, 5, device),
+                "uniform BF16",
+            ),
+            (
+                Tensor::randn_seeded(half::f16::ZERO, half::f16::ONE, 8, 5, device),
+                "normal F16",
+            ),
+            (
+                Tensor::randn_seeded(half::bf16::ZERO, half::bf16::ONE, 8, 5, device),
+                "normal BF16",
+            ),
+        ] {
+            let error = result.expect_err("seeded Metal half generation unexpectedly succeeded");
+            assert!(
+                error.to_string().contains("only supports F32 on Metal"),
+                "seeded Metal {distribution} returned the wrong dtype-boundary error: {error}"
+            );
+        }
+    }
+
+    const MOMENT_SAMPLES: usize = 200_000;
+    let uniform =
+        Tensor::rand_seeded(0f32, 1f32, MOMENT_SAMPLES, 0x51a7_15ac, device)?.to_vec1::<f32>()?;
+    assert!(
+        uniform.iter().all(|&value| (0.0..1.0).contains(&value)),
+        "explicit uniform generation escaped its half-open bounds"
+    );
+    let uniform_mean =
+        uniform.iter().map(|&value| f64::from(value)).sum::<f64>() / MOMENT_SAMPLES as f64;
+    let uniform_variance = uniform
+        .iter()
+        .map(|&value| (f64::from(value) - uniform_mean).powi(2))
+        .sum::<f64>()
+        / MOMENT_SAMPLES as f64;
+    assert!(
+        (uniform_mean - 0.5).abs() < 0.005 && (uniform_variance - 1.0 / 12.0).abs() < 0.002,
+        "explicit uniform moments are wrong: mean={uniform_mean} variance={uniform_variance}"
+    );
+
+    let normal =
+        Tensor::randn_seeded(0f32, 1f32, MOMENT_SAMPLES, 0x51a7_15ac, device)?.to_vec1::<f32>()?;
+    let normal_mean =
+        normal.iter().map(|&value| f64::from(value)).sum::<f64>() / MOMENT_SAMPLES as f64;
+    let normal_variance = normal
+        .iter()
+        .map(|&value| (f64::from(value) - normal_mean).powi(2))
+        .sum::<f64>()
+        / MOMENT_SAMPLES as f64;
+    assert!(
+        normal.iter().all(|value| value.is_finite())
+            && normal_mean.abs() < 0.01
+            && (normal_variance - 1.0).abs() < 0.02,
+        "explicit normal moments are wrong: mean={normal_mean} variance={normal_variance}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn seeded_random_metal_matches_philox_reference() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let values = Tensor::rand_seeded(0f32, 1f32, 4, 0, &device)?.to_vec1::<f32>()?;
+    let expected = [0x6627_e8d5_u32, 0xe169_c58d, 0xbc57_ac4c, 0x9b00_dbd8]
+        .map(|word| (word >> 8) as f32 * 2f32.powi(-24));
+    assert_eq!(
+        values, expected,
+        "seeded Metal uniform no longer matches Philox4x32-10"
+    );
+    Ok(())
+}
+
 fn zero_dim(device: &Device) -> Result<()> {
     let t = Tensor::zeros((4, 0, 1), DType::F32, device)?;
     assert_eq!(t.dims3()?, (4, 0, 1));
@@ -1961,7 +2144,11 @@ fn to_dtype(dev: &Device) -> Result<()> {
     for &src in dtypes.iter() {
         for &dst in dtypes.iter() {
             let v = max_exact(src).min(max_exact(dst));
-            let v2 = if is_signed(src) && is_signed(dst) { -v } else { 2. };
+            let v2 = if is_signed(src) && is_signed(dst) {
+                -v
+            } else {
+                2.
+            };
 
             let vals = [v, v2, 3.];
             let t = Tensor::new(&vals, &cpu)?.to_dtype(src)?.to_device(dev)?;
@@ -2002,12 +2189,7 @@ test_device!(argmax, argmax_cpu, argmax_gpu, argmax_metal);
 test_device!(argmin, argmin_cpu, argmin_gpu, argmin_metal);
 test_device!(transpose, transpose_cpu, transpose_gpu, transpose_metal);
 test_device!(unary_op, unary_op_cpu, unary_op_gpu, unary_op_metal);
-test_device!(
-    bitnet_quantize_pipeline,
-    bqp_cpu,
-    bqp_gpu,
-    bqp_metal
-);
+test_device!(bitnet_quantize_pipeline, bqp_cpu, bqp_gpu, bqp_metal);
 test_device!(
     bitnet_quantize_pipeline_concurrent,
     bqpc_cpu,
@@ -2040,6 +2222,36 @@ test_device!(
     slice_scatter_metal
 );
 test_device!(randn, randn_cpu, randn_gpu, randn_metal);
+#[test]
+fn seeded_random_cpu() -> Result<()> {
+    seeded_random(&Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn seeded_random_metal() -> Result<()> {
+    seeded_random(&Device::new_metal(0)?)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn seeded_random_cuda_reports_unsupported() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    for error in [
+        Tensor::rand_seeded(0f32, 1f32, 8, 7, &device)
+            .expect_err("CUDA seeded uniform generation unexpectedly succeeded"),
+        Tensor::randn_seeded(0f32, 1f32, 8, 7, &device)
+            .expect_err("CUDA seeded normal generation unexpectedly succeeded"),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("random generation is not implemented for this backend"),
+            "CUDA seeded random generation returned the wrong backend-boundary error: {error}"
+        );
+    }
+    Ok(())
+}
 test_device!(clamp, clamp_cpu, clamp_gpu, clamp_metal);
 test_device!(asort, asort_cpu, asort_gpu, asort_metal);
 test_device!(asort_big, asort_big_cpu, asort_big_gpu, asort_big_metal);
@@ -2396,10 +2608,7 @@ fn cumsum_metal_large_last_dim() -> Result<()> {
     let n = 5000usize;
     let t = Tensor::arange(0f32, n as f32, &device)?;
     let c = t.cumsum(0)?;
-    assert_eq!(
-        c.i(n - 1)?.to_scalar::<f32>()?,
-        (n * (n - 1) / 2) as f32
-    );
+    assert_eq!(c.i(n - 1)?.to_scalar::<f32>()?, (n * (n - 1) / 2) as f32);
 
     let t = Tensor::ones((3, 4097), DType::I64, &device)?;
     let c = t.cumsum(1)?;

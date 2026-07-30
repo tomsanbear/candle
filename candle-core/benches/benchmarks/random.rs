@@ -1,6 +1,6 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
 use candle_core::{DType, Device, Tensor};
-use criterion::{criterion_group, Criterion, Throughput};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -52,6 +52,102 @@ fn run_random_bench(c: &mut Criterion, device: &Device) {
         })
     });
     group.finish();
+
+    if device.is_cuda() {
+        // Explicit seeded CUDA generation is deliberately unsupported until a
+        // stateless kernel exists; do not benchmark a stateful emulation.
+        return;
+    }
+
+    for (label, elements) in [
+        ("flow_short", 50_240usize),
+        ("decoder_representative", 998_720),
+        ("decoder_max", 9_026_880),
+    ] {
+        for distribution in ["uniform", "normal"] {
+            let mut group =
+                c.benchmark_group(device.bench_name(format!("seeded_{distribution}_{label}")));
+            group.throughput(Throughput::Bytes(
+                (elements * DType::F32.size_in_bytes()) as u64,
+            ));
+            group.bench_with_input(
+                BenchmarkId::new("stateful", elements),
+                &elements,
+                |benches, &elements| {
+                    benches.iter_custom(|iters| {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            let tensor = if distribution == "uniform" {
+                                Tensor::rand(0f32, 1f32, elements, device).unwrap()
+                            } else {
+                                Tensor::randn(0f32, 1f32, elements, device).unwrap()
+                            };
+                            black_box(tensor);
+                        }
+                        device.sync().unwrap();
+                        start.elapsed()
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("explicit", elements),
+                &elements,
+                |benches, &elements| {
+                    benches.iter_custom(|iters| {
+                        let start = Instant::now();
+                        for iteration in 0..iters {
+                            let tensor = if distribution == "uniform" {
+                                Tensor::rand_seeded(0f32, 1f32, elements, iteration, device)
+                                    .unwrap()
+                            } else {
+                                Tensor::randn_seeded(0f32, 1f32, elements, iteration, device)
+                                    .unwrap()
+                            };
+                            black_box(tensor);
+                        }
+                        device.sync().unwrap();
+                        start.elapsed()
+                    })
+                },
+            );
+            if !device.is_cpu() {
+                group.bench_with_input(
+                    BenchmarkId::new("host_seeded_upload", elements),
+                    &elements,
+                    |benches, &elements| {
+                        benches.iter_custom(|iters| {
+                            let start = Instant::now();
+                            for iteration in 0..iters {
+                                let host = if distribution == "uniform" {
+                                    Tensor::rand_seeded(
+                                        0f32,
+                                        1f32,
+                                        elements,
+                                        iteration,
+                                        &Device::Cpu,
+                                    )
+                                    .unwrap()
+                                } else {
+                                    Tensor::randn_seeded(
+                                        0f32,
+                                        1f32,
+                                        elements,
+                                        iteration,
+                                        &Device::Cpu,
+                                    )
+                                    .unwrap()
+                                };
+                                black_box(host.to_device(device).unwrap());
+                            }
+                            device.sync().unwrap();
+                            start.elapsed()
+                        })
+                    },
+                );
+            }
+            group.finish();
+        }
+    }
 }
 
 fn criterion_benchmark(c: &mut Criterion) {

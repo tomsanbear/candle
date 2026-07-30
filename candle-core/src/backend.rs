@@ -166,6 +166,28 @@ pub trait BackendDevice: Sized + std::fmt::Debug + Clone {
 
     fn rand_normal(&self, _: &Shape, _: DType, _: f64, _: f64) -> Result<Self::Storage>;
 
+    fn rand_uniform_seeded(
+        &self,
+        _: &Shape,
+        _: DType,
+        _: f64,
+        _: f64,
+        _: u64,
+    ) -> Result<Self::Storage> {
+        crate::bail!("seeded uniform random generation is not implemented for this backend")
+    }
+
+    fn rand_normal_seeded(
+        &self,
+        _: &Shape,
+        _: DType,
+        _: f64,
+        _: f64,
+        _: u64,
+    ) -> Result<Self::Storage> {
+        crate::bail!("seeded normal random generation is not implemented for this backend")
+    }
+
     fn set_seed(&self, _: u64) -> Result<()>;
     fn get_current_seed(&self) -> Result<u64>;
 

@@ -356,6 +356,39 @@ impl Tensor {
         Self::rand_impl(lo, up, s, device, false)
     }
 
+    /// Creates a new tensor initialized from a uniform distribution and an
+    /// explicit per-operation seed.
+    ///
+    /// Unlike [`Device::set_seed`], the seed belongs to this operation and
+    /// cannot be changed by unrelated or concurrently queued random work. The
+    /// operation does not advance the device's stateful RNG, and a longer shape
+    /// preserves the values in a shorter shape's common prefix.
+    ///
+    /// The bounds must be finite and `lo < up`. Exact reproducibility is scoped
+    /// to the same backend implementation and build; CPU and Metal deliberately
+    /// use different generators. Metal currently supports F32, and CUDA does
+    /// not yet implement this operation.
+    pub fn rand_seeded<S: Into<Shape>, T: crate::FloatDType>(
+        lo: T,
+        up: T,
+        s: S,
+        seed: u64,
+        device: &Device,
+    ) -> Result<Self> {
+        let (lo_value, up_value) = (lo.to_f64(), up.to_f64());
+        if !lo_value.is_finite() || !up_value.is_finite() || lo_value >= up_value {
+            crate::bail!(
+                "seeded uniform requires finite bounds with lo < up, got lo={lo_value} up={up_value}"
+            )
+        }
+        let s = s.into();
+        if s.elem_count() == 0 {
+            return Self::zeros(s, T::DTYPE, device);
+        }
+        let storage = device.rand_uniform_seeded(lo, up, &s, seed)?;
+        Ok(from_storage(storage, s, BackpropOp::none(), false))
+    }
+
     pub fn rand_like(&self, lo: f64, up: f64) -> Result<Self> {
         Tensor::rand_f64_impl(lo, up, self.shape(), self.dtype(), self.device(), false)
     }
@@ -407,6 +440,39 @@ impl Tensor {
         device: &Device,
     ) -> Result<Self> {
         Self::randn_impl(mean, std, s, device, false)
+    }
+
+    /// Creates a new tensor initialized from a normal distribution and an
+    /// explicit per-operation seed.
+    ///
+    /// Unlike [`Device::set_seed`], the seed belongs to this operation and
+    /// cannot be changed by unrelated or concurrently queued random work. The
+    /// operation does not advance the device's stateful RNG, and a longer shape
+    /// preserves the values in a shorter shape's common prefix.
+    ///
+    /// `mean` must be finite and `std` must be finite and strictly positive.
+    /// Exact reproducibility is scoped to the same backend implementation and
+    /// build; CPU and Metal deliberately use different generators. Metal
+    /// currently supports F32, and CUDA does not yet implement this operation.
+    pub fn randn_seeded<S: Into<Shape>, T: crate::FloatDType>(
+        mean: T,
+        std: T,
+        s: S,
+        seed: u64,
+        device: &Device,
+    ) -> Result<Self> {
+        let (mean_value, std_value) = (mean.to_f64(), std.to_f64());
+        if !mean_value.is_finite() || !std_value.is_finite() || std_value <= 0.0 {
+            crate::bail!(
+                "seeded normal requires a finite mean and finite std > 0, got mean={mean_value} std={std_value}"
+            )
+        }
+        let s = s.into();
+        if s.elem_count() == 0 {
+            return Self::zeros(s, T::DTYPE, device);
+        }
+        let storage = device.rand_normal_seeded(mean, std, &s, seed)?;
+        Ok(from_storage(storage, s, BackpropOp::none(), false))
     }
 
     pub(crate) fn new_impl<A: crate::device::NdArray>(

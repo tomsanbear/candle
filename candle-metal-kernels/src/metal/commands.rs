@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 /// Closure installed via `Commands::set_completion_hook` that fires once
 /// per command buffer when it completes on the GPU. The hook runs on a
 /// Metal-internal thread and receives a `CommandBuffer` clone so it can
-/// call `kernel_start_time()` / `kernel_end_time()` / read the buffer's
-/// label. Intended for programmatic profilers that want coverage of
-/// *every* command buffer candle creates, not just the ones whose
-/// dispatchers were patched individually.
+/// call `gpu_start_time()` / `gpu_end_time()` for execution, inspect the
+/// separate driver-scheduling timestamps, or read the buffer's label.
+/// Intended for programmatic profilers that want coverage of *every*
+/// command buffer candle creates, not just the ones whose dispatchers were
+/// patched individually.
 pub type CompletionHook = Arc<dyn Fn(&CommandBuffer) + Send + Sync + 'static>;
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
@@ -176,8 +177,9 @@ impl Commands {
 
     /// Install or clear a per-buffer completion hook. When `Some`, every
     /// command buffer gets the hook registered via `addCompletedHandler`
-    /// before it is committed. Typical use: a profiler records each
-    /// buffer's label + kernel start/end times into a trace sink.
+    /// before it is committed. Typical use: a profiler records GPU start/end
+    /// times into a trace sink. The hook's closure should carry attribution;
+    /// command-buffer labels are not populated by normal encoder labels.
     pub fn set_completion_hook(&self, hook: Option<CompletionHook>) {
         *self.completion_hook.write().unwrap() = hook;
     }

@@ -212,9 +212,9 @@ impl MetalDevice {
 
     /// Install or clear a per-buffer completion hook on this device's
     /// command pool. When `Some`, every command buffer gets the hook
-    /// registered via `addCompletedHandler` before it's committed —
-    /// giving programmatic profilers coverage of every Metal kernel
-    /// candle dispatches without per-kernel patches.
+    /// registered via `addCompletedHandler` before it's committed, giving
+    /// programmatic profilers GPU execution timestamps for every command
+    /// buffer Candle creates.
     pub fn set_completion_hook(
         &self,
         hook: Option<candle_metal_kernels::metal::CompletionHook>,

@@ -90,23 +90,40 @@ impl CommandBuffer {
         self.raw.waitUntilCompleted();
     }
 
-    /// GPU-side kernel start time in seconds (CFTimeInterval epoch), valid
-    /// only after the buffer has completed. Pair with `kernel_end_time()`
-    /// for per-buffer GPU duration.
+    /// Host time when the CPU driver began scheduling this command buffer.
+    ///
+    /// This is Metal's `kernelStartTime`, despite the potentially misleading
+    /// property name. Pair it with [`Self::kernel_end_time`] to measure driver
+    /// scheduling, not GPU execution.
     pub fn kernel_start_time(&self) -> f64 {
         self.raw.kernelStartTime()
     }
 
-    /// GPU-side kernel end time in seconds (CFTimeInterval epoch).
+    /// Host time when the CPU driver finished scheduling this command buffer.
     pub fn kernel_end_time(&self) -> f64 {
         self.raw.kernelEndTime()
     }
 
+    /// Host time when the GPU began executing this command buffer.
+    ///
+    /// Pair this host time, in seconds, with [`Self::gpu_end_time`] from a
+    /// completion handler to compare execution intervals across queues. It
+    /// remains zero until the GPU starts this command buffer.
+    pub fn gpu_start_time(&self) -> f64 {
+        self.raw.GPUStartTime()
+    }
+
+    /// Host time, in seconds, when the GPU finished executing this command
+    /// buffer. It remains zero until the CPU receives completion notification.
+    pub fn gpu_end_time(&self) -> f64 {
+        self.raw.GPUEndTime()
+    }
+
     /// Register a completion callback that fires on a Metal-internal thread
     /// as soon as the buffer finishes executing. `handler` receives this
-    /// `CommandBuffer` (cloned) so it can read `kernel_start_time` /
-    /// `kernel_end_time` without blocking the producer. Used by programmatic
-    /// GPU profilers.
+    /// `CommandBuffer` (cloned) so it can read scheduling or GPU execution
+    /// timestamps without blocking the producer. Used by programmatic GPU
+    /// profilers.
     ///
     /// Safety: the callback runs on a different thread than the caller.
     /// The `Fn` closure must be `Send + Sync + 'static`.

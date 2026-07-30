@@ -256,6 +256,45 @@ impl<'a> EncoderParam for Output<'a> {
     }
 }
 
+/// Marks a buffer as both read and written in `set_params!` calls.
+///
+/// This is required for in-place kernels: [`Input`] alone omits the write
+/// dependency, while [`Output`] alone omits the read dependency. Registering
+/// both sides lets the encoder insert same-encoder barriers and cross-encoder
+/// fence waits without changing the Metal argument binding.
+#[derive(Copy, Clone)]
+pub struct ReadWrite<'a> {
+    buffer: &'a Buffer,
+    offset: usize,
+}
+
+impl<'a> ReadWrite<'a> {
+    #[inline]
+    pub fn new(buffer: &'a Buffer) -> Self {
+        Self { buffer, offset: 0 }
+    }
+
+    #[inline]
+    pub fn with_offset(buffer: &'a Buffer, offset: usize) -> Self {
+        Self { buffer, offset }
+    }
+
+    #[inline]
+    pub fn from_buffer_offset(bo: &'a BufferOffset<'a>) -> Self {
+        Self {
+            buffer: bo.buffer,
+            offset: bo.offset_in_bytes,
+        }
+    }
+}
+
+impl<'a> EncoderParam for ReadWrite<'a> {
+    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        encoder.set_input_buffer(position, Some(data.buffer), data.offset);
+        encoder.set_output_buffer(position, Some(data.buffer), data.offset);
+    }
+}
+
 #[macro_export]
 macro_rules! set_params {
     ($encoder:ident, ($($param:expr),+)) => (

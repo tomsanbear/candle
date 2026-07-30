@@ -7,21 +7,20 @@ pub mod utils;
 
 pub use err::MetalKernelError;
 pub use kernel::Kernels;
-pub use metal::{CommandBuffer, CompletionHook, ComputeCommandEncoder};
 pub use kernels::{
-    affine::*, call_binary_contiguous, call_binary_strided, call_mlx_gemm,
-    call_mlx_gemm_with_bias, cast::*, convolution::*, fill::*, indexing::*, quantized::*,
-    random::*, reduce::*, sdpa::*, sort::*, ternary::*, unary, unary::*, GemmActivation,
-    GemmDType, GgmlDType,
+    affine::*, call_binary_contiguous, call_binary_strided, call_mlx_gemm, call_mlx_gemm_with_bias,
+    cast::*, convolution::*, fill::*, indexing::*, quantized::*, random::*, reduce::*, sdpa::*,
+    sort::*, ternary::*, unary, unary::*, GemmActivation, GemmDType, GgmlDType,
 };
 use metal::{
     Buffer, CommandQueue, ComputePipeline, ConstantValues, Device, Function, Library,
     MTLResourceOptions, Value,
 };
+pub use metal::{CommandBuffer, CompletionHook, ComputeCommandEncoder};
 use objc2_metal::{MTLCompileOptions, MTLMathFloatingPointFunctions, MTLMathMode, MTLSize};
 use source::Source;
 use utils::{get_block_dims, get_tile_size, linear_split, EncoderParam, EncoderProvider};
-pub use utils::{BufferOffset, Output};
+pub use utils::{BufferOffset, Output, ReadWrite};
 
 pub const RESOURCE_OPTIONS: MTLResourceOptions = objc2_metal::MTLResourceOptions(
     MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,

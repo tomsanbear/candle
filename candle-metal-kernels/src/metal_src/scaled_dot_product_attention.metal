@@ -2064,7 +2064,7 @@ template <
 
   if (do_causal) {
     int q_max = (tid.x + 1) * BQ + params->qL_off;
-    kb_lim = (q_max + BK - 1) / BK;
+    kb_lim = min(params->NK, (q_max + BK - 1) / BK);
   }
 
   // Loop over KV seq length

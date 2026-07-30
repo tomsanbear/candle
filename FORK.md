@@ -64,6 +64,13 @@ Cherry-picked (`-x`) onto dev 2026-07-22 with authorship preserved, while it was
 
 ## Incubating on `tomsanbear-dev`
 
+### Operation-local seeded random tensors
+`core` / `metal-kernels` · `99ba7b04` · Incubating · **proven — deterministic and 3.5–6.9× faster on M3**
+
+`Tensor::rand_seeded` and `Tensor::randn_seeded` give one operation an immutable `u64` seed without advancing the device's stateful RNG. The old downstream workaround — `Device::set_seed` followed by an asynchronously queued Metal random kernel — was not deterministic: a later host reset could overwrite the one shared seed buffer before an earlier kernel read it, and thread zero mutated that buffer while sibling threads were still loading it. CPU now owns a call-local `StdRng`; Metal copies the seed into command-owned parameter bytes and maps logical groups of four outputs through full-key Philox4x32-10 counters. Same-backend/build results are exact and prefix-stable; cross-backend identity is not promised. CUDA is explicitly unsupported until a native stateless kernel exists. Metal intentionally exposes F32 only: converting f32 uniforms near the exclusive upper bound to F16/BF16 can round to the bound, so advertising half support would violate `[lo, up)`.
+
+M3 Criterion medians at 50,240 / 998,720 / 9,026,880 elements: explicit Metal is 3.5× / 6.5–6.9× / 5.2× faster than the mutable stateful path; host generation plus upload is 40–99× / 151–369× / 129–335× slower than explicit Metal. The benchmark queues each tensor and synchronizes the batch; it does not read tensors back. Full `candle-core --features metal`, Metal-kernel, and warnings-denied clippy gates pass; the CUDA unsupported-boundary test passes on the CUDA host. Compiling mutations proved queued-seed independence, cloned-handle concurrency, upper-32-bit sensitivity, all four published Philox words and ten rounds, uniform and normal prefix stability, bounds/moments, validation semantics, half/CUDA backend boundaries, and stateful RNG isolation.
+
 ### Fused SwiGLU kernel
 `metal-kernels` / `candle-nn` · `4e892d30` · Incubating · tested (`swiglu` cpu+metal)
 

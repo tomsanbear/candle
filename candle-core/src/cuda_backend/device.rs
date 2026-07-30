@@ -2,7 +2,7 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use candle_kernels as kernels;
 pub use cudarc;
-use cudarc::driver::CudaFunction;
+use cudarc::driver::{CudaFunction, PushKernelArg};
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::any::{Any, TypeId};
@@ -594,6 +594,82 @@ impl BackendDevice for CudaDevice {
         };
         Ok(CudaStorage {
             slice,
+            device: self.clone(),
+        })
+    }
+
+    fn rand_uniform_seeded(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        lo: f64,
+        up: f64,
+        seed: u64,
+    ) -> Result<CudaStorage> {
+        if dtype != DType::F32 {
+            return Err(CudaError::UnsupportedDtype {
+                dtype,
+                op: "rand_uniform_seeded",
+            })
+            .w()?;
+        }
+        let elem_count = shape.elem_count();
+        let data = unsafe { self.alloc::<f32>(elem_count)? };
+        let work_items = elem_count.div_ceil(4);
+        if work_items > 0 {
+            let work_items = u32::try_from(work_items).map_err(crate::Error::wrap)?;
+            let func = self.get_or_load_func("rand_uniform_seeded_f32", &kernels::RANDOM)?;
+            let cfg = cudarc::driver::LaunchConfig::for_num_elems(work_items);
+            let lo = lo as f32;
+            let up = up as f32;
+            let mut builder = func.builder();
+            builder.arg(&elem_count);
+            builder.arg(&lo);
+            builder.arg(&up);
+            builder.arg(&seed);
+            builder.arg(&data);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        Ok(CudaStorage {
+            slice: CudaStorageSlice::F32(data),
+            device: self.clone(),
+        })
+    }
+
+    fn rand_normal_seeded(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        std: f64,
+        seed: u64,
+    ) -> Result<CudaStorage> {
+        if dtype != DType::F32 {
+            return Err(CudaError::UnsupportedDtype {
+                dtype,
+                op: "rand_normal_seeded",
+            })
+            .w()?;
+        }
+        let elem_count = shape.elem_count();
+        let data = unsafe { self.alloc::<f32>(elem_count)? };
+        let work_items = elem_count.div_ceil(4);
+        if work_items > 0 {
+            let work_items = u32::try_from(work_items).map_err(crate::Error::wrap)?;
+            let func = self.get_or_load_func("rand_normal_seeded_f32", &kernels::RANDOM)?;
+            let cfg = cudarc::driver::LaunchConfig::for_num_elems(work_items);
+            let mean = mean as f32;
+            let std = std as f32;
+            let mut builder = func.builder();
+            builder.arg(&elem_count);
+            builder.arg(&mean);
+            builder.arg(&std);
+            builder.arg(&seed);
+            builder.arg(&data);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        Ok(CudaStorage {
+            slice: CudaStorageSlice::F32(data),
             device: self.clone(),
         })
     }

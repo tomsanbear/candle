@@ -2004,7 +2004,8 @@ fn seeded_random(device: &Device) -> Result<()> {
         "explicit normal output is not prefix-stable across shapes"
     );
 
-    if device.is_metal() {
+    if device.is_metal() || device.is_cuda() {
+        let backend = if device.is_metal() { "Metal" } else { "CUDA" };
         for (result, distribution) in [
             (
                 Tensor::rand_seeded(half::f16::ZERO, half::f16::ONE, 8, 5, device),
@@ -2023,10 +2024,15 @@ fn seeded_random(device: &Device) -> Result<()> {
                 "normal BF16",
             ),
         ] {
-            let error = result.expect_err("seeded Metal half generation unexpectedly succeeded");
+            let error = result.expect_err("seeded backend half generation unexpectedly succeeded");
+            let operation = if distribution.starts_with("uniform") {
+                "rand_uniform_seeded"
+            } else {
+                "rand_normal_seeded"
+            };
             assert!(
-                error.to_string().contains("only supports F32 on Metal"),
-                "seeded Metal {distribution} returned the wrong dtype-boundary error: {error}"
+                error.to_string().contains(operation),
+                "seeded {backend} {distribution} returned the wrong dtype-boundary error: {error}"
             );
         }
     }
@@ -2078,6 +2084,20 @@ fn seeded_random_metal_matches_philox_reference() -> Result<()> {
     assert_eq!(
         values, expected,
         "seeded Metal uniform no longer matches Philox4x32-10"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn seeded_random_cuda_matches_philox_reference() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let values = Tensor::rand_seeded(0f32, 1f32, 4, 0, &device)?.to_vec1::<f32>()?;
+    let expected = [0x6627_e8d5_u32, 0xe169_c58d, 0xbc57_ac4c, 0x9b00_dbd8]
+        .map(|word| (word >> 8) as f32 * 2f32.powi(-24));
+    assert_eq!(
+        values, expected,
+        "seeded CUDA uniform no longer matches Philox4x32-10"
     );
     Ok(())
 }
@@ -2235,22 +2255,8 @@ fn seeded_random_metal() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn seeded_random_cuda_reports_unsupported() -> Result<()> {
-    let device = Device::new_cuda(0)?;
-    for error in [
-        Tensor::rand_seeded(0f32, 1f32, 8, 7, &device)
-            .expect_err("CUDA seeded uniform generation unexpectedly succeeded"),
-        Tensor::randn_seeded(0f32, 1f32, 8, 7, &device)
-            .expect_err("CUDA seeded normal generation unexpectedly succeeded"),
-    ] {
-        assert!(
-            error
-                .to_string()
-                .contains("random generation is not implemented for this backend"),
-            "CUDA seeded random generation returned the wrong backend-boundary error: {error}"
-        );
-    }
-    Ok(())
+fn seeded_random_cuda() -> Result<()> {
+    seeded_random(&Device::new_cuda(0)?)
 }
 test_device!(clamp, clamp_cpu, clamp_gpu, clamp_metal);
 test_device!(asort, asort_cpu, asort_gpu, asort_metal);

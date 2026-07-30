@@ -365,9 +365,9 @@ impl Tensor {
     /// preserves the values in a shorter shape's common prefix.
     ///
     /// The bounds must be finite and `lo < up`. Exact reproducibility is scoped
-    /// to the same backend implementation and build; CPU and Metal deliberately
-    /// use different generators. Metal currently supports F32, and CUDA does
-    /// not yet implement this operation.
+    /// to the same backend implementation and build; backend floating-point
+    /// transforms may deliberately differ. Metal and CUDA currently support
+    /// F32.
     pub fn rand_seeded<S: Into<Shape>, T: crate::FloatDType>(
         lo: T,
         up: T,
@@ -452,8 +452,8 @@ impl Tensor {
     ///
     /// `mean` must be finite and `std` must be finite and strictly positive.
     /// Exact reproducibility is scoped to the same backend implementation and
-    /// build; CPU and Metal deliberately use different generators. Metal
-    /// currently supports F32, and CUDA does not yet implement this operation.
+    /// build; backend floating-point transforms may deliberately differ. Metal
+    /// and CUDA currently support F32.
     pub fn randn_seeded<S: Into<Shape>, T: crate::FloatDType>(
         mean: T,
         std: T,

@@ -53,12 +53,6 @@ fn run_random_bench(c: &mut Criterion, device: &Device) {
     });
     group.finish();
 
-    if device.is_cuda() {
-        // Explicit seeded CUDA generation is deliberately unsupported until a
-        // stateless kernel exists; do not benchmark a stateful emulation.
-        return;
-    }
-
     for (label, elements) in [
         ("flow_short", 50_240usize),
         ("decoder_representative", 998_720),
